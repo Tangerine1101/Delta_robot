@@ -1,5 +1,21 @@
 # Giải Thích Siêu Chi Tiết Các Script Python Trong Project Delta Robot
 
+## Ghi chú cập nhật
+
+Tài liệu này ban đầu được viết để giải thích luồng **CLI + PLC worker** là chính.
+
+Codebase hiện tại đã thay đổi thêm:
+
+- `interpolar_points` mặc định bây giờ là `6`, không còn là `4`
+- có thêm mode `--scheduler`
+- có thêm [modules/image_processing.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py:1)
+- có thêm [modules/scheduler.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py:1)
+
+Vì tài liệu này rất dài, phần thân bên dưới vẫn tập trung mạnh vào luồng CLI/PLC cốt lõi. Khi đọc các ví dụ cũ có nhắc `4` slot, hãy hiểu rằng **giá trị hiện tại trong code là 6 slot**. Nguồn tham chiếu đúng nhất hiện tại là:
+
+- [modules/config.json](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json:1)
+- [doc/system_configuration.md](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/system_configuration.md:1)
+
 Tài liệu này dành cho người mới học Python rất ngắn ngày.
 
 Mục tiêu của tài liệu:

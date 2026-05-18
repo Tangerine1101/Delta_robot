@@ -7,6 +7,7 @@ from typing import Any
 
 from modules.EthernetCom import PLCGateway, load_config
 from modules.cli import run_interactive
+from modules.scheduler import SCENARIO_NAMES, run_scheduler_scenario
 
 
 def _worker(
@@ -79,33 +80,7 @@ def _wait_for_response(response_queue: mp.Queue, timeout: float = 5.0) -> dict[s
         return None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Delta robot command line entrypoint")
-    config = load_config()
-    default_interpolar_points = int(getattr(config, "interpolar_points", 4))
-
-    parser.add_argument(
-        "--cli",
-        action="store_true",
-        help="Run the interactive CLI mode",
-    )
-    parser.add_argument("--ip", default=config.ip_address, help="PLC IP address")
-    parser.add_argument("--port", type=int, default=config.port, help="PLC port")
-    parser.add_argument(
-        "--interpolar-points",
-        type=int,
-        default=default_interpolar_points,
-        help="Fixed number of array elements that must match the PLC struct",
-    )
-    parser.add_argument("--prompt", default="robot> ", help="CLI prompt text")
-    args = parser.parse_args()
-
-    if not args.cli:
-        parser.error("Only --cli mode is implemented right now.")
-
-    if args.interpolar_points <= 0:
-        parser.error("--interpolar-points must be a positive integer.")
-
+def _run_cli(args: argparse.Namespace) -> None:
     ctx = mp.get_context("spawn")
     command_queue: mp.Queue = ctx.Queue()
     response_queue: mp.Queue = ctx.Queue()
@@ -172,6 +147,61 @@ def main() -> None:
         if worker.is_alive():
             worker.terminate()
             worker.join(timeout=5.0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Delta robot command line entrypoint")
+    config = load_config()
+    default_interpolar_points = int(getattr(config, "interpolar_points", 6))
+
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run the interactive CLI mode",
+    )
+    parser.add_argument(
+        "--scheduler",
+        action="store_true",
+        help="Run the offline scheduler simulator/benchmark mode",
+    )
+    parser.add_argument("--ip", default=config.ip_address, help="PLC IP address")
+    parser.add_argument("--port", type=int, default=config.port, help="PLC port")
+    parser.add_argument(
+        "--interpolar-points",
+        type=int,
+        default=default_interpolar_points,
+        help="Fixed number of array elements that must match the PLC struct",
+    )
+    parser.add_argument("--prompt", default="robot> ", help="CLI prompt text")
+    parser.add_argument(
+        "--scenario",
+        default="test_throughput",
+        choices=sorted(SCENARIO_NAMES),
+        help="Scheduler scenario name",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Optional scheduler runtime in seconds. Omit for continuous run.",
+    )
+    args = parser.parse_args()
+
+    if args.interpolar_points <= 0:
+        parser.error("--interpolar-points must be a positive integer.")
+
+    if args.cli == args.scheduler:
+        parser.error("Choose exactly one mode: --cli or --scheduler.")
+
+    if args.cli:
+        _run_cli(args)
+        return
+
+    run_scheduler_scenario(
+        args.scenario,
+        duration_s=args.duration,
+        interpolar_points=args.interpolar_points,
+    )
 
 
 if __name__ == "__main__":

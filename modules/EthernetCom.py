@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "ip_address": "192.168.250.1",
     "port": 502,
     "period_s": 0.1,
-    "interpolar_points": 4,
+    "interpolar_points": 6,
 }
 
 COMMAND_ID = {
@@ -64,12 +64,12 @@ def _coerce_list(values: Iterable[Any], size: int, fill_value: Any = 0.0) -> lis
 def _zero_package(slots: int) -> dict[str, Any]:
     return {
         "commandID": COMMAND_ID["stop"],
-        "argument_number": 0, # AKA interpolar points. equal to slot
+        "argument_number": 0,
         "argument_x": [0.0] * slots,
         "argument_y": [0.0] * slots,
         "argument_z": [0.0] * slots,
         "argument_e": [0.0] * slots,
-        "argument_time": [0.0] * slots
+        "argument_time": [0.0] * slots,
     }
 
 
@@ -306,11 +306,12 @@ if __name__ == "__main__":
         gateway.connect()
         test_package = gateway.build_command(
             "go_trajectory",
-            x=[100.0, 150.0, 200.0, 250.0],
-            y=[0.0, 50.0, 100.0, 150.0],
-            z=[-150.0, -150.0, -150.0, -150.0],
-            t=[0.5, 0.5, 0.5, 0.5],
-            argument_number=4,
+            x=[100.0, 150.0, 200.0, 250.0, 280.0, 300.0],
+            y=[0.0, 50.0, 100.0, 150.0, 180.0, 200.0],
+            z=[-150.0, -150.0, -150.0, -150.0, -150.0, -150.0],
+            e=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            t=[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            argument_number=6,
         )
         gateway.send_package(test_package)
         print("[INFO] test package sent")

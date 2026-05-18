@@ -1,15 +1,21 @@
-pandoc doc/adaptive_conveyor.md -o adaptive_conveyor.pdf --pdf-engine=xelatex -V geometry:margin=2.5cm -V fontsize=12pt -V monofont="DejaVu Sans Mono" 2>&1
-
 # Adaptive Conveyor
 
 ## 1. Overview
 
-Adaptive Conveyor is a mechanism that **automatically adjusts conveyor belt speed** based on the number of products currently awaiting sorting. The goal is to optimize the Delta robot's pick rate by keeping the product density on the belt within the robot's effective processing range.
+Adaptive Conveyor is the future mechanism that provides conveyor-speed state to the pick scheduler and may later also receive control requests back from the system.
 
-**Operating principle:**
+Current repository status:
 
-- When products are **scarce** → the conveyor runs **faster** to bring new products into the workspace sooner.
-- When products are **abundant** → the conveyor **slows down** so the robot has enough time to process each product.
+- scheduler already assumes a conveyor-speed input exists
+- real speed input from `EthernetCom` is **not integrated yet**
+- the current scheduler uses a simulated speed source
+- current software treats speed primarily as an **input to prediction**
+
+The immediate purpose of conveyor-speed data is:
+
+- predict where the object will be at pickup time
+- decide whether the object is still reachable
+- build the outbound leg so the robot arrives slightly early above the future pickup point
 
 ---
 
@@ -28,13 +34,11 @@ $$
 | $\eta$ | Throughput — pick rate | picks/s |
 | $u(t)$ | Number of products on the conveyor at time $t$ | — |
 
-**Physical interpretation:** Conveyor speed is inversely proportional to the number of products. As $u(t)$ increases, $v(t)$ decreases — giving the robot more time to handle each product within the workspace $L_{wk}$.
+This is still a good high-level model for future closed-loop conveyor behavior.
 
-### 2.2. Position and Time Prediction System
+### 2.2. Position and Time Prediction
 
-To pick a product moving on the conveyor, the robot must **predict** the pick position $X_p$ and the travel time $t_p$ required to reach that position.
-
-#### Object Position Equation
+To pick a moving product, the scheduler must estimate a future pickup point:
 
 $$
 X_p = x(t) + v(t) \cdot t_p
@@ -42,14 +46,12 @@ $$
 
 | Symbol | Description |
 |--------|-------------|
-| $X_p$ | Predicted pick position |
-| $x(t)$ | Current position of the product on the conveyor |
-| $v(t)$ | Current conveyor speed |
-| $t_p$ | Time required for the robot to reach $X_p$ |
+| $X_p$ | Predicted pickup position |
+| $x(t)$ | Current product position |
+| $v(t)$ | Conveyor speed sample used by the scheduler |
+| $t_p$ | Time until robot reaches the pickup point |
 
-#### Robot Constraint Equation
-
-Assuming the algorithm operates in **actuator space** and the actuator trajectory approximates a **trapezoidal velocity profile**:
+Robot timing can still be approximated by a travel model:
 
 $$
 t_p = \frac{S}{V_{max}} + \frac{V_{max}}{A_{max}}
@@ -61,61 +63,135 @@ $$
 S = X_p - x(t)
 $$
 
-| Symbol | Description | Unit |
-|--------|-------------|------|
-| $S$ | Distance the robot must travel (in actuator space) | m |
-| $V_{max}$ | Maximum actuator velocity | m/s |
-| $A_{max}$ | Maximum actuator acceleration | m/s² |
+In the current repository, this is simplified in code into a segment-timing model based on:
 
-> **Note:** The two equations above form an implicit system — $X_p$ depends on $t_p$ and vice versa. They must be solved simultaneously (via substitution or iteration) to find a feasible pair $(X_p, t_p)$.
-
----
-
-## 3. Open Questions
-
-### 3.1. Sampling Period of $v(t)$
-
-Should the conveyor speed be updated in **real time** (continuous update) or only **after the robot completes its current pick cycle** (discrete, per-cycle update)?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Real-time** | Fast response to product density changes | Speed change mid-pick → position prediction error |
-| **Per pick cycle** | Stable during pick, easier to control | Slow response to sudden density changes |
-
-### 3.2. Algorithm Workspace
-
-Should the prediction algorithm operate in **joint space** or **actuator space**?
-
-| Space | Characteristics |
-|-------|-----------------|
-| **Joint space** | Direct encoder feedback, no conversion needed. Clear velocity/acceleration limits per joint |
-| **Actuator space** | Closer to Cartesian space, more intuitive for conveyor tracking. However, requires handling singularities and inter-axis coupling |
+- nominal XY speed
+- nominal Z speed
+- a fixed intercept lead time
+- a fixed 6-point path template
 
 ---
 
-## 4. Logic Diagram
+## 3. Current Software Assumptions
+
+The current scheduler implementation uses these practical assumptions:
+
+### 3.1. Speed is frozen while planning one pick
+
+The scheduler uses the latest available speed sample to build one `PickPlan`. That sample is treated as fixed during planning of that cycle.
+
+This is currently the safest software assumption because:
+
+- it avoids continuous mid-pick replanning
+- it is easier to benchmark
+- it matches the current simulator structure
+
+### 3.2. Speed source shape
+
+The future real input is expected to look like:
+
+- `speed`
+- `timestamp`
+
+This matches the current internal `SpeedSample` model.
+
+### 3.3. Current integration path
+
+Planned long-term path:
 
 ```
-┌─────────────┐      ┌──────────────┐      ┌─────────────────┐
-│  Camera /   │────▶│  Count u(t)  │────▶│  Compute v(t)   │
-│  Sensor     │      │  products    │      │  = L_wk·η/u(t)  │
-└─────────────┘      └──────────────┘      └────────┬────────┘
-                                                    │
-                                                    ▼
-                                           ┌─────────────────┐
-                                           │ Update conveyor │
-                                           │ speed           │
-                                           └────────┬────────┘
-                                                    │
-                    ┌──────────────┐                │
-                    │ Solve system │◀──────────────┘
-                    │  (X_p, t_p)  │
-                    └──────┬───────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │  Robot       │
-                    │  executes    │
-                    │  pick        │
-                    └──────────────┘
+Conveyor-speed PLC
+        │
+        ▼
+EthernetCom
+        │
+        ▼
+Scheduler
+        │
+        ▼
+PickPlan
 ```
+
+Current temporary path:
+
+```
+SimulatedSpeedSource
+        │
+        ▼
+Scheduler
+        │
+        ▼
+PickPlan
+```
+
+---
+
+## 4. Relation to the Current Scheduler
+
+The current scheduler does not only choose an object. It also uses conveyor speed to:
+
+1. estimate whether the object is still reachable
+2. predict where the object will be at pickup time
+3. generate the outbound 6-point leg
+4. place point 5 slightly early above the predicted pickup point
+5. descend at point 6 and switch suction on
+
+After pickup, the inbound leg is independent of conveyor speed and goes to the sorting position configured for the object type.
+
+---
+
+## 5. Benchmark Relevance
+
+Conveyor-speed logic directly affects the current benchmark scenarios:
+
+### 5.1. `test_throughput`
+
+- simulated speed changes the rate at which objects enter the reachable pickup window
+- affects queue pressure and number of successful plans
+
+### 5.2. `test_accuracy`
+
+- current test uses fixed points and simulated trace logging
+- useful for validating motion-template timing and logging behavior
+- less focused on conveyor dynamics than `test_throughput`
+
+---
+
+## 6. Current Open Questions
+
+| Question | Current repository choice | Future work |
+|----------|---------------------------|-------------|
+| Should speed update continuously during one pick? | No, current plan is effectively frozen per cycle | Evaluate if late replanning is needed |
+| Where does speed come from? | Simulated speed source | Replace with `EthernetCom` input |
+| Is conveyor speed only an input, or also a control output? | Input only for now | Later may support closed-loop conveyor control |
+| Which space should the prediction live in? | Practical Cartesian-like scheduler approximation | Revisit if actuator/joint constraints become dominant |
+
+---
+
+## 7. Logic Diagram
+
+```
+┌────────────────────┐      ┌─────────────────────┐
+│ Object detections  │────▶│      Scheduler      │
+└────────────────────┘      │                     │
+                            │  predict pickup     │
+┌────────────────────┐────▶│  using speed input  │
+│ Conveyor speed     │      │  build PickPlan     │
+└────────────────────┘      └─────────┬───────────┘
+                                      │
+                                      ▼
+                             ┌──────────────────┐
+                             │ Outbound 6-point │
+                             │ pickup leg       │
+                             └─────────┬────────┘
+                                       │
+                                       ▼
+                             ┌──────────────────┐
+                             │ Inbound 6-point  │
+                             │ sorting leg      │
+                             └──────────────────┘
+```
+
+---
+
+*This document now reflects how conveyor-speed assumptions relate to the scheduler that already exists in the repository, while keeping the original mathematical intuition for future adaptive control.*

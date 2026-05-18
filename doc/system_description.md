@@ -1,10 +1,10 @@
 # System Description — Delta Robot Pick-and-Place Project
 
-> **Last updated:** 2026-04-10
+> **Last updated:** 2026-05-18
 > **Project type:** Graduation thesis
-> **Topic:** Delta robot control for product sorting on a variable-speed conveyor, using YOLO image processing
+> **Topic:** Delta robot control for product sorting on a variable-speed conveyor, using future image processing and a scheduler
 
-> **⚠ Disclaimer:** This document was not written by a professional engineer. Its sole purpose is to provide structured context for AI-assisted development. Technical details may be incomplete or imprecise.
+> **Disclaimer:** This document is a practical project overview aligned to the current repository state. Some future-system details are still provisional.
 
 ---
 
@@ -12,183 +12,261 @@
 
 ### 1.1. Problem Statement
 
-In industrial pick-and-place applications, a delta robot must pick products from a moving conveyor and sort them into designated bins. The core challenge is that the **conveyor speed is not fixed** — it varies adaptively based on system load. This means the robot cannot rely on pre-programmed static trajectories; it must synchronize its motion with a continuously changing target.
+The delta robot must pick products from a moving conveyor and place them into sorting areas. The main difficulty is synchronization:
 
-### 1.2. Final System Vision (Full Scope)
+- the product is moving
+- the robot needs to predict where the product will be
+- the conveyor speed may change over time
+- the robot must still reach the right point at the right time
+
+This creates two connected problems:
+
+1. reliable **motion execution** between PC and PLC
+2. reliable **pick scheduling and prediction** before motion is sent
+
+### 1.2. Full System Vision
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        FULL SYSTEM VISION                           │
 │                                                                     │
-│   Camera ──► PC (YOLO + Scheduler + Trajectory) ──► PLC (NX1P2)     │
-│                                                         │           │
-│                                          ┌──────────────┼────────┐  │
-│                                          │              │        │  │
-│                                          ▼              ▼        ▼  │
-│                                     Servo Drives   Conveyor   Bins  │
-│                                          │                          │
-│                                          ▼                          │
-│                                     Delta Robot                     │
-│                                    (pick & place)                   │
+│ Camera / Vision ─► Scheduler / PickPlan ─► Motion / PLC ─► Robot    │
+│                      ▲                    │                          │
+│                      │                    ▼                          │
+│               Conveyor speed       Sorting zones / bins             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The complete system would include:
+Target full system components:
 
-1. **Camera + YOLO** — detect and classify products on the conveyor
-2. **Tracking + Scheduler** — track product positions, decide pick order and timing
-3. **Trajectory Planning + IK** — compute robot joint trajectories to reach each target
-4. **PLC + Servo Drives** — execute motion in real-time
-5. **Adaptive Conveyor** — adjust conveyor speed based on system load
+1. **Image processing** — detect object position and type
+2. **Scheduler** — predict pick timing/position and select destination
+3. **Trajectory planning** — build 6-point robot legs for pick/place
+4. **PLC communication** — send fixed packages to PLC and read status
+5. **Robot execution** — PLC + EtherCAT + servo system
+6. **Adaptive conveyor** — later provide speed input and possibly closed-loop adjustment
 
-### 1.3. Current Development Phase
+### 1.3. Current Repository State
 
-> **Phase 1 goal: Prove that the PC can command the PLC to move the delta robot along a pre-computed trajectory.**
+The repository is no longer only a raw PLC-motion prototype. It now contains two implemented software tracks:
 
-This phase focuses exclusively on the **motion execution pipeline** — everything from trajectory computation on the PC down to physical motor movement. Vision, scheduling, conveyor control, and UI are deferred.
+1. **CLI mode**
+   - manual commands to send PLC packages
+   - useful for direct motion testing
+
+2. **Offline scheduler mode**
+   - simulated object stream
+   - simulated conveyor speed
+   - `PickPlan` generation
+   - benchmark scenarios for throughput and accuracy
+
+What is still simulated:
+
+- image processing input
+- conveyor-speed input from `EthernetCom`
+- executor feedback for scheduler scenarios
 
 ---
 
-## 2. System Architecture
+## 2. Current Architecture
 
 ### 2.1. Hardware
 
 | # | Component | Model | Qty | Role |
 |---|-----------|-------|-----|------|
-| 1 | Machine Controller | Omron NX1P2-1140DT | 1 | Motion master — receives trajectory from PC, drives servos via EtherCAT |
-| 2 | Servo Driver | Panasonic MADLN05BE (MINAS A6BE) | 3 | EtherCAT slave — executes position commands, returns encoder feedback |
-| 3 | Servo Motor | Panasonic MSMF012L1T2 (MINAS A6) | 3 | 100W AC servo with 23-bit absolute encoder — one per robot arm |
-| 4 | Delta Robot | 3-DOF parallel mechanism | 1 | Mechanical structure driven by the 3 motors |
-| 5 | PC | Laptop / Desktop (Python) | 1 | Computes IK and trajectory, sends packets to PLC |
+| 1 | Machine Controller | Omron NX1P2-1140DT | 1 | Motion master, PLC communication endpoint |
+| 2 | Servo Driver | Panasonic MADLN05BE | 3 | EtherCAT slave |
+| 3 | Servo Motor | Panasonic MSMF012L1T2 | 3 | Actuate the 3 robot axes |
+| 4 | Delta Robot | 3-DOF parallel mechanism | 1 | Pick-and-place structure |
+| 5 | PC | Laptop / Desktop (Python) | 1 | CLI, scheduler, simulator, communication |
 
-> Full hardware specifications: see `system_configuration.md`
+### 2.2. Software Modules in the Repository
 
-### 2.2. Communication Stack
+| Component | Current status | Description |
+|-----------|----------------|-------------|
+| `main.py` | Implemented | Entry point for CLI and scheduler modes |
+| `EthernetCom.py` | Implemented | PLC package normalization and read/write gateway |
+| `cli.py` | Implemented | Manual command parser |
+| `image_processing.py` | Implemented as simulator | Fake object source for scheduler testing |
+| `scheduler.py` | Implemented | Pick-plan generation, trajectory template, scenario runner |
 
-```
-┌────────────┐      Ethernet (TBD)      ┌────────────┐      EtherCAT       ┌────────────┐
-│     PC     │ ───────────────────────► │   NX1P2    │ ──────────────────► │  3x Driver │
-│  (Python)  │ ◄─────────────────────── │   (PLC)    │ ◄────────────────── │  + 3x Motor│
-└────────────┘   Trajectory packets     └────────────┘   CSP mode (cyclic  └────────────┘
-                 Status responses                        position every
-                                                         0.5–4 ms)
-```
+### 2.3. Current Operating Modes
 
-| Link | Protocol | Status | Purpose |
-|------|----------|--------|---------|
-| PC → PLC | EtherNet/IP or TCP Socket | **TBD** | Send trajectory data and commands |
-| PLC → Drivers | EtherCAT (CoE, CSP mode) | **Confirmed** | Real-time servo control, < 1 us jitter |
-
-### 2.3. Software Components
-
-| Component | Runs on | Language | Description |
-|-----------|---------|----------|-------------|
-| Inverse Kinematics | PC | Python | Converts end-effector (x,y,z) to joint angles (θ1,θ2,θ3) |
-| Trajectory Planner | PC | Python | Interpolates between waypoints (linear / trapezoidal / S-curve) |
-| Packet Builder | PC | Python | Serializes trajectory into binary packet for transmission |
-| Communication Client | PC | Python | Sends/receives packets over Ethernet |
-| Packet Parser | PLC | Structured Text | Deserializes received packets, stores in buffer |
-| Motion Executor | PLC | Structured Text | Reads buffer each cycle, writes target position to EtherCAT PDO |
+| Mode | Command | Purpose |
+|------|---------|---------|
+| CLI | `python3 main.py --cli` | Manual PLC command testing |
+| Scheduler benchmark | `python3 main.py --scheduler --scenario test_throughput` | Continuous simulated pick planning |
+| Scheduler accuracy test | `python3 main.py --scheduler --scenario test_accuracy` | Repeated fixed-target planning with logging |
 
 ---
 
-## 3. How It Works (Phase 1)
+## 3. Data Contracts
 
-### Step-by-step
+### 3.1. PC → PLC package
 
-```
- ① PC computes trajectory offline
-    (x,y,z) waypoints → IK → (θ1,θ2,θ3) → interpolation → point array
+The repository currently sends a fixed robot command struct with **6 slots**:
 
- ② PC sends trajectory packet to PLC
-    [Header: ID, N points, cycle time] + [N × (θ1,θ2,θ3)] + [CRC]
-
- ③ PLC buffers the trajectory
-    Stores all N points in internal memory
-
- ④ PLC executes on START command
-    Every 0.5–4 ms: reads next point → writes to 3 servo drives via EtherCAT
-
- ⑤ Servo drives move the motors
-    CSP mode: driver receives position target each cycle, closes position loop
-
- ⑥ Robot moves
-    3 motors rotate → delta mechanism translates to end-effector (x,y,z) motion
-
- ⑦ PC verifies
-    Reads actual encoder positions from PLC → compares with target → evaluates error
+```python
+{
+    "commandID": int,
+    "argument_number": int,
+    "argument_x": [float] * 6,
+    "argument_y": [float] * 6,
+    "argument_z": [float] * 6,
+    "argument_e": [float] * 6,
+    "argument_time": [float] * 6,
+}
 ```
 
-### What success looks like
+Important meaning:
 
-- End-effector follows the commanded trajectory with acceptable position error
-- All 3 axes stay synchronized throughout the motion
-- No communication drops or buffer underruns during execution
+- `argument_number`: active points in the current command
+- `argument_e`: end-effector state timeline along the trajectory
+- array length must stay synchronized with the PLC struct
 
----
+### 3.2. PLC → PC status
 
-## 4. What Changed from the Original Plan
+Current Python code reads:
 
-The project started with a different hardware and scope assumption (documented in `doc(removed)/`). Key changes:
+- `plc_package.task_doing`
+- `plc_package.task_state`
 
-| Aspect | Original (brainstorm) | Current | Why |
-|--------|----------------------|---------|-----|
-| PLC | Siemens S7-1200 | Omron NX1P2-1140DT | Built-in EtherCAT master, native motion control |
-| PLC-Drive link | Modbus TCP / Analog signals | EtherCAT | Real-time, synchronized, industry standard for servo |
-| Motors | Unspecified | Panasonic MSMF012L1T2 (100W) | Available hardware with 23-bit encoder |
-| Drivers | Unspecified | Panasonic MADLN05BE (EtherCAT) | Matched to motors and PLC |
-| Adaptive conveyor | Included (DC Motor + PID) | **Deferred** | Not yet decided if adaptive conveyor will be used |
-| Vision (YOLO) | Included | **Deferred to later phase** | Focus on motion pipeline first |
-| HMI / GUI | Included | **Deferred** | Not a priority |
+### 3.3. Scheduler input/output
 
----
+Current scheduler input model:
 
-## 5. Project Scope by Phase
+- `object_id`
+- `x`, `y`
+- `object_type`
+- `timestamp`
+- conveyor speed sample
 
-### Phase 1 — Trajectory Execution (current)
+Current scheduler output model:
 
-| In scope | Out of scope |
-|----------|-------------|
-| Inverse Kinematics (PC) | Image processing (YOLO) |
-| Trajectory planning (PC) | Object tracking / scheduling |
-| PC → PLC communication | Conveyor control |
-| PLC motion execution (EtherCAT + CSP) | HMI / GUI |
-| Encoder feedback verification | Physical buttons / safety I/O |
+- `PickPlan`
 
-> Detailed workflow: see `workflow.md`
+`PickPlan` includes:
 
-### Phase 2+ — Future (not yet planned in detail)
-
-- Integrate camera + YOLO for real-time product detection
-- Implement pick scheduler with priority queue
-- Add conveyor control (if adaptive conveyor is adopted)
-- Closed-loop: vision → schedule → trajectory → execute → feedback
-- Performance evaluation: throughput, miss rate, position accuracy
+- predicted pickup time
+- predicted pickup position
+- sorting destination
+- outbound 6-point trajectory
+- inbound 6-point trajectory
 
 ---
 
-## 6. Open Questions
+## 4. Motion and Scheduling Logic
 
-| # | Question | Impact | Status |
-|---|----------|--------|--------|
-| 1 | PC ↔ PLC communication method? | Determines packet design and library choice | **TBD** — investigating EtherNet/IP vs TCP Socket |
-| 2 | Driver 50W vs Motor 100W — compatible? | May limit torque/speed if mismatched | **Needs verification** |
-| 3 | Where does interpolation happen? | PC sends every point vs PLC interpolates sparse points | **TBD** |
-| 4 | Will adaptive conveyor be used? | Affects overall system complexity and Phase 2 scope | **TBD** |
-| 5 | IK on PC or PLC long-term? | PC is easier to debug; PLC is real-time | Phase 1: PC. Revisit later |
+### 4.1. CLI path
+
+CLI mode is the direct operator path:
+
+1. user types a command
+2. CLI converts it into a normalized PLC package
+3. worker process sends that package to the PLC
+4. main process reads and prints PLC status
+
+### 4.2. Scheduler path
+
+Scheduler mode is the planning/operator path:
+
+1. simulated image-processing module emits fake detections
+2. simulated speed source emits conveyor speed samples
+3. scheduler predicts pickup timing and position
+4. scheduler chooses the sorting destination from config
+5. scheduler builds a `PickPlan`
+6. the plan contains:
+   - outbound leg to the conveyor
+   - inbound leg to the sorting position
+
+### 4.3. 6-point leg template
+
+Each leg currently uses a 6-point template.
+
+Outbound leg intent:
+
+1. leave current position
+2. rise to safe clearance
+3. move through blended corner
+4. approach intercept zone
+5. arrive slightly early above the predicted object location
+6. descend and enable suction
+
+Inbound leg intent:
+
+1. leave pickup point
+2. rise to clearance
+3. move through blended corner
+4. approach sorting zone
+5. arrive above sorting target
+6. descend and release
 
 ---
 
-## 7. Document Index
+## 5. Development Phases
 
-| File | Location | Description |
-|------|----------|-------------|
-| `system_configuration.md` | `doc/` | Hardware specs, communication options, compatibility notes |
-| `workflow.md` | `doc/` | Phase 1 data flow, packet format, PLC state machine, sequence diagram |
-| `system_description.md` | `doc/` | This file — project overview and big picture |
-| `brainstorm_review.md` | `doc(removed)/` | Original brainstorm (reference only — many ideas changed) |
-| `workflow_algo.md` | `doc(removed)/` | Original algorithm design (reference only) |
+### Phase 1 — Motion execution
+
+Implemented:
+
+- PLC package generation
+- CLI manual commands
+- PLC worker process
+- connection-state handling in `EthernetCom`
+
+### Phase 1.5 — Offline scheduler simulation
+
+Implemented:
+
+- fake object stream
+- fake speed stream
+- `PickPlan` generation
+- `test_throughput` scenario
+- `test_accuracy` scenario
+- `data.log` trace output for accuracy runs
+
+### Phase 2 — Real integration
+
+Planned next steps:
+
+- replace fake detections with real image-processing output
+- replace fake speed with real speed from `EthernetCom`
+- connect `PickPlan` execution to real PLC motion commands
+- validate pickup timing on the real conveyor
 
 ---
 
-*This file provides the high-level view of the project. For implementation details, see the linked documents above.*
+## 6. Main Constraints
+
+- PLC-side struct must remain synchronized with Python
+- current fixed array length is **6**
+- scheduler must be testable without real image processing
+- object type routing must come from config
+- pick logic must support one full cycle: pick leg + place leg
+
+---
+
+## 7. Open Questions
+
+| # | Question | Current state |
+|---|----------|---------------|
+| 1 | Real PC ↔ PLC transport details | Still needs final confirmation |
+| 2 | Real conveyor-speed source shape | Planned through `EthernetCom` |
+| 3 | Real image-processing interface | Not integrated yet |
+| 4 | Driver/motor power compatibility | Still needs verification |
+| 5 | Whether adaptive conveyor will become closed-loop output, not only input | Still open |
+
+---
+
+## 8. Document Index
+
+| File | Description |
+|------|-------------|
+| `system_configuration.md` | Hardware and software configuration, including config variables |
+| `workflow.md` | Current repository workflow for CLI and scheduler |
+| `adaptive_conveyor.md` | Conveyor prediction assumptions and future control notes |
+| `python_scripts_beginner_guide.md` | Beginner-oriented explanation of the Python code |
+
+---
+
+*This document is the high-level project map. For exact runtime parameters, use `system_configuration.md` and `modules/config.json` as the primary references.*

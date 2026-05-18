@@ -1,113 +1,67 @@
 # Delta Robot
 
-This repository contains the current Python-side control code for a delta robot that exchanges fixed PLC packages over Ethernet.
+This repository contains Python-side tooling for a delta robot that exchanges fixed PLC packages over Ethernet and now also includes an offline scheduler simulator.
 
-At the moment, only `--cli` mode is implemented. Other execution modes can be added later without changing the PLC package structure.
+## Current modes
 
-## Current scope
+- `--cli`: manual PLC command mode
+- `--scheduler`: offline scheduler simulation and benchmark mode
 
-- Start a worker process that talks to the PLC through `pylogix`
-- Open an interactive CLI for manual testing
-- Send fixed-structure command packages to the PLC tag `pc_package`
-- Read basic PLC status from the PLC tag `plc_package`
+## Fixed PLC package
 
-## Important rule: do not change the package structure
+The PLC struct must keep the same members and the same fixed array length.
 
-The PLC struct is already declared on the PLC side, so the Python package must keep the same members and the same fixed array length.
+Current fixed slot count:
 
-Current outgoing PC package:
+- `interpolar_points = 6`
+
+Outgoing PC package:
 
 ```python
 {
     "commandID": int,
     "argument_number": int,
-    "argument_x": [float] * interpolar_points,
-    "argument_y": [float] * interpolar_points,
-    "argument_z": [float] * interpolar_points,
-    "argument_e": [float] * interpolar_points,
-    "argument_time": [float] * interpolar_points,
+    "argument_x": [float] * 6,
+    "argument_y": [float] * 6,
+    "argument_z": [float] * 6,
+    "argument_e": [float] * 6,
+    "argument_time": [float] * 6,
 }
 ```
 
-Important notes:
+Notes:
 
-- `interpolar_points` is the fixed array length of the struct.
-- `argument_number` is the number of valid points used by the current command.
-- If a field is unused, it must still be sent and padded with `0.0`.
-- `argument_e` is only meaningful for trajectory commands.
-- For non-trajectory commands, `argument_e` is sent as all zeros.
-
-## PLC tags
-
-- Write from PC to PLC: `pc_package`
-- Read from PLC to PC: `plc_package`
-
-The current status probe reads:
-
-- `plc_package.task_doing`
-- `plc_package.task_state`
-
-## Requirements
-
-- Python 3.10 or newer is recommended
-- `pylogix`
-- A PLC program that already defines compatible `pc_package` and `plc_package` structs
-
-Install dependency:
-
-```bash
-pip install pylogix
-```
+- `argument_number` is the number of active points
+- unused elements must still be sent as `0.0`
+- `argument_e` is used for end-effector state along trajectory points
 
 ## Configuration
 
-Default configuration is stored in [modules/config.json](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json):
+Main configuration lives in [modules/config.json](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json).
 
-```json
-{
-    "ip_address": "192.168.250.1",
-    "port": 502,
-    "period_s": 0.1,
-    "interpolar_points": 4
-}
-```
+It now contains:
 
-Meaning:
+- PLC connection defaults
+- fixed `interpolar_points = 6`
+- object-type mapping
+- sorting position, for example `object_A`
+- scheduler motion and benchmark settings
 
-- `ip_address`: PLC IP address
-- `port`: PLC port
-- `period_s`: reserved for future use
-- `interpolar_points`: fixed array size of the PLC package
+## CLI usage
 
-Do not change `interpolar_points` unless the PLC struct is changed to exactly match it.
-
-## How to run
-
-Run the CLI:
+Run the PLC CLI:
 
 ```bash
 python3 main.py --cli
 ```
 
-Optional arguments:
+Optional example:
 
 ```bash
-python3 main.py --cli --ip 192.168.250.1 --port 502 --interpolar-points 4 --prompt "robot> "
+python3 main.py --cli --ip 192.168.250.1 --port 502 --interpolar-points 6
 ```
 
-Available arguments:
-
-- `--cli`: start interactive CLI mode
-- `--ip`: override PLC IP address
-- `--port`: override PLC port
-- `--interpolar-points`: fixed array length for the package
-- `--prompt`: custom CLI prompt text
-
-If `--cli` is not provided, the program exits with an error because no other mode is implemented yet.
-
-## CLI commands
-
-After the CLI starts, these commands are available:
+Supported commands:
 
 - `stop`
 - `go <theta1> <theta2> <theta3>`
@@ -117,124 +71,45 @@ After the CLI starts, these commands are available:
 - `pick`
 - `release`
 - `status`
-- `help`
-- `quit`
-- `exit`
 
-### Command meanings
+## Scheduler usage
 
-- `stop`
-  Sends command ID `0` to stop motion.
+Run the throughput scenario:
 
-- `go <theta1> <theta2> <theta3>`
-  Sends a relative joint move using command ID `1`.
-
-- `goto <x> <y> <z>`
-  Sends an absolute Cartesian move using command ID `2`.
-
-- `go_trajectory <demo|square|home>`
-  Sends a predefined trajectory using command ID `3`.
-
-- `calib`
-  Sends command ID `4`.
-
-- `pick`
-  Sends command ID `5` to close or activate the end effector.
-
-- `release`
-  Sends command ID `6` to open or release the end effector.
-
-- `status`
-  Reads the current PLC status package.
-
-### Examples
-
-```text
-robot> go 5 0 -5
-robot> goto 0 0 -200
-robot> go_trajectory home
-robot> pick
-robot> release
-robot> status
+```bash
+python3 main.py --scheduler --scenario test_throughput
 ```
 
-## Trajectory presets
+Run the accuracy scenario for a limited time:
 
-The current CLI contains these built-in presets in [modules/cli.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py):
-
-- `demo`
-- `square`
-- `home`
-
-Each trajectory point contains:
-
-```python
-{
-    "x": float,
-    "y": float,
-    "z": float,
-    "e": float,
-    "time": float,
-}
+```bash
+python3 main.py --scheduler --scenario test_accuracy --duration 5
 ```
 
-Meaning:
+Scheduler characteristics:
 
-- `x`, `y`, `z`: Cartesian target
-- `e`: end-effector state along the trajectory
-- `time`: segment time
+- input: simulated object detections plus simulated conveyor speed
+- future integration point: image processing module and EthernetCom speed source
+- output: `PickPlan`
+- each cycle includes:
+  - outbound leg to conveyor pickup
+  - inbound leg to sorting zone
+- each leg uses a 6-point trajectory template
 
-Convention for `e`:
+### Default scheduler scenarios
 
-- `0.0`: open / release
-- `1.0`: pick / close
+- `test_throughput`
+  - continuous fake object stream
+  - keeps planning until stopped or until `--duration` expires
 
-## Example package: `go_trajectory home`
-
-With `interpolar_points = 4`, the preset `home` currently has one active point:
-
-```python
-{
-    "commandID": 3,
-    "argument_number": 1,
-    "argument_x": [0.0, 0.0, 0.0, 0.0],
-    "argument_y": [0.0, 0.0, 0.0, 0.0],
-    "argument_z": [-200.0, 0.0, 0.0, 0.0],
-    "argument_e": [0.0, 0.0, 0.0, 0.0],
-    "argument_time": [0.6, 0.0, 0.0, 0.0],
-}
-```
-
-Why it looks like this:
-
-- Only the first slot is active because `argument_number = 1`
-- The remaining slots must still exist because the PLC struct has fixed-length arrays
-- `argument_e` is present even when not used by this preset
-
-## Connection behavior
-
-PLC communication is handled by `PLCGateway` in [modules/EthernetCom.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py).
-
-Current behavior:
-
-- `connect()` does not just set a flag
-- it tries to read PLC status tags first
-- `self.connected` becomes `True` only if that probe succeeds
-- read/write failures force `self.connected = False`
-- `disconnect()` closes the communication object and then marks the gateway as disconnected
-
-This is meant to keep the Python-side connection state closer to the real communication state.
+- `test_accuracy`
+  - repeatedly targets 3 fixed points
+  - logs simulated position updates to `data.log`
 
 ## File overview
 
-- [main.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/main.py): entry point, argument parsing, worker process, CLI startup
-- [modules/cli.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): command parsing and package creation for CLI commands
-- [modules/EthernetCom.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication, packet normalization, config loading
-- [Algorithm.md](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/Algorithm.md): high-level workflow notes
-
-## Known limitations
-
-- Only CLI mode is implemented
-- Only a small PLC status subset is read
-- Trajectories are currently hardcoded presets
-- Image processing and scheduler mode mentioned in `Algorithm.md` are not implemented here yet
+- [main.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/main.py): entrypoint for CLI and scheduler modes
+- [modules/EthernetCom.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication and packet normalization
+- [modules/cli.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): manual command parser
+- [modules/image_processing.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): fake image-processing object source
+- [modules/scheduler.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py): pick-plan logic, trajectory template, and scenario runner
