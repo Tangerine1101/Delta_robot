@@ -7,7 +7,7 @@ from typing import Any
 
 from modules.EthernetCom import PLCGateway, load_config
 from modules.cli import run_interactive
-from modules.scheduler import SCENARIO_NAMES, run_scheduler_scenario
+from modules.scheduler import RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
 
 
 def _worker(
@@ -149,10 +149,95 @@ def _run_cli(args: argparse.Namespace) -> None:
             worker.join(timeout=5.0)
 
 
+def _run_scheduler(args: argparse.Namespace) -> None:
+    if args.simulate_executor:
+        run_scheduler_scenario(
+            args.scenario,
+            duration_s=args.duration,
+            interpolar_points=args.interpolar_points,
+        )
+        return
+
+    ctx = mp.get_context("spawn")
+    command_queue: mp.Queue = ctx.Queue()
+    response_queue: mp.Queue = ctx.Queue()
+    worker = ctx.Process(
+        target=_worker,
+        args=(
+            command_queue,
+            response_queue,
+            args.ip,
+            args.port,
+            args.interpolar_points,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    startup = _wait_for_response(response_queue, timeout=10.0)
+    if startup is None:
+        print("[WARN] PLC worker did not report readiness in time")
+    elif startup.get("ok"):
+        print(f"[INFO] Worker connected to {startup.get('ip')}:{startup.get('port')}")
+    else:
+        print(f"[ERROR] Worker failed to start: {startup.get('error')}")
+        command_queue.put({"type": "shutdown"})
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=2.0)
+        return
+
+    def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
+        command_queue.put({"type": "send", "package": package})
+        response = _wait_for_response(response_queue, timeout=10.0)
+        if response is None:
+            raise TimeoutError("no response from PLC worker while sending scheduler package")
+        if not response.get("ok", False):
+            raise RuntimeError(str(response.get("error")))
+        return response.get("status")
+
+    def request_status() -> dict[str, Any] | None:
+        command_queue.put({"type": "status"})
+        response = _wait_for_response(response_queue, timeout=10.0)
+        if response is None:
+            raise TimeoutError("no response from PLC worker while polling status")
+        if not response.get("ok", False):
+            raise RuntimeError(str(response.get("error")))
+        return response.get("data")
+
+    config = load_config()
+    scheduler_config = getattr(config, "scheduler", {}) or {}
+    wait_margin_s = float(scheduler_config.get("execution_margin_s", 0.3))
+    status_poll_interval_s = float(scheduler_config.get("poll_interval_s", 0.05))
+    executor = RealRobotExecutor(
+        dispatch,
+        request_status,
+        interpolar_points=args.interpolar_points,
+        wait_margin_s=wait_margin_s,
+        status_poll_interval_s=status_poll_interval_s,
+    )
+
+    try:
+        run_scheduler_scenario(
+            args.scenario,
+            duration_s=args.duration,
+            interpolar_points=args.interpolar_points,
+            executor=executor,
+        )
+    finally:
+        command_queue.put({"type": "shutdown"})
+        _wait_for_response(response_queue, timeout=5.0)
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=5.0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Delta robot command line entrypoint")
     config = load_config()
-    default_interpolar_points = int(getattr(config, "interpolar_points", 6))
+    default_interpolar_points = int(getattr(config, "interpolar_points", 4))
 
     parser.add_argument(
         "--cli",
@@ -185,6 +270,11 @@ def main() -> None:
         default=None,
         help="Optional scheduler runtime in seconds. Omit for continuous run.",
     )
+    parser.add_argument(
+        "--simulate-executor",
+        action="store_true",
+        help="Run scheduler without sending PickPlan trajectories to the PLC",
+    )
     args = parser.parse_args()
 
     if args.interpolar_points <= 0:
@@ -197,11 +287,7 @@ def main() -> None:
         _run_cli(args)
         return
 
-    run_scheduler_scenario(
-        args.scenario,
-        duration_s=args.duration,
-        interpolar_points=args.interpolar_points,
-    )
+    _run_scheduler(args)
 
 
 if __name__ == "__main__":

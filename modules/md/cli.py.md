@@ -17,33 +17,29 @@ class CommandPlan:
     quit_requested: bool = False
 
 
-PRESET_TRAJECTORIES: dict[str, list[dict[str, Any]]] = {
+PRESET_TRAJECTORIES: dict[str, list[dict[str, float]]] = {
     "demo": [
-        {"x": 100.0, "y": 0.0, "z": -220.0, "e": 0, "time": 0.4},
-        {"x": 120.0, "y": 20.0, "z": -220.0, "e": 0, "time": 0.4},
-        {"x": 140.0, "y": 0.0, "z": -220.0, "e": 0, "time": 0.4},
-        {"x": 140.0, "y": -20.0, "z": -220.0, "e": 0, "time": 0.4},
+        {"x": 100.0, "y": 0.0, "z": -220.0, "e": 0.0, "time": 0.4},
+        {"x": 120.0, "y": 20.0, "z": -220.0, "e": 0.0, "time": 0.4},
+        {"x": 140.0, "y": 0.0, "z": -220.0, "e": 0.0, "time": 0.4},
+        {"x": 140.0, "y": -20.0, "z": -220.0, "e": 0.0, "time": 0.4},
     ],
     "square": [
-        {"x": 80.0, "y": 80.0, "z": -230.0, "e": 0, "time": 0.35},
-        {"x": 120.0, "y": 80.0, "z": -230.0, "e": 0, "time": 0.35},
-        {"x": 120.0, "y": 120.0, "z": -230.0, "e": 0, "time": 0.35},
-        {"x": 80.0, "y": 120.0, "z": -230.0, "e": 0, "time": 0.35},
+        {"x": 80.0, "y": 80.0, "z": -230.0, "e": 0.0, "time": 0.35},
+        {"x": 120.0, "y": 80.0, "z": -230.0, "e": 0.0, "time": 0.35},
+        {"x": 120.0, "y": 120.0, "z": -230.0, "e": 0.0, "time": 0.35},
+        {"x": 80.0, "y": 120.0, "z": -230.0, "e": 0.0, "time": 0.35},
     ],
     "home": [
-        {"x": 0.0, "y": 0.0, "z": -260.0, "e": 0, "time": 0.6},
+        {"x": 0.0, "y": 0.0, "z": -200.0, "e": 0.0, "time": 0.6},
     ],
 }
 
 
-def _pad(
-    values: Iterable[Any],
-    interpolar_points: int = INTERPOLAR_POINTS,
-    fill_value: Any = 0.0,
-) -> list[Any]:
+def _pad(values: Iterable[float], interpolar_points: int = INTERPOLAR_POINTS) -> list[float]:
     items = list(values)[:interpolar_points]
     if len(items) < interpolar_points:
-        items.extend([fill_value] * (interpolar_points - len(items)))
+        items.extend([0.0] * (interpolar_points - len(items)))
     return items
 
 
@@ -54,14 +50,14 @@ def _zero_command(command_name: str, interpolar_points: int = INTERPOLAR_POINTS)
         argument_x=[0.0] * interpolar_points,
         argument_y=[0.0] * interpolar_points,
         argument_z=[0.0] * interpolar_points,
-        argument_e=[0] * interpolar_points,
+        argument_e=[0.0] * interpolar_points,
         argument_time=[0.0] * interpolar_points,
     ).to_dict(interpolar_points)
 
 
 def _trajectory_command(
     name: str,
-    points: list[dict[str, Any]],
+    points: list[dict[str, float]],
     interpolar_points: int = INTERPOLAR_POINTS,
 ) -> dict[str, Any]:
     del name
@@ -75,8 +71,8 @@ def _trajectory_command(
         argument_x=_pad((point["x"] for point in points), interpolar_points),
         argument_y=_pad((point["y"] for point in points), interpolar_points),
         argument_z=_pad((point["z"] for point in points), interpolar_points),
-        argument_e=_pad((1 if point.get("e", 0) else 0 for point in points), interpolar_points, 0),
-        argument_time=_pad((point["time"] for point in points), interpolar_points, 0.0),
+        argument_e=_pad((point.get("e", 0.0) for point in points), interpolar_points),
+        argument_time=_pad((point["time"] for point in points), interpolar_points),
     ).to_dict(interpolar_points)
 
 
@@ -90,10 +86,10 @@ def _joint_command(
     return RobotPacket(
         commandID=COMMAND_ID[command_name],
         argument_number=1,
-        argument_x=_pad([theta1], interpolar_points, 0.0),
-        argument_y=_pad([theta2], interpolar_points, 0.0),
-        argument_z=_pad([theta3], interpolar_points, 0.0),
-        argument_e=[0] * interpolar_points,
+        argument_x=_pad([theta1], interpolar_points),
+        argument_y=_pad([theta2], interpolar_points),
+        argument_z=_pad([theta3], interpolar_points),
+        argument_e=[0.0] * interpolar_points,
         argument_time=[0.0] * interpolar_points,
     ).to_dict(interpolar_points)
 
@@ -108,10 +104,10 @@ def _cartesian_command(
     return RobotPacket(
         commandID=COMMAND_ID[command_name],
         argument_number=1,
-        argument_x=_pad([x], interpolar_points, 0.0),
-        argument_y=_pad([y], interpolar_points, 0.0),
-        argument_z=_pad([z], interpolar_points, 0.0),
-        argument_e=[0] * interpolar_points,
+        argument_x=_pad([x], interpolar_points),
+        argument_y=_pad([y], interpolar_points),
+        argument_z=_pad([z], interpolar_points),
+        argument_e=[0.0] * interpolar_points,
         argument_time=[0.0] * interpolar_points,
     ).to_dict(interpolar_points)
 
@@ -199,14 +195,7 @@ def _print_help() -> None:
 def format_status(status: dict[str, Any] | None) -> str:
     if not status:
         return "[INFO] no PLC status available"
-    parts: list[str] = []
-    for key, value in status.items():
-        if isinstance(value, list):
-            rendered = "[" + ", ".join(str(item) for item in value) + "]"
-        else:
-            rendered = str(value)
-        parts.append(f"{key}={rendered}")
-    return "[INFO] PLC status: " + ", ".join(parts)
+    return "[INFO] PLC status: " + ", ".join(f"{key}={value}" for key, value in status.items())
 
 
 def run_interactive(

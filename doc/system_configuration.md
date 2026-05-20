@@ -170,20 +170,23 @@ The Python code currently normalizes and writes this fixed package:
 {
     "commandID": int,
     "argument_number": int,
-    "argument_x": [float] * 6,
-    "argument_y": [float] * 6,
-    "argument_z": [float] * 6,
-    "argument_e": [float] * 6,
-    "argument_time": [float] * 6,
+    "argument_x": [float] * 4,
+    "argument_y": [float] * 4,
+    "argument_z": [float] * 4,
+    "argument_e": [byte] * 4,
+    "argument_time": [float] * 4,
+    "doing_bit": byte,
 }
 ```
 
 Important rules:
 
-- fixed array length is now `6`
+- fixed array length is now `4`
 - `argument_number` is the number of active points in the current command
 - unused slots must still be sent as `0.0`
 - `argument_e` is used to control end-effector state along the trajectory
+- `0` means release/open, `1` means pick/on
+- `doing_bit` is written as `1` when PC posts a new command
 
 ### 5.4. Current command IDs
 
@@ -212,7 +215,7 @@ Source of truth:
 | `ip_address` | `192.168.250.1` | Default PLC IP address |
 | `port` | `502` | Default PLC port |
 | `period_s` | `0.1` | Reserved timing/config period |
-| `interpolar_points` | `6` | Fixed PLC trajectory slot count |
+| `interpolar_points` | `4` | Fixed PLC trajectory slot count |
 
 ### 6.2. Object-type routing config
 
@@ -228,10 +231,10 @@ Source of truth:
 | `scheduler.home_position` | `[0.0, 0.0, -180.0]` | Robot rest/start position |
 | `scheduler.clearance_height` | `-165.0` | Safe travel Z during horizontal motion |
 | `scheduler.pickup_height` | `-230.0` | Pickup Z at conveyor |
+| `scheduler.pre_pick_height` | `-210.0` | Z of `D_goto`, the short pre-pick point above independent `A_pick` |
 | `scheduler.place_height` | `-205.0` | Placement Z at sorting area |
 | `scheduler.corner_blend_xy` | `35.0` | XY blend amount for the smoothed-square path |
 | `scheduler.intercept_lead_time_s` | `0.14` | Early-arrival margin above predicted pickup point |
-| `scheduler.pickup_descent_time_s` | `0.14` | Final descent time during pickup |
 | `scheduler.release_descent_time_s` | `0.14` | Final descent time during release |
 | `scheduler.nominal_xy_speed` | `220.0` | XY timing model for segment durations |
 | `scheduler.nominal_z_speed` | `180.0` | Z timing model for segment durations |
@@ -239,6 +242,8 @@ Source of truth:
 | `scheduler.speed_timeout_s` | `1.0` | Reject planning if speed sample is too old |
 | `scheduler.poll_interval_s` | `0.05` | Scheduler loop polling interval |
 | `scheduler.default_speed` | `80.0` | Default simulated conveyor speed |
+| `scheduler.robot_movement_delay_s` | `0.05` | Constant D_goto to A_pick movement delay used in pick dispatch compensation |
+| `scheduler.ethernet_delay_s` | `0.002` | Temporary communication delay assumption for pick dispatch compensation |
 | `scheduler.pickup_window_x` | `[-120.0, 120.0]` | Allowed pickup X workspace |
 | `scheduler.pickup_window_y` | `[-120.0, 120.0]` | Allowed pickup Y workspace |
 | `scheduler.throughput_object_types` | `["object_A"]` | Types emitted in throughput simulation |
@@ -281,7 +286,7 @@ Current scheduler scenarios:
 | 2 | Real PLC transport details | **TBD** | Current code assumes PLC tag reads/writes through `pylogix` |
 | 3 | Real conveyor-speed source integration | **Planned** | Scheduler still uses simulated speed source |
 | 4 | Real image-processing integration | **Planned** | Scheduler still uses simulated detections |
-| 5 | PLC-side struct synchronization for 6 points | **Must be kept aligned** | Python now assumes fixed arrays of length 6 |
+| 5 | PLC-side struct synchronization for 4 points | **Must be kept aligned** | Python now assumes fixed arrays of length 4 |
 
 ---
 

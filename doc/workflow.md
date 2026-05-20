@@ -82,25 +82,28 @@ status read from plc_package.task_doing / task_state
 
 ### 3.4. Current PLC package shape
 
-The Python code always sends a fixed struct of length 6:
+The Python code always sends a fixed struct of length 4:
 
 ```python
 {
     "commandID": int,
     "argument_number": int,
-    "argument_x": [float] * 6,
-    "argument_y": [float] * 6,
-    "argument_z": [float] * 6,
-    "argument_e": [float] * 6,
-    "argument_time": [float] * 6,
+    "argument_x": [float] * 4,
+    "argument_y": [float] * 4,
+    "argument_z": [float] * 4,
+    "argument_e": [byte] * 4,
+    "argument_time": [float] * 4,
+    "doing_bit": byte,
 }
 ```
 
 Rules:
 
 - `argument_number` tells how many points are active
-- all arrays must still have length 6 even if only 1 point is used
+- all arrays must still have length 4 even if only 1 point is used
 - `argument_e` defines end-effector state along the trajectory
+- `0` means release/open, `1` means pick/on
+- `doing_bit` is set to `1` by PC when a new command is sent, then reset by PLC
 
 ---
 
@@ -153,7 +156,7 @@ At each polling cycle:
 4. reject detections outside pickup workspace
 5. resolve sorting destination from object type
 6. predict pickup position and pickup time
-7. build outbound and inbound trajectories
+7. build `goto` and `pick` trajectory phases
 8. emit one `PickPlan`
 9. execute it in the simulator
 10. update metrics
@@ -189,45 +192,55 @@ It currently contains:
 - source position
 - predicted pickup time
 - predicted pickup position
+- pick dispatch time after delay compensation
 - sorting destination
-- outbound trajectory
-- inbound trajectory
+- `goto` trajectory
+- `pick` trajectory
 
 ### 5.2. One pick cycle
 
 One full cycle includes:
 
-1. **outbound leg** to the conveyor
-2. **inbound leg** to the sorting position
+1. **goto phase** to the pre-pick point above the conveyor object
+2. **pick phase** to descend, suction-pick, move to sorting zone, and release
 
-### 5.3. 6-point trajectory template
+### 5.3. 4-point trajectory template
 
-Both legs currently use 6 points because the PLC package now has 6 slots.
+Both phases currently use 4 points because the PLC package has 4 trajectory slots.
 
-#### Outbound leg intent
+#### Goto phase intent
 
 1. leave the current position
-2. move to clearance
-3. follow a blended horizontal corner
-4. approach the intercept path
-5. arrive slightly early above the predicted pickup point
-6. descend and switch suction on
+2. move through the first blended corner at clearance
+3. approach the conveyor side of the smoothed-square path
+4. stop at `D_goto`, slightly above `A_pick`
 
-#### Inbound leg intent
+#### Pick phase intent
 
-1. leave the pickup point
-2. move to clearance
-3. follow a blended horizontal corner
-4. approach the sorting path
-5. arrive above the sorting point
-6. descend and release
+1. move from `D_goto` to `A_pick` and enable suction
+2. move through `B_pick`, which is the same Cartesian point as `C_goto`
+3. move through `C_pick`, which is the same Cartesian point as `B_goto`
+4. move to `D_pick` at the sorting point and release
 
 ### 5.4. `argument_e` usage
 
-- outbound leg typically ends with `argument_e = 1.0`
-- inbound leg typically ends with `argument_e = 0.0`
+- `goto` phase keeps `argument_e = 0`
+- `pick` phase starts with `argument_e = 1` and ends with `argument_e = 0`
 
 So the gripper state is embedded into the trajectory timeline, not only sent as a separate pick/release command.
+
+### 5.5. Pick dispatch timing
+
+Because PLC-side trajectory time planning is not available yet, Python sends the `pick` package at the corrected pickup dispatch time:
+
+```text
+t_p(real) = t_p(theory) - robot_movement_delay_s - ethernet_delay_s
+```
+
+Current defaults:
+
+- `robot_movement_delay_s = 0.05`
+- `ethernet_delay_s = 0.002`
 
 ---
 
@@ -261,7 +274,7 @@ Next logical integration steps:
 1. replace simulated detections with real image-processing output
 2. read real conveyor speed through `EthernetCom`
 3. connect `PickPlan` execution to real PLC motion command generation
-4. validate the 6-point template on the actual robot
+4. validate the 4-point, 2-phase template on the actual robot
 
 ---
 

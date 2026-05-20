@@ -27,10 +27,10 @@ class TrajectoryPoint:
     x: float
     y: float
     z: float
-    e: int
+    e: float
     time_s: float
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, float]:
         return {
             "x": self.x,
             "y": self.y,
@@ -463,7 +463,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 goto_points,
-                [0, 0, 0, 0],
+                [0.0, 0.0, 0.0, 0.0],
                 goto_times,
             )
         ]
@@ -483,7 +483,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 pick_points,
-                [1, 1, 1, 0],
+                [1.0, 1.0, 1.0, 0.0],
                 pick_times,
             )
         ]

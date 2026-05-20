@@ -41,7 +41,7 @@ Target full system components:
 
 1. **Image processing** — detect object position and type
 2. **Scheduler** — predict pick timing/position and select destination
-3. **Trajectory planning** — build 6-point robot legs for pick/place
+3. **Trajectory planning** — build 4-point `goto` and `pick` phases
 4. **PLC communication** — send fixed packages to PLC and read status
 5. **Robot execution** — PLC + EtherCAT + servo system
 6. **Adaptive conveyor** — later provide speed input and possibly closed-loop adjustment
@@ -104,24 +104,26 @@ What is still simulated:
 
 ### 3.1. PC → PLC package
 
-The repository currently sends a fixed robot command struct with **6 slots**:
+The repository currently sends a fixed robot command struct with **4 slots**:
 
 ```python
 {
     "commandID": int,
     "argument_number": int,
-    "argument_x": [float] * 6,
-    "argument_y": [float] * 6,
-    "argument_z": [float] * 6,
-    "argument_e": [float] * 6,
-    "argument_time": [float] * 6,
+    "argument_x": [float] * 4,
+    "argument_y": [float] * 4,
+    "argument_z": [float] * 4,
+    "argument_e": [byte] * 4,
+    "argument_time": [float] * 4,
+    "doing_bit": byte,
 }
 ```
 
 Important meaning:
 
 - `argument_number`: active points in the current command
-- `argument_e`: end-effector state timeline along the trajectory
+- `argument_e`: end-effector state timeline along the trajectory, using `0` and `1`
+- `doing_bit`: PC-to-PLC new-command handshake bit
 - array length must stay synchronized with the PLC struct
 
 ### 3.2. PLC → PC status
@@ -148,10 +150,11 @@ Current scheduler output model:
 `PickPlan` includes:
 
 - predicted pickup time
+- compensated pick dispatch time
 - predicted pickup position
 - sorting destination
-- outbound 6-point trajectory
-- inbound 6-point trajectory
+- `goto` 4-point trajectory
+- `pick` 4-point trajectory
 
 ---
 
@@ -176,30 +179,32 @@ Scheduler mode is the planning/operator path:
 4. scheduler chooses the sorting destination from config
 5. scheduler builds a `PickPlan`
 6. the plan contains:
-   - outbound leg to the conveyor
-   - inbound leg to the sorting position
+   - `goto` phase to the pre-pick point
+   - `pick` phase to pick and then release at the sorting position
 
-### 4.3. 6-point leg template
+### 4.3. 4-point phase template
 
-Each leg currently uses a 6-point template.
+Each scheduler phase currently uses a 4-point template.
 
-Outbound leg intent:
+Goto phase intent:
 
 1. leave current position
-2. rise to safe clearance
-3. move through blended corner
-4. approach intercept zone
-5. arrive slightly early above the predicted object location
-6. descend and enable suction
+2. move through a blended corner at safe clearance
+3. approach the conveyor side of the path
+4. stop at `D_goto`, slightly above `A_pick`
 
-Inbound leg intent:
+Pick phase intent:
 
-1. leave pickup point
-2. rise to clearance
-3. move through blended corner
-4. approach sorting zone
-5. arrive above sorting target
-6. descend and release
+1. move from independent `D_goto` to independent `A_pick` and enable suction
+2. move through `B_pick`, which corresponds to `C_goto`
+3. move through `C_pick`, which corresponds to `B_goto`
+4. move to `D_pick` at the sorting target and release
+
+The real `pick` package dispatch time is corrected in Python:
+
+```text
+t_p(real) = t_p(theory) - robot_movement_delay_s - ethernet_delay_s
+```
 
 ---
 

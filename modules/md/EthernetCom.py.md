@@ -61,10 +61,6 @@ def _coerce_list(values: Iterable[Any], size: int, fill_value: Any = 0.0) -> lis
     return result
 
 
-def _coerce_flag_byte(value: Any) -> int:
-    return 1 if bool(value) else 0
-
-
 def _zero_package(slots: int) -> dict[str, Any]:
     return {
         "commandID": COMMAND_ID["stop"],
@@ -72,9 +68,8 @@ def _zero_package(slots: int) -> dict[str, Any]:
         "argument_x": [0.0] * slots,
         "argument_y": [0.0] * slots,
         "argument_z": [0.0] * slots,
-        "argument_e": [0] * slots,
+        "argument_e": [0.0] * slots,
         "argument_time": [0.0] * slots,
-        "bit_doing": 0,
     }
 
 
@@ -87,9 +82,8 @@ class RobotPacket:
     argument_x: list[float] = field(default_factory=list)
     argument_y: list[float] = field(default_factory=list)
     argument_z: list[float] = field(default_factory=list)
-    argument_e: list[int] = field(default_factory=list)
+    argument_e: list[float] = field(default_factory=list)
     argument_time: list[float] = field(default_factory=list)
-    bit_doing: int = 1
 
     def to_dict(self, slots: int) -> dict[str, Any]:
         package = _zero_package(slots)
@@ -98,9 +92,8 @@ class RobotPacket:
         package["argument_x"] = _coerce_list(self.argument_x, slots, 0.0)
         package["argument_y"] = _coerce_list(self.argument_y, slots, 0.0)
         package["argument_z"] = _coerce_list(self.argument_z, slots, 0.0)
-        package["argument_e"] = [_coerce_flag_byte(value) for value in _coerce_list(self.argument_e, slots, 0)]
+        package["argument_e"] = _coerce_list(self.argument_e, slots, 0.0)
         package["argument_time"] = _coerce_list(self.argument_time, slots, 0.0)
-        package["bit_doing"] = _coerce_flag_byte(self.bit_doing)
         return package
 
 
@@ -133,18 +126,6 @@ class PLCGateway:
 
     def _status_tags(self) -> list[str]:
         return [
-            f"{self.tag_read}.pos_angular[0]",
-            f"{self.tag_read}.pos_angular[1]",
-            f"{self.tag_read}.pos_angular[2]",
-            f"{self.tag_read}.pos_EE[0]",
-            f"{self.tag_read}.pos_EE[1]",
-            f"{self.tag_read}.pos_EE[2]",
-            f"{self.tag_read}.task_doing",
-            f"{self.tag_read}.task_state",
-        ]
-
-    def _probe_tags(self) -> list[str]:
-        return [
             f"{self.tag_read}.task_doing",
             f"{self.tag_read}.task_state",
         ]
@@ -161,7 +142,7 @@ class PLCGateway:
 
     def _probe_connection(self) -> bool:
         try:
-            response = self._read_tags(self._probe_tags())
+            response = self._read_tags(self._status_tags())
         except Exception:
             return False
         return self._response_has_success(response)
@@ -207,20 +188,10 @@ class PLCGateway:
             normalized["commandID"] = int(package.get("commandID", COMMAND_ID["stop"]))
             normalized["argument_number"] = int(package.get("argument_number", 0))
             for field_name in ARRAY_FIELDS:
-                fill_value = 0 if field_name == "argument_e" else 0.0
                 normalized[field_name] = _coerce_list(
-                    package.get(field_name, []), self.interpolar_points, fill_value
+                    package.get(field_name, []), self.interpolar_points, 0.0
                 )
-            normalized["argument_e"] = [
-                _coerce_flag_byte(value) for value in normalized["argument_e"]
-            ]
-            normalized["bit_doing"] = _coerce_flag_byte(
-                package.get("bit_doing", package.get("doing_bit", 1))
-            )
             package = normalized
-
-        if package["commandID"] == COMMAND_ID["goto_absolute"]:
-            package["argument_e"] = [0] * self.interpolar_points
 
         return package
 
@@ -259,7 +230,6 @@ class PLCGateway:
             self.connect()
 
         normalized = self._normalize_package(package)
-        normalized["bit_doing"] = 1
         for key, value in normalized.items():
             if isinstance(value, list):
                 for index, item in enumerate(value):
@@ -285,29 +255,13 @@ class PLCGateway:
             return None
 
         status_dict: dict[str, Any] = {}
-        list_values: dict[str, dict[int, Any]] = {}
         for item in response:
             status = getattr(item, "Status", None)
             if status is not None and str(status).lower() != "success":
                 continue
             tag_name = getattr(item, "TagName", "")
             key_name = tag_name.split(".")[-1]
-            value = getattr(item, "Value", None)
-            if "[" in key_name and key_name.endswith("]"):
-                base_name, raw_index = key_name[:-1].split("[", 1)
-                try:
-                    index = int(raw_index)
-                except ValueError:
-                    status_dict[key_name] = value
-                    continue
-                list_values.setdefault(base_name, {})[index] = value
-                continue
-            status_dict[key_name] = value
-
-        for base_name, indexed_values in list_values.items():
-            status_dict[base_name] = [
-                indexed_values[index] for index in sorted(indexed_values)
-            ]
+            status_dict[key_name] = getattr(item, "Value", None)
 
         self.connected = True
         return status_dict or None
@@ -355,7 +309,7 @@ if __name__ == "__main__":
             x=[100.0, 150.0, 200.0, 250.0],
             y=[0.0, 50.0, 100.0, 150.0],
             z=[-150.0, -150.0, -150.0, -150.0],
-            e=[0, 0, 1, 1],
+            e=[0.0, 0.0, 1.0, 1.0],
             t=[0.5, 0.5, 0.5, 0.5],
             argument_number=config.interpolar_points,
         )

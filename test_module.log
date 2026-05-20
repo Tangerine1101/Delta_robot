@@ -1,0 +1,4 @@
+{"timestamp_ms": 0.51, "event": "server_started", "plc_package": {"pos_angular": [0.0, 0.0, -1.8], "pos_EE": [0.0, 0.0, -180.0], "task_doing": 0, "task_state": 0, "end_effector": 0.0}, "host": "127.0.0.1", "port": 1502, "interpolar_points": 4, "protocol": "json-lines"}
+{"timestamp_ms": 246662.698, "event": "server_stopped", "plc_package": {"pos_angular": [0.0, 0.0, -1.8], "pos_EE": [0.0, 0.0, -180.0], "task_doing": 0, "task_state": 0, "end_effector": 0.0}}
+{"timestamp_ms": 0.434, "event": "server_started", "plc_package": {"pos_angular": [0.0, 0.0, -1.8], "pos_EE": [0.0, 0.0, -180.0], "task_doing": 0, "task_state": 0, "end_effector": 0.0}, "host": "127.0.0.1", "port": 1502, "interpolar_points": 4, "protocol": "json-lines"}
+{"timestamp_ms": 190516.351, "event": "server_stopped", "plc_package": {"pos_angular": [0.0, 0.0, -1.8], "pos_EE": [0.0, 0.0, -180.0], "task_doing": 0, "task_state": 0, "end_effector": 0.0}}

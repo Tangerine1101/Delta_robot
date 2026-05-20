@@ -15,7 +15,8 @@ The immediate purpose of conveyor-speed data is:
 
 - predict where the object will be at pickup time
 - decide whether the object is still reachable
-- build the outbound leg so the robot arrives slightly early above the future pickup point
+- build the `goto` phase so the robot waits at `D_goto`, slightly above the future pickup point
+- dispatch the `pick` phase at the compensated pickup time
 
 ---
 
@@ -68,7 +69,8 @@ In the current repository, this is simplified in code into a segment-timing mode
 - nominal XY speed
 - nominal Z speed
 - a fixed intercept lead time
-- a fixed 6-point path template
+- fixed `robot_movement_delay_s` and `ethernet_delay_s` compensation
+- a fixed 4-point, 2-phase path template
 
 ---
 
@@ -132,11 +134,11 @@ The current scheduler does not only choose an object. It also uses conveyor spee
 
 1. estimate whether the object is still reachable
 2. predict where the object will be at pickup time
-3. generate the outbound 6-point leg
-4. place point 5 slightly early above the predicted pickup point
-5. descend at point 6 and switch suction on
+3. generate the 4-point `goto` phase to `D_goto`
+4. compute `t_p(real) = t_p(theory) - robot_movement_delay_s - ethernet_delay_s`
+5. dispatch the 4-point `pick` phase at `t_p(real)`
 
-After pickup, the inbound leg is independent of conveyor speed and goes to the sorting position configured for the object type.
+After pickup, the remaining points of the `pick` phase are independent of conveyor speed and go to the sorting position configured for the object type.
 
 ---
 
@@ -181,14 +183,14 @@ Conveyor-speed logic directly affects the current benchmark scenarios:
                                       │
                                       ▼
                              ┌──────────────────┐
-                             │ Outbound 6-point │
-                             │ pickup leg       │
+                             │ Goto 4-point     │
+                             │ pre-pick phase   │
                              └─────────┬────────┘
                                        │
                                        ▼
                              ┌──────────────────┐
-                             │ Inbound 6-point  │
-                             │ sorting leg      │
+                             │ Pick 4-point     │
+                             │ pick/release     │
                              └──────────────────┘
 ```
 

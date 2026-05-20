@@ -6,7 +6,7 @@ Tài liệu này ban đầu được viết để giải thích luồng **CLI + 
 
 Codebase hiện tại đã thay đổi thêm:
 
-- `interpolar_points` mặc định bây giờ là `6`, không còn là `4`
+- `interpolar_points` mặc định bây giờ là `4`
 - có thêm mode `--scheduler`
 - có thêm [modules/image_processing.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py:1)
 - có thêm [modules/scheduler.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py:1)
