@@ -18,8 +18,7 @@ Position3D = tuple[float, float, float]
 
 @dataclass(frozen=True)
 class SpeedSample:
-    vx: float
-    vy: float
+    speed: float
     timestamp: float
 
 
@@ -28,10 +27,10 @@ class TrajectoryPoint:
     x: float
     y: float
     z: float
-    e: int
+    e: float
     time_s: float
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, float]:
         return {
             "x": self.x,
             "y": self.y,
@@ -49,10 +48,10 @@ class PickPlan:
     detected_at: float
     source_position_2d: tuple[float, float]
     cycle_start_position: Position3D
-    assumed_speed: tuple[float, float]
+    assumed_speed: float
     predicted_pick_time: float
     pick_dispatch_time: float
-    predicted_pick_position_2d: tuple[float, float, float]
+    predicted_pick_position_2d: tuple[float, float]
     sorting_position: Position3D
     trajectory_goto: list[TrajectoryPoint]
     trajectory_pick: list[TrajectoryPoint]
@@ -78,7 +77,6 @@ class PickPlan:
             "predicted_pick_position_2d": [
                 round(self.predicted_pick_position_2d[0], 3),
                 round(self.predicted_pick_position_2d[1], 3),
-                round(self.predicted_pick_position_2d[2], 3),
             ],
             "sorting_position": [round(value, 3) for value in self.sorting_position],
             "duration_s": round(self.total_duration(), 3),
@@ -129,7 +127,7 @@ class SchedulerSettings:
     stale_timeout_s: float
     speed_timeout_s: float
     poll_interval_s: float
-    default_speed: tuple[float, float]
+    default_speed: float
     robot_movement_delay_s: float
     ethernet_delay_s: float
     pickup_window_x: tuple[float, float]
@@ -144,27 +142,6 @@ class SchedulerSettings:
     throughput_emit_interval_s: float
     accuracy_emit_interval_s: float
     execution_margin_s: float
-
-    def validate(self) -> None:
-        # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
-        # Therefore, clearance_height must be higher (less negative) than pre_pick_height,
-        # which must be higher than pickup_height.
-        # Format: clearance_height > pre_pick_height > pickup_height
-        if self.clearance_height <= self.pre_pick_height:
-            raise ValueError(
-                f"Configuration Error: clearance_height ({self.clearance_height}) must be higher "
-                f"than pre_pick_height ({self.pre_pick_height}) in physical space (less negative)."
-            )
-        if self.pre_pick_height <= self.pickup_height:
-            raise ValueError(
-                f"Configuration Error: pre_pick_height ({self.pre_pick_height}) must be higher "
-                f"than pickup_height ({self.pickup_height}) in physical space (less negative)."
-            )
-        if self.clearance_height < self.place_height:
-            raise ValueError(
-                f"Configuration Error: clearance_height ({self.clearance_height}) must be higher "
-                f"than or equal to place_height ({self.place_height}) in physical space."
-            )
 
     @classmethod
     def from_config(cls, config: Any) -> "SchedulerSettings":
@@ -189,7 +166,7 @@ class SchedulerSettings:
             )
         ]
 
-        settings = cls(
+        return cls(
             home_position=_coerce_position3d(
                 scheduler_raw.get("home_position", [0.0, 0.0, -180.0]),
                 (0.0, 0.0, -180.0),
@@ -206,10 +183,7 @@ class SchedulerSettings:
             stale_timeout_s=float(scheduler_raw.get("stale_timeout_s", 5.0)),
             speed_timeout_s=float(scheduler_raw.get("speed_timeout_s", 1.0)),
             poll_interval_s=float(scheduler_raw.get("poll_interval_s", 0.05)),
-            default_speed=_coerce_vector2d(
-                scheduler_raw.get("default_speed", [80.0, 0.0]),
-                (80.0, 0.0),
-            ),
+            default_speed=float(scheduler_raw.get("default_speed", 80.0)),
             robot_movement_delay_s=float(scheduler_raw.get("robot_movement_delay_s", 0.05)),
             ethernet_delay_s=float(scheduler_raw.get("ethernet_delay_s", 0.002)),
             pickup_window_x=_coerce_range(
@@ -231,8 +205,6 @@ class SchedulerSettings:
             accuracy_emit_interval_s=float(scheduler_raw.get("accuracy_emit_interval_s", 0.8)),
             execution_margin_s=float(scheduler_raw.get("execution_margin_s", 0.3)),
         )
-        settings.validate()
-        return settings
 
 
 class SimulatedSpeedSource:
@@ -243,14 +215,12 @@ class SimulatedSpeedSource:
 
     def sample(self, now: float) -> SpeedSample:
         if self.scenario_name == "test_accuracy":
-            return SpeedSample(vx=0.0, vy=0.0, timestamp=now)
+            return SpeedSample(speed=0.0, timestamp=now)
 
         elapsed = now - self.start_time
         band = int(elapsed // 4.0) % 3
         scale = [0.8, 1.0, 1.2][band]
-        vx = self.settings.default_speed[0] * scale
-        vy = self.settings.default_speed[1] * scale
-        return SpeedSample(vx=vx, vy=vy, timestamp=now)
+        return SpeedSample(speed=self.settings.default_speed * scale, timestamp=now)
 
 
 class SimulatedExecutor:
@@ -421,7 +391,6 @@ class PickScheduler:
 
     def update_speed(self, sample: SpeedSample) -> None:
         self.latest_speed = sample
-        print(f"[SPEED] vx={sample.vx:.4f} vy={sample.vy:.4f} t={sample.timestamp:.4f}", flush=True)
 
     def prune_stale(self, now: float) -> None:
         kept: list[ObjectDetection] = []
@@ -494,7 +463,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 goto_points,
-                [0, 0, 0, 0],
+                [0.0, 0.0, 0.0, 0.0],
                 goto_times,
             )
         ]
@@ -514,7 +483,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 pick_points,
-                [1, 1, 1, 0],
+                [1.0, 1.0, 1.0, 0.0],
                 pick_times,
             )
         ]
@@ -531,10 +500,10 @@ class PickScheduler:
             detected_at=detection.timestamp,
             source_position_2d=(detection.x, detection.y),
             cycle_start_position=self.current_position,
-            assumed_speed=(self.latest_speed.vx, self.latest_speed.vy),
+            assumed_speed=self.latest_speed.speed,
             predicted_pick_time=predicted_pick_time,
             pick_dispatch_time=pick_dispatch_time,
-            predicted_pick_position_2d=(pick_position[0], pick_position[1], pick_position[2]),
+            predicted_pick_position_2d=(pick_position[0], pick_position[1]),
             sorting_position=sorting_position,
             trajectory_goto=trajectory_goto,
             trajectory_pick=trajectory_pick,
@@ -562,12 +531,12 @@ class PickScheduler:
         command_delay_s = self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         guess_pick_time = now + max(self.settings.intercept_lead_time_s, command_delay_s)
         predicted_x = detection.x
-        predicted_y = detection.y
         for _ in range(6):
-            dt = max(0.0, guess_pick_time - detection.timestamp)
-            predicted_x = detection.x + speed_sample.vx * dt
-            predicted_y = detection.y + speed_sample.vy * dt
-            pick_position = (predicted_x, predicted_y, self.settings.pickup_height)
+            predicted_x = detection.x + speed_sample.speed * max(
+                0.0,
+                guess_pick_time - detection.timestamp,
+            )
+            pick_position = (predicted_x, detection.y, self.settings.pickup_height)
             if not self._within_workspace(pick_position):
                 return None
             goto_points = _build_goto_geometry(
@@ -585,10 +554,11 @@ class PickScheduler:
                 guess_pick_time = new_guess
                 break
             guess_pick_time = new_guess
-        dt = max(0.0, guess_pick_time - detection.timestamp)
-        predicted_x = detection.x + speed_sample.vx * dt
-        predicted_y = detection.y + speed_sample.vy * dt
-        pick_position = (predicted_x, predicted_y, self.settings.pickup_height)
+        predicted_x = detection.x + speed_sample.speed * max(
+            0.0,
+            guess_pick_time - detection.timestamp,
+        )
+        pick_position = (predicted_x, detection.y, self.settings.pickup_height)
         if not self._within_workspace(pick_position):
             return None
         pick_dispatch_time = guess_pick_time - command_delay_s
@@ -605,12 +575,6 @@ def _coerce_position3d(raw_value: Any, fallback: Position3D) -> Position3D:
     if not isinstance(raw_value, (list, tuple)) or len(raw_value) != 3:
         return fallback
     return float(raw_value[0]), float(raw_value[1]), float(raw_value[2])
-
-
-def _coerce_vector2d(raw_value: Any, fallback: tuple[float, float]) -> tuple[float, float]:
-    if not isinstance(raw_value, (list, tuple)) or len(raw_value) != 2:
-        return fallback
-    return float(raw_value[0]), float(raw_value[1])
 
 
 def _coerce_range(raw_value: Any, fallback: tuple[float, float]) -> tuple[float, float]:
@@ -639,22 +603,16 @@ def _build_goto_geometry(
 ) -> list[Position3D]:
     dx = pick_position[0] - start_position[0]
     dy = pick_position[1] - start_position[1]
-    d = math.hypot(dx, dy)
-    if d > 0.001:
-        u_x = dx / d
-        u_y = dy / d
-    else:
-        u_x = 0.0
-        u_y = 0.0
-    blend = min(d * 0.5, settings.corner_blend_xy)
+    blend_x = min(abs(dx) * 0.5, settings.corner_blend_xy)
+    blend_y = min(abs(dy) * 0.5, settings.corner_blend_xy)
     return [
-        # A_goto: lift to clearance height above start position
         (start_position[0], start_position[1], settings.clearance_height),
-        # B_goto: blend offset from start toward pick, at clearance
-        (start_position[0] + u_x * blend, start_position[1] + u_y * blend, settings.clearance_height),
-        # C_goto: directly above pick position at clearance (shared with B_pick)
-        (pick_position[0], pick_position[1], settings.clearance_height),
-        # D_goto: descend to pre-pick height above pick
+        (start_position[0] + _sign(dx) * blend_x, start_position[1], settings.clearance_height),
+        (
+            pick_position[0] - _sign(dx) * blend_x,
+            pick_position[1] - _sign(dy) * blend_y,
+            settings.clearance_height,
+        ),
         (pick_position[0], pick_position[1], settings.pre_pick_height),
     ]
 
@@ -678,24 +636,13 @@ def _build_pick_geometry(
     settings: SchedulerSettings,
     goto_points: list[Position3D],
 ) -> list[Position3D]:
-    dx = sorting_position[0] - pick_position[0]
-    dy = sorting_position[1] - pick_position[1]
-    d = math.hypot(dx, dy)
-    if d > 0.001:
-        u_x = dx / d
-        u_y = dy / d
-    else:
-        u_x = 0.0
-        u_y = 0.0
-    blend = min(d * 0.5, settings.corner_blend_xy)
+    # The pick phase reuses the goto geometry: B_pick == C_goto and C_pick == B_goto.
+    b_goto = goto_points[1]
+    c_goto = goto_points[2]
     return [
-        # A_pick: at pickup height (suction ON)
         pick_position,
-        # B_pick: directly above pick at clearance height (shared with C_goto)
-        (pick_position[0], pick_position[1], settings.clearance_height),
-        # C_pick: blend offset from sort toward pick, at clearance
-        (sorting_position[0] - u_x * blend, sorting_position[1] - u_y * blend, settings.clearance_height),
-        # D_pick: at sorting position, place height
+        c_goto,
+        b_goto,
         (sorting_position[0], sorting_position[1], settings.place_height),
     ]
 
