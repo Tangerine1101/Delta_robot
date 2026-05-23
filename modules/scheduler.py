@@ -51,7 +51,7 @@ class PickPlan:
     assumed_speed: float
     predicted_pick_time: float
     pick_dispatch_time: float
-    predicted_pick_position_2d: tuple[float, float]
+    predicted_pick_position_2d: tuple[float, float, float]
     sorting_position: Position3D
     trajectory_goto: list[TrajectoryPoint]
     trajectory_pick: list[TrajectoryPoint]
@@ -77,6 +77,7 @@ class PickPlan:
             "predicted_pick_position_2d": [
                 round(self.predicted_pick_position_2d[0], 3),
                 round(self.predicted_pick_position_2d[1], 3),
+                round(self.predicted_pick_position_2d[2], 3),
             ],
             "sorting_position": [round(value, 3) for value in self.sorting_position],
             "duration_s": round(self.total_duration(), 3),
@@ -503,7 +504,7 @@ class PickScheduler:
             assumed_speed=self.latest_speed.speed,
             predicted_pick_time=predicted_pick_time,
             pick_dispatch_time=pick_dispatch_time,
-            predicted_pick_position_2d=(pick_position[0], pick_position[1]),
+            predicted_pick_position_2d=(pick_position[0], pick_position[1], pick_position[2]),
             sorting_position=sorting_position,
             trajectory_goto=trajectory_goto,
             trajectory_pick=trajectory_pick,

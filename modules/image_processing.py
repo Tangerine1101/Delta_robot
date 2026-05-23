@@ -41,9 +41,9 @@ class SimulatedImageProcessing:
         raw_points = config.get(
             "accuracy_points",
             [
-                [40.0, -60.0, -220.0],
-                [0.0, 0.0, -220.0],
-                [-40.0, 60.0, -220.0],
+                [40.0, -60.0, -300.0],
+                [0.0, 0.0, -300.0],
+                [-40.0, 60.0, -300.0],
             ],
         )
         self.accuracy_points = [(float(point[0]), float(point[1])) for point in raw_points]

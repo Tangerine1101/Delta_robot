@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,6 +105,79 @@ class RobotPacket:
         return package
 
 
+class MockPLC:
+    """Mock PLC that uses JSON-lines TCP protocol to communicate with test_module."""
+
+    def __init__(self) -> None:
+        self.IPAddress = "127.0.0.1"
+        self.Port = 502
+        self._socket: socket.socket | None = None
+
+    def Connect(self) -> bool:
+        if self._socket is not None:
+            return True
+        try:
+            self._socket = socket.create_connection((self.IPAddress, self.Port), timeout=2.0)
+            return True
+        except Exception:
+            self._socket = None
+            return False
+
+    def Close(self) -> None:
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+
+    def Write(self, tag_name: str, value: Any) -> Any:
+        if self._socket is None:
+            if not self.Connect():
+                class MockResponse:
+                    Status = "Connection Error"
+                return MockResponse()
+        try:
+            req = {"action": "write", "tag": tag_name, "value": value}
+            self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
+            resp_bytes = self._socket.recv(4096)
+            if not resp_bytes:
+                raise ConnectionError("Connection closed by peer")
+            resp = json.loads(resp_bytes.decode("utf-8").strip())
+            class MockResponse:
+                Status = "Success" if resp.get("ok") else resp.get("error", "Error")
+            return MockResponse()
+        except Exception as exc:
+            self.Close()
+            class MockResponse:
+                Status = str(exc)
+            return MockResponse()
+
+    def Read(self, tags: list[str]) -> list[Any] | None:
+        if self._socket is None:
+            if not self.Connect():
+                return None
+        try:
+            req = {"action": "read", "tags": tags}
+            self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
+            resp_bytes = self._socket.recv(4096)
+            if not resp_bytes:
+                raise ConnectionError("Connection closed by peer")
+            resp = json.loads(resp_bytes.decode("utf-8").strip())
+            if not resp.get("ok"):
+                return None
+            values = resp.get("values", {})
+            class MockResponseItem:
+                def __init__(self, tag_name: str, val: Any) -> None:
+                    self.TagName = tag_name
+                    self.Value = val
+                    self.Status = "Success"
+            return [MockResponseItem(t, values.get(t)) for t in tags]
+        except Exception:
+            self.Close()
+            return None
+
+
 class PLCGateway:
     """Simple PLC gateway built on top of pylogix."""
 
@@ -125,11 +199,15 @@ class PLCGateway:
         self.tag_read = tag_read
         self.connected = False
 
-        self.plc = PLC() if PLC is not None else None
-        if self.plc is not None:
+        if PLC is not None and self.ip not in ("127.0.0.1", "localhost"):
+            self.plc = PLC()
             self.plc.IPAddress = self.ip
             if hasattr(self.plc, "Port"):
                 self.plc.Port = self.port
+        else:
+            self.plc = MockPLC()
+            self.plc.IPAddress = self.ip
+            self.plc.Port = self.port
 
     def _status_tags(self) -> list[str]:
         return [

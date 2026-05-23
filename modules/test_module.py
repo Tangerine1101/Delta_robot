@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from datetime import datetime
 
 from modules.EthernetCom import ARRAY_FIELDS, COMMAND_ID, COMMAND_NAME, load_config
 
@@ -28,14 +29,80 @@ class FakePLCState:
     interpolar_points: int
     log_path: Path
     sample_period_s: float
+    home_position: Position3D = (0.0, 0.0, -300.0)
     started_at: float = field(default_factory=time.monotonic)
-    position: Position3D = (0.0, 0.0, -180.0)
+    position: Position3D = field(init=False)
     end_effector: int = 0
     task_doing: int = COMMAND_ID["stop"]
     task_state: int = 0
     last_pc_package: dict[str, Any] | None = None
     motion_queue: list[MotionTarget] = field(default_factory=list)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def __post_init__(self) -> None:
+        self.position = self.home_position
+        self.accumulated_pc_package = {
+            "commandID": COMMAND_ID["stop"],
+            "argument_number": 0,
+            "argument_x": [0.0] * self.interpolar_points,
+            "argument_y": [0.0] * self.interpolar_points,
+            "argument_z": [0.0] * self.interpolar_points,
+            "argument_e": [0] * self.interpolar_points,
+            "argument_time": [0.0] * self.interpolar_points,
+            "bit_doing": 0,
+        }
+
+    def handle_tag_write(self, tag: str, value: Any) -> bool:
+        parts = tag.split(".", 1)
+        if len(parts) < 2:
+            return False
+        field_part = parts[1]
+
+        with self.lock:
+            if "[" in field_part and field_part.endswith("]"):
+                name, index_str = field_part[:-1].split("[", 1)
+                try:
+                    index = int(index_str)
+                    if name in self.accumulated_pc_package and 0 <= index < self.interpolar_points:
+                        self.accumulated_pc_package[name][index] = value
+                except ValueError:
+                    return False
+            else:
+                if field_part in self.accumulated_pc_package:
+                    self.accumulated_pc_package[field_part] = value
+
+            if field_part in ("bit_doing", "doing_bit") and int(value) == 1:
+                self.accumulated_pc_package[field_part] = 0
+                self.accept_pc_package(self.accumulated_pc_package)
+        return True
+
+    def handle_tag_read(self, tags: list[str]) -> dict[str, Any]:
+        plc_pkg = self.build_plc_package()
+        values = {}
+        for tag in tags:
+            parts = tag.split(".", 1)
+            if len(parts) < 2:
+                values[tag] = None
+                continue
+            field_part = parts[1]
+
+            with self.lock:
+                if "[" in field_part and field_part.endswith("]"):
+                    name, index_str = field_part[:-1].split("[", 1)
+                    try:
+                        index = int(index_str)
+                        if name in plc_pkg and 0 <= index < len(plc_pkg[name]):
+                            values[tag] = plc_pkg[name][index]
+                        else:
+                            values[tag] = None
+                    except ValueError:
+                        values[tag] = None
+                else:
+                    if field_part in plc_pkg:
+                        values[tag] = plc_pkg[field_part]
+                    else:
+                        values[tag] = None
+        return values
 
     def normalize_pc_package(self, package: dict[str, Any]) -> dict[str, Any]:
         normalized = {
@@ -79,7 +146,7 @@ class FakePLCState:
                             normalized["argument_y"][0],
                             normalized["argument_z"][0],
                         ),
-                        0.5,
+                        1.0,
                         self.end_effector,
                     )
                 ]
@@ -92,7 +159,7 @@ class FakePLCState:
                 self.end_effector = 0
                 self.task_state = 0
             elif command_id == COMMAND_ID["calibrate"]:
-                self.position = (0.0, 0.0, -180.0)
+                self.position = self.home_position
                 self.end_effector = 0
                 self.motion_queue.clear()
                 self.task_state = 0
@@ -116,7 +183,7 @@ class FakePLCState:
                         package["argument_y"][index],
                         package["argument_z"][index],
                     ),
-                    max(package["argument_time"][index], self.sample_period_s),
+                    1.0,
                     package["argument_e"][index],
                 )
             )
@@ -132,15 +199,22 @@ class FakePLCState:
             "end_effector": self.end_effector,
         }
 
+    def get_status_str(self) -> str:
+        pkg = self.build_plc_package()
+        parts = []
+        for key, value in pkg.items():
+            if isinstance(value, list):
+                rendered = "[" + ", ".join(str(item) for item in value) + "]"
+            else:
+                rendered = str(value)
+            parts.append(f"{key}={rendered}")
+        return "[INFO] PLC status: " + ", ".join(parts)
+
     def log_event(self, event: str, payload: dict[str, Any] | None = None) -> None:
-        entry = {
-            "timestamp_ms": round((time.monotonic() - self.started_at) * 1000.0, 3),
-            "event": event,
-            "plc_package": self.build_plc_package(),
-        }
-        if payload:
-            entry.update(payload)
-        line = json.dumps(entry, ensure_ascii=True)
+        now = datetime.now()
+        timestamp = now.strftime("%H:%M:%S.%f")[:-3]
+        status_str = self.get_status_str()
+        line = f"[{timestamp}] {status_str}"
         print(line, flush=True)
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -195,7 +269,18 @@ class FakePLCRequestHandler(socketserver.StreamRequestHandler):
                 continue
             try:
                 message = json.loads(line)
-                response = state.accept_pc_package(message)
+                action = message.get("action")
+                if action == "write":
+                    tag = message.get("tag", "")
+                    value = message.get("value")
+                    ok = state.handle_tag_write(tag, value)
+                    response = {"ok": ok}
+                elif action == "read":
+                    tags = message.get("tags", [])
+                    values = state.handle_tag_read(tags)
+                    response = {"ok": True, "values": values}
+                else:
+                    response = state.accept_pc_package(message)
             except Exception as exc:
                 response = {"ok": False, "error": str(exc)}
                 state.log_event("error", response)
@@ -250,11 +335,13 @@ def run_fake_plc(
     sample_period_s: float,
     self_test: bool,
     duration_s: float | None,
+    home_position: Position3D,
 ) -> None:
     state = FakePLCState(
         interpolar_points=interpolar_points,
         log_path=log_path,
         sample_period_s=sample_period_s,
+        home_position=home_position,
     )
     stop_event = threading.Event()
     motion_thread = threading.Thread(
@@ -341,6 +428,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    scheduler_raw = getattr(config, "scheduler", {}) or {}
+    raw_home = scheduler_raw.get("home_position", [0.0, 0.0, -300.0])
+    home_position = (float(raw_home[0]), float(raw_home[1]), float(raw_home[2]))
+
     run_fake_plc(
         host=args.host,
         port=args.port,
@@ -349,6 +440,7 @@ def main() -> None:
         sample_period_s=max(args.sample_period, 0.01),
         self_test=args.self_test,
         duration_s=args.duration,
+        home_position=home_position,
     )
 
 

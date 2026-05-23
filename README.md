@@ -157,3 +157,40 @@ Scheduler characteristics:
 - [modules/cli.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): manual command parser
 - [modules/image_processing.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): fake image-processing object source
 - [modules/scheduler.py](/home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py): pick-plan logic, trajectory template, and scenario runner
+
+## Issues & Roadmap (Updated: 23/5)
+
+Here is the list of identified issues and the sequential plan to address them:
+
+### 1. Hardcoded Conveyor Axis (X-Axis Speed Limitation)
+* **Problem:** The conveyor speed prediction model assumes the conveyor runs strictly parallel to the $X$ axis (`predicted_x = detection.x + speed * dt`).
+* **Impact:** If the conveyor runs along the $Y$ axis, or at an angle relative to the robot's base frame, the prediction will be incorrect.
+* **Resolution Plan (Phase 1):**
+  1. Add a 2D velocity vector configuration `conveyor_velocity_vector: [v_x, v_y]` in `config.json` instead of a scalar speed.
+  2. Refactor `modules/scheduler.py` (`_predict_pick_position`) to calculate predictions in 2D using the velocity vector:
+     $$\mathbf{P}_{\text{pick\_xy}} = \mathbf{P}_{\text{detect\_xy}} + \mathbf{v}_{\text{conveyor}} \times \Delta t$$
+  3. Update `modules/image_processing.py` to spawn objects and move them using the 2D velocity.
+
+### 2. Overspecified Parameters Without Clear Documentation
+* **Problem:** `config.json` contains a large number of interrelated height and timing parameters without sufficient documentation.
+* **Impact:** High configuration complexity makes manual calibration error-prone, potentially leading to mechanical crashes.
+* **Resolution Plan (Phase 2):**
+  1. Document the exact physical meaning and safe ranges of each setting in a dedicated configuration guide (`doc/configuration_guide.md`).
+  2. Add automatic validation logic in `modules/scheduler.py` during initialization to enforce logical safety invariants (e.g., verifying `clearance_height` > `pre_pick_height` > `pickup_height` in robot coordinates) and raise clear, helpful errors before running.
+
+### 3. Incorrect Plane for Smooth Motion Blending
+* **Problem:** The current trajectory corner blending (`corner_blend_xy`) operates within the horizontal $XY$ plane at `clearance_height`.
+* **Impact:** In a standard gate-shaped pick-and-place cycle, the corner smoothing should occur in the vertical plane perpendicular to the $XY$ plane (blending the vertical $Z$ liftoff/descent with the horizontal $XY$ travel to create a smooth arch). The current implementation instead rounds the path horizontally while maintaining a constant $Z$, which does not reduce vertical acceleration peaks or create the desired 3D arch.
+* **Resolution Plan (Phase 3):**
+  1. Re-engineer the trajectory template in `_build_goto_geometry` and `_build_pick_geometry` to blend the $Z$ and $XY$ components.
+  2. Map the 3D path coordinates to form a smooth vertical arch (blended parabola or splined transition) at the transition points.
+  3. Update the segment timing calculation (`_build_goto_timing`) to reflect the new 3D path length.
+
+### 4. Lack of Calibration and Profiling Tools
+* **Problem:** There is currently no tool to measure key physical parameters of the cell automatically.
+* **Impact:** Delays such as `robot_movement_delay_s` and `ethernet_delay_s` must be estimated manually.
+* **Resolution Plan (Phase 4):**
+  1. Develop a standalone calibration utility `modules/calibration.py`.
+  2. Implement network latency profiling (calculating average round-trip times by reading/writing mock or real tags repeatedly).
+  3. Implement mechanical profiling (sending move commands, polling the PLC status until completion, and logging execution duration).
+  4. Implement an automatic tuning script to write measured timing delays back to `config.json`.
