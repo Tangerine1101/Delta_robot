@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import socket
 from dataclasses import dataclass, field
@@ -11,6 +12,38 @@ try:
     from pylogix import PLC
 except ImportError:  # pragma: no cover - handled at runtime
     PLC = None
+
+try:
+    from snap7.client import Client
+except ImportError:
+    Client = None
+
+# ================= Siemens PLC Memory Config =================
+SIEMENS_DB_WRITE = 1          # DB để ghi lệnh xuống PLC (ví dụ DB1)
+SIEMENS_DB_WRITE_OFFSET = 0   # Offset byte bắt đầu ghi lệnh
+
+SIEMENS_DB_READ = 2           # DB để đọc trạng thái phản hồi từ PLC (ví dụ DB2)
+SIEMENS_DB_READ_OFFSET = 0    # Offset byte bắt đầu đọc trạng thái
+
+class SiemensSendPacket(ctypes.Structure):
+    """Cấu trúc gói tin gửi từ PC xuống Siemens PLC (PC -> PLC)"""
+    _pack_ = 1
+    _fields_ = [
+        ("CommandID", ctypes.c_int32),  # Kiểu int (4 bytes)
+        ("rotate", ctypes.c_float),     # Kiểu float (4 bytes)
+        ("speed", ctypes.c_float),      # Kiểu float (4 bytes)
+    ]
+
+class SiemensReceivePacket(ctypes.Structure):
+    """Cấu trúc gói tin đọc từ Siemens PLC lên PC (PLC -> PC)"""
+    _pack_ = 1
+    _fields_ = [
+        ("rotate_current", ctypes.c_float), # Kiểu float (4 bytes)
+        ("speed_current", ctypes.c_float),  # Kiểu float (4 bytes)
+        ("task_doing", ctypes.c_int32),     # Kiểu int (4 bytes)
+        ("task_state", ctypes.c_int32),     # Kiểu int (4 bytes)
+    ]
+# =============================================================
 
 
 PARENT_DIR = Path(__file__).parent
@@ -182,37 +215,75 @@ class MockPLC:
 
 
 class SiemensGateway:
-    """Gateway for Siemens S7-1200 communicating via TCP JSON-lines socket."""
+    """Gateway for Siemens S7-1200 supporting snap7 (Real Mode) and TCP Socket (Mock Mode)."""
 
     def __init__(self, ip: str | None = None, port: int | None = None) -> None:
         self.config = load_config()
         self.ip = ip or getattr(self.config, "siemens_ip", "192.168.250.2")
         self.port = port or getattr(self.config, "siemens_port", 1502)
-        self._socket: socket.socket | None = None
+        # Các thông số rack và slot dùng cho snap7 (mặc định S7-1200 là rack=0, slot=1)
+        self.rack = int(getattr(self.config, "siemens_rack", 0))
+        self.slot = int(getattr(self.config, "siemens_slot", 1))
+        
         self.connected = False
+        
+        # Xác định chế độ hoạt động
+        self.is_mock = self.ip in ("127.0.0.1", "localhost")
+        
+        # Biến quản lý kết nối
+        self._socket: socket.socket | None = None
+        self._snap7_client: Client | None = None
 
     def connect(self) -> bool:
-        if self._socket is not None:
-            self.connected = True
+        if self.connected:
             return True
-        try:
-            self._socket = socket.create_connection((self.ip, self.port), timeout=2.0)
-            self.connected = True
-            print(f"[INFO] Siemens gateway connected to {self.ip}:{self.port}")
-            return True
-        except Exception as exc:
-            self._socket = None
-            self.connected = False
-            print(f"[ERROR] Siemens gateway failed to connect to {self.ip}:{self.port}: {exc}")
-            return False
+            
+        if self.is_mock:
+            # Chế độ giả lập (Mock Mode) - Dùng TCP socket JSON-lines
+            try:
+                self._socket = socket.create_connection((self.ip, self.port), timeout=2.0)
+                self.connected = True
+                print(f"[INFO] Siemens gateway (Mock Mode) connected to {self.ip}:{self.port}")
+                return True
+            except Exception as exc:
+                self._socket = None
+                self.connected = False
+                print(f"[ERROR] Siemens gateway (Mock Mode) failed to connect to {self.ip}:{self.port}: {exc}")
+                return False
+        else:
+            # Chế độ thực tế (Real Mode) - Dùng python-snap7
+            if Client is None:
+                self.connected = False
+                print("[ERROR] Siemens gateway (Real Mode) failed: python-snap7 is not installed.")
+                return False
+            try:
+                self._snap7_client = Client()
+                self._snap7_client.connect(self.ip, self.rack, self.slot)
+                self.connected = self._snap7_client.get_connected()
+                if self.connected:
+                    print(f"[INFO] Siemens gateway (Real Mode) connected to {self.ip} (rack={self.rack}, slot={self.slot})")
+                return self.connected
+            except Exception as exc:
+                self._snap7_client = None
+                self.connected = False
+                print(f"[ERROR] Siemens gateway (Real Mode) failed to connect to {self.ip}: {exc}")
+                return False
 
     def disconnect(self) -> None:
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
+        if self.is_mock:
+            if self._socket is not None:
+                try:
+                    self._socket.close()
+                except Exception:
+                    pass
+                self._socket = None
+        else:
+            if self._snap7_client is not None:
+                try:
+                    self._snap7_client.disconnect()
+                except Exception:
+                    pass
+                self._snap7_client = None
         self.connected = False
         print("[INFO] Siemens gateway disconnected")
 
@@ -221,26 +292,73 @@ class SiemensGateway:
         if not self.connected:
             if not self.connect():
                 return None
-        try:
-            payload = {
-                "CommandID": int(package.get("CommandID", package.get("commandID", 0))),
-                "rotate": float(package.get("rotate", 0.0)),
-                "speed": float(package.get("speed", 0.0)),
-            }
-            self._socket.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
-            resp_bytes = self._socket.recv(4096)
-            if not resp_bytes:
-                raise ConnectionError("Siemens connection closed by peer")
-            resp = json.loads(resp_bytes.decode("utf-8").strip())
-            return resp
-        except Exception as exc:
-            print(f"[ERROR] Siemens gateway communication error: {exc}")
-            self.disconnect()
-            return None
+                
+        if self.is_mock:
+            # Gửi nhận qua socket (JSON-lines) ở chế độ Mock
+            try:
+                payload = {
+                    "CommandID": int(package.get("CommandID", package.get("commandID", 0))),
+                    "rotate": float(package.get("rotate", 0.0)),
+                    "speed": float(package.get("speed", 0.0)),
+                }
+                self._socket.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
+                resp_bytes = self._socket.recv(4096)
+                if not resp_bytes:
+                    raise ConnectionError("Siemens connection closed by peer")
+                resp = json.loads(resp_bytes.decode("utf-8").strip())
+                return resp
+            except Exception as exc:
+                print(f"[ERROR] Siemens gateway communication error (Mock): {exc}")
+                self.disconnect()
+                return None
+        else:
+            # Gửi nhận qua snap7 (DB Read/Write) ở chế độ Real
+            try:
+                # 1. Ghi gói tin điều khiển xuống PLC
+                send_data = SiemensSendPacket()
+                send_data.CommandID = int(package.get("CommandID", package.get("commandID", 0)))
+                send_data.rotate = float(package.get("rotate", 0.0))
+                send_data.speed = float(package.get("speed", 0.0))
+                self._snap7_client.db_write(SIEMENS_DB_WRITE, SIEMENS_DB_WRITE_OFFSET, bytes(send_data))
+
+                # 2. Đọc gói tin phản hồi từ PLC
+                read_size = ctypes.sizeof(SiemensReceivePacket)
+                raw_bytes = self._snap7_client.db_read(SIEMENS_DB_READ, SIEMENS_DB_READ_OFFSET, read_size)
+                recv_data = SiemensReceivePacket.from_buffer_copy(raw_bytes)
+                
+                return {
+                    "rotate_current": recv_data.rotate_current,
+                    "speed_current": recv_data.speed_current,
+                    "task_doing": recv_data.task_doing,
+                    "task_state": recv_data.task_state,
+                }
+            except Exception as exc:
+                print(f"[ERROR] Siemens gateway communication error (Real): {exc}")
+                self.disconnect()
+                return None
 
     def get_status(self) -> dict[str, Any] | None:
         """Query state from Siemens PLC."""
-        return self.send_package({"CommandID": 0, "rotate": 0.0, "speed": 0.0})
+        if self.is_mock:
+            return self.send_package({"CommandID": 0, "rotate": 0.0, "speed": 0.0})
+        else:
+            if not self.connected:
+                if not self.connect():
+                    return None
+            try:
+                read_size = ctypes.sizeof(SiemensReceivePacket)
+                raw_bytes = self._snap7_client.db_read(SIEMENS_DB_READ, SIEMENS_DB_READ_OFFSET, read_size)
+                recv_data = SiemensReceivePacket.from_buffer_copy(raw_bytes)
+                return {
+                    "rotate_current": recv_data.rotate_current,
+                    "speed_current": recv_data.speed_current,
+                    "task_doing": recv_data.task_doing,
+                    "task_state": recv_data.task_state,
+                }
+            except Exception as exc:
+                print(f"[ERROR] Siemens gateway communication error (Real): {exc}")
+                self.disconnect()
+                return None
 
 
 class PLCGateway:
