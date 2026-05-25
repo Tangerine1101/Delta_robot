@@ -41,6 +41,10 @@ class FakePLCState:
 
     def __post_init__(self) -> None:
         self.position = self.home_position
+        self.rotate_current = 0.0
+        self.speed_current = 80.0
+        self.siemens_task_doing = 0
+        self.siemens_task_state = 0
         self.accumulated_pc_package = {
             "commandID": COMMAND_ID["stop"],
             "argument_number": 0,
@@ -103,6 +107,38 @@ class FakePLCState:
                     else:
                         values[tag] = None
         return values
+
+    def accept_siemens_package(self, package: dict[str, Any]) -> dict[str, Any]:
+        command_id = int(package.get("CommandID", package.get("commandID", 0)))
+        rotate = float(package.get("rotate", 0.0))
+        speed = float(package.get("speed", 0.0))
+
+        with self.lock:
+            self.siemens_task_doing = command_id
+            self.siemens_task_state = 1
+
+            if command_id == COMMAND_ID["stop"]:
+                self.siemens_task_state = 0
+            elif command_id == COMMAND_ID["rotate_absolute"]:
+                self.rotate_current = rotate
+                self.siemens_task_state = 0
+            elif command_id == COMMAND_ID["change_speed"]:
+                self.speed_current = speed
+                self.siemens_task_state = 0
+            elif command_id == COMMAND_ID["plan_siemen"]:
+                self.rotate_current = rotate
+                self.speed_current = speed
+                self.siemens_task_state = 0
+
+            response = {
+                "rotate_current": self.rotate_current,
+                "speed_current": self.speed_current,
+                "task_doing": self.siemens_task_doing,
+                "task_state": self.siemens_task_state,
+            }
+
+        self.log_event("accept_siemens", response)
+        return response
 
     def normalize_pc_package(self, package: dict[str, Any]) -> dict[str, Any]:
         normalized = {
@@ -213,6 +249,12 @@ class FakePLCState:
 
     def get_status_str(self) -> str:
         pkg = self.build_plc_package()
+        pkg.update({
+            "rotate_current": self.rotate_current,
+            "speed_current": self.speed_current,
+            "siemens_task_doing": self.siemens_task_doing,
+            "siemens_task_state": self.siemens_task_state,
+        })
         parts = []
         for key, value in pkg.items():
             if isinstance(value, list):
@@ -291,6 +333,8 @@ class FakePLCRequestHandler(socketserver.StreamRequestHandler):
                     tags = message.get("tags", [])
                     values = state.handle_tag_read(tags)
                     response = {"ok": True, "values": values}
+                elif "CommandID" in message or "commandID" in message or "rotate" in message or "speed" in message:
+                    response = state.accept_siemens_package(message)
                 else:
                     response = state.accept_pc_package(message)
             except Exception as exc:

@@ -271,6 +271,23 @@ class SimulatedSpeedSource:
         return SpeedSample(vx=vx, vy=vy, timestamp=now)
 
 
+class RealSpeedSource:
+    """Read conveyor speed from the status callback."""
+
+    def __init__(self, request_status) -> None:
+        self.request_status = request_status
+
+    def sample(self, now: float) -> SpeedSample:
+        try:
+            status = self.request_status()
+            if status is not None:
+                speed = float(status.get("speed_current", 80.0) or 80.0)
+                return SpeedSample(vx=0.0, vy=speed, timestamp=now)
+        except Exception as exc:
+            print(f"[WARN] RealSpeedSource failed to read speed: {exc}")
+        return SpeedSample(vx=0.0, vy=80.0, timestamp=now)
+
+
 class SimulatedExecutor:
     def __init__(self, log_path: str, sample_period_s: float) -> None:
         self.log_path = Path(log_path)
@@ -362,6 +379,16 @@ class RealRobotExecutor:
         for phase_name, packet in zip(("goto", "pick"), packets):
             if phase_name == "pick":
                 self._wait_until_pick_dispatch(plan)
+                try:
+                    rotate_pkg = {
+                        "commandID": COMMAND_ID["rotate_absolute"],
+                        "CommandID": COMMAND_ID["rotate_absolute"],
+                        "rotate": 90.0,
+                        "speed": 0.0,
+                    }
+                    self.dispatch(rotate_pkg)
+                except Exception as s_exc:
+                    print(f"[WARN] Failed to dispatch Siemens rotation: {s_exc}")
             print(
                 "[EXEC]",
                 json.dumps(
@@ -422,7 +449,7 @@ class PickScheduler:
         self.settings = settings
         self.interpolar_points = interpolar_points
         self.pending_objects: list[ObjectDetection] = []
-        self.seen_object_ids: set[str] = set()
+        self.seen_object_ids: dict[str, float] = {}
         self.metrics = SchedulerMetrics()
         self.current_position: Position3D = settings.home_position
         self.latest_speed: SpeedSample | None = None
@@ -433,7 +460,7 @@ class PickScheduler:
             self.metrics.total_detections += 1
             if detection.object_id in self.seen_object_ids:
                 continue
-            self.seen_object_ids.add(detection.object_id)
+            self.seen_object_ids[detection.object_id] = detection.timestamp
             self.pending_objects.append(detection)
         self.metrics.queue_peak = max(self.metrics.queue_peak, len(self.pending_objects))
 
@@ -450,6 +477,12 @@ class PickScheduler:
             kept.append(detection)
         self.pending_objects = kept
 
+        # Prune seen_object_ids to prevent memory leaks
+        limit = now - self.settings.stale_timeout_s
+        self.seen_object_ids = {
+            obj_id: ts for obj_id, ts in self.seen_object_ids.items() if ts >= limit
+        }
+
     def plan_next(self, now: float) -> PickPlan | None:
         if self.latest_speed is None:
             return None
@@ -457,6 +490,7 @@ class PickScheduler:
             return None
 
         candidates: list[tuple[float, ObjectDetection, Position3D]] = []
+        kept_pending: list[ObjectDetection] = []
         for detection in self.pending_objects:
             sorting_position = self._resolve_sorting_position(detection.object_type)
             if sorting_position is None:
@@ -465,9 +499,19 @@ class PickScheduler:
 
             prediction = self._predict_pick_position(detection, self.latest_speed, now)
             if prediction is None:
+                # Check if it has passed downstream boundary
+                dt = max(0.0, now - detection.timestamp)
+                current_y = detection.y + self.latest_speed.vy * dt
+                if current_y > self.settings.pickup_window_y[1]:
+                    self.metrics.skipped_outside_workspace += 1
+                else:
+                    kept_pending.append(detection)
                 continue
             predicted_pick_time, _, pick_position = prediction
             candidates.append((predicted_pick_time, detection, sorting_position))
+            kept_pending.append(detection)
+
+        self.pending_objects = kept_pending
 
         if not candidates:
             return None
@@ -527,6 +571,7 @@ class PickScheduler:
             pick_position,
             pick_points,
             self.settings,
+            goto_points,
         )
         trajectory_pick = [
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
@@ -579,6 +624,12 @@ class PickScheduler:
     ) -> tuple[float, float, Position3D] | None:
         command_delay_s = self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         guess_pick_time = now + max(self.settings.intercept_lead_time_s, command_delay_s)
+
+        t_enter = detection.timestamp
+        if speed_sample.vy > 0.001 and detection.y < self.settings.pickup_window_y[0]:
+            t_enter = detection.timestamp + (self.settings.pickup_window_y[0] - detection.y) / speed_sample.vy
+            guess_pick_time = max(guess_pick_time, t_enter)
+
         predicted_x = detection.x
         predicted_y = detection.y
         for _ in range(6):
@@ -605,6 +656,7 @@ class PickScheduler:
                 self.settings,
             )
             new_guess = now + sum(goto_times) + command_delay_s
+            new_guess = max(new_guess, t_enter)
             if abs(new_guess - guess_pick_time) < 0.01:
                 guess_pick_time = new_guess
                 break
@@ -732,14 +784,17 @@ def _build_pick_timing(
     pick_position: Position3D,
     points: list[Position3D],
     settings: SchedulerSettings,
+    goto_points: list[Position3D],
 ) -> list[float]:
     times: list[float] = []
     previous = pick_position
     for index, point in enumerate(points):
         if index == 0:
-            times.append(max(settings.robot_movement_delay_s, 0.01))
+            d_goto = goto_points[-1]
+            times.append(_segment_duration(d_goto, point, settings))
         elif index == len(points) - 1:
-            times.append(settings.release_descent_time_s)
+            travel_time = _segment_duration(previous, point, settings)
+            times.append(max(travel_time, settings.release_descent_time_s))
         else:
             times.append(_segment_duration(previous, point, settings))
         previous = point
@@ -785,10 +840,15 @@ def run_scheduler_scenario(
         },
         start_time,
     )
-    speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
-    scheduler = PickScheduler(settings, interpolar_points)
     if executor is None:
         executor = SimulatedExecutor(settings.log_path, settings.poll_interval_s)
+        speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
+    else:
+        if hasattr(executor, "request_status"):
+            speed_source = RealSpeedSource(executor.request_status)
+        else:
+            speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
+    scheduler = PickScheduler(settings, interpolar_points)
 
     print(f"[INFO] Running scheduler scenario: {scenario_name}")
     print(f"[INFO] Fixed PLC slot count: {interpolar_points}")
