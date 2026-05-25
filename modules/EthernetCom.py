@@ -31,6 +31,9 @@ COMMAND_ID = {
     "calibrate": 4,
     "pick": 5,
     "release": 6,
+    "rotate_absolute": 7,
+    "change_speed": 8,
+    "plan_siemen": 9,
 }
 
 COMMAND_NAME = {value: key for key, value in COMMAND_ID.items()}
@@ -178,6 +181,68 @@ class MockPLC:
             return None
 
 
+class SiemensGateway:
+    """Gateway for Siemens S7-1200 communicating via TCP JSON-lines socket."""
+
+    def __init__(self, ip: str | None = None, port: int | None = None) -> None:
+        self.config = load_config()
+        self.ip = ip or getattr(self.config, "siemens_ip", "192.168.250.2")
+        self.port = port or getattr(self.config, "siemens_port", 1502)
+        self._socket: socket.socket | None = None
+        self.connected = False
+
+    def connect(self) -> bool:
+        if self._socket is not None:
+            self.connected = True
+            return True
+        try:
+            self._socket = socket.create_connection((self.ip, self.port), timeout=2.0)
+            self.connected = True
+            print(f"[INFO] Siemens gateway connected to {self.ip}:{self.port}")
+            return True
+        except Exception as exc:
+            self._socket = None
+            self.connected = False
+            print(f"[ERROR] Siemens gateway failed to connect to {self.ip}:{self.port}: {exc}")
+            return False
+
+    def disconnect(self) -> None:
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+        self.connected = False
+        print("[INFO] Siemens gateway disconnected")
+
+    def send_package(self, package: dict[str, Any]) -> dict[str, Any] | None:
+        """Send Siemens command package to the PLC and read its status back."""
+        if not self.connected:
+            if not self.connect():
+                return None
+        try:
+            payload = {
+                "CommandID": int(package.get("CommandID", package.get("commandID", 0))),
+                "rotate": float(package.get("rotate", 0.0)),
+                "speed": float(package.get("speed", 0.0)),
+            }
+            self._socket.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
+            resp_bytes = self._socket.recv(4096)
+            if not resp_bytes:
+                raise ConnectionError("Siemens connection closed by peer")
+            resp = json.loads(resp_bytes.decode("utf-8").strip())
+            return resp
+        except Exception as exc:
+            print(f"[ERROR] Siemens gateway communication error: {exc}")
+            self.disconnect()
+            return None
+
+    def get_status(self) -> dict[str, Any] | None:
+        """Query state from Siemens PLC."""
+        return self.send_package({"CommandID": 0, "rotate": 0.0, "speed": 0.0})
+
+
 class PLCGateway:
     """Simple PLC gateway built on top of pylogix."""
 
@@ -219,6 +284,7 @@ class PLCGateway:
             f"{self.tag_read}.pos_EE[2]",
             f"{self.tag_read}.task_doing",
             f"{self.tag_read}.task_state",
+            f"{self.tag_read}.end_effector",
         ]
 
     def _probe_tags(self) -> list[str]:

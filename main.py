@@ -5,7 +5,7 @@ import multiprocessing as mp
 from queue import Empty
 from typing import Any
 
-from modules.EthernetCom import PLCGateway, load_config
+from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
 from modules.scheduler import RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
 
@@ -17,9 +17,20 @@ def _worker(
     port: int,
     interpolar_points: int,
 ) -> None:
+    config = load_config()
+    if ip in ("127.0.0.1", "localhost"):
+        siemens_ip = ip
+        siemens_port = port
+    else:
+        siemens_ip = getattr(config, "siemens_ip", "192.168.250.2")
+        siemens_port = getattr(config, "siemens_port", 1502)
+
     gateway = PLCGateway(ip=ip, port=port, interpolar_points=interpolar_points)
+    siemens_gateway = SiemensGateway(ip=siemens_ip, port=siemens_port)
+
     try:
         gateway.connect()
+        siemens_gateway.connect()
         response_queue.put(
             {
                 "ok": True,
@@ -40,6 +51,18 @@ def _worker(
             if message_type == "status":
                 try:
                     status = gateway.get_package()
+                    if status is not None:
+                        try:
+                            s_status = siemens_gateway.get_status()
+                            if s_status is not None:
+                                status.update({
+                                    "rotate_current": s_status.get("rotate_current"),
+                                    "speed_current": s_status.get("speed_current"),
+                                    "siemens_task_doing": s_status.get("task_doing"),
+                                    "siemens_task_state": s_status.get("task_state"),
+                                })
+                        except Exception as s_exc:
+                            print(f"[WARN] Failed to query Siemens status: {s_exc}")
                     response_queue.put({"ok": True, "type": "status", "data": status})
                 except Exception as exc:
                     response_queue.put({"ok": False, "type": "error", "error": str(exc)})
@@ -47,17 +70,33 @@ def _worker(
 
             if message_type == "send":
                 try:
-                    package = gateway.send_package(message["package"])
-                    status = gateway.get_package()
-                    response_queue.put(
-                        {
-                            "ok": True,
-                            "type": "sent",
-                            "commandID": package.get("commandID"),
-                            "package": package,
-                            "status": status,
-                        }
-                    )
+                    pkg = message["package"]
+                    cmd_id = pkg.get("commandID")
+                    if cmd_id in (7, 8, 9):
+                        # Siemens command
+                        s_status = siemens_gateway.send_package(pkg)
+                        response_queue.put(
+                            {
+                                "ok": True,
+                                "type": "sent",
+                                "commandID": cmd_id,
+                                "package": pkg,
+                                "status": s_status,
+                            }
+                        )
+                    else:
+                        # Omron command
+                        package = gateway.send_package(pkg)
+                        status = gateway.get_package()
+                        response_queue.put(
+                            {
+                                "ok": True,
+                                "type": "sent",
+                                "commandID": package.get("commandID"),
+                                "package": package,
+                                "status": status,
+                            }
+                        )
                 except Exception as exc:
                     response_queue.put({"ok": False, "type": "error", "error": str(exc)})
                 continue
@@ -71,6 +110,7 @@ def _worker(
             )
     finally:
         gateway.disconnect()
+        siemens_gateway.disconnect()
 
 
 def _wait_for_response(response_queue: mp.Queue, timeout: float = 5.0) -> dict[str, Any] | None:

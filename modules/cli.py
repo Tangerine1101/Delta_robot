@@ -176,6 +176,24 @@ def _parse_plan(line: str, interpolar_points: int = INTERPOLAR_POINTS) -> Comman
         return CommandPlan(packages=[_zero_command("pick", interpolar_points)])
     if command == "release":
         return CommandPlan(packages=[_zero_command("release", interpolar_points)])
+    if command == "rotate":
+        if len(tokens) != 2:
+            raise ValueError("rotate expects 1 angle value: rotate <angle>")
+        return CommandPlan(
+            packages=[{"commandID": COMMAND_ID["rotate_absolute"], "CommandID": COMMAND_ID["rotate_absolute"], "rotate": float(tokens[1]), "speed": 0.0}]
+        )
+    if command == "setspeed":
+        if len(tokens) != 2:
+            raise ValueError("setspeed expects 1 speed value: setspeed <speed>")
+        return CommandPlan(
+            packages=[{"commandID": COMMAND_ID["change_speed"], "CommandID": COMMAND_ID["change_speed"], "rotate": 0.0, "speed": float(tokens[1])}]
+        )
+    if command == "plan_siemen":
+        if len(tokens) != 3:
+            raise ValueError("plan_siemen expects 2 values: plan_siemen <rotate> <speed>")
+        return CommandPlan(
+            packages=[{"commandID": COMMAND_ID["plan_siemen"], "CommandID": COMMAND_ID["plan_siemen"], "rotate": float(tokens[1]), "speed": float(tokens[2])}]
+        )
 
     raise ValueError(f"Unknown command: {command}")
 
@@ -187,6 +205,9 @@ def _print_help() -> None:
         "  go <theta1> <theta2> <theta3>        # relative joint move\n"
         "  goto <x> <y> <z>                     # absolute Cartesian move\n"
         "  go_trajectory <demo|square|home>\n"
+        "  rotate <angle>                       # Siemens EE suction cup rotation\n"
+        "  setspeed <speed>                     # Siemens conveyor speed\n"
+        "  plan_siemen <rotate> <speed>         # Siemens plan\n"
         "  calib\n"
         "  pick\n"
         "  release\n"
