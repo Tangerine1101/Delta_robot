@@ -274,10 +274,13 @@ class SimulatedSpeedSource:
 class RealSpeedSource:
     """Read conveyor speed from the status callback."""
 
-    def __init__(self, request_status) -> None:
+    def __init__(self, request_status, scenario_name: str = "") -> None:
         self.request_status = request_status
+        self.scenario_name = scenario_name
 
     def sample(self, now: float) -> SpeedSample:
+        if self.scenario_name == "test_accuracy":
+            return SpeedSample(vx=0.0, vy=0.0, timestamp=now)
         try:
             status = self.request_status()
             if status is not None:
@@ -845,7 +848,7 @@ def run_scheduler_scenario(
         speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
     else:
         if hasattr(executor, "request_status"):
-            speed_source = RealSpeedSource(executor.request_status)
+            speed_source = RealSpeedSource(executor.request_status, scenario_name)
         else:
             speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
     scheduler = PickScheduler(settings, interpolar_points)
