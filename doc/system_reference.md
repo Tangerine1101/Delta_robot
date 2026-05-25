@@ -128,8 +128,8 @@ Due to physical parallel arm kinematics:
 
 ### 3.2. Safety Invariants
 To prevent mechanical crashes and servo strain, the scheduler enforces the following height hierarchy at initialization:
-$$\text{clearance\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
-*(Example values in `config.json`: $-290.0 > -300.0 > -310.0$)*
+$$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
+*(Example values in `config.json`: $-290.0 > -295.0 > -300.0 > -310.0$)*
 
 Furthermore, during travel:
 * `clearance_height` (safe horizontal transfer plane) must be higher than or equal to `place_height`.
@@ -146,6 +146,8 @@ In offline test scenarios, conveyor speed varies dynamically. In production, spe
 
 $$\mathbf{v}(t) = [v_x(t), v_y(t)]^T$$
 
+The default conveyor model assumes the belt moves along **positive Y**. Simulated throughput objects spawn at a low Y value and keep X fixed on one of the configured lane positions.
+
 ### 4.2. Position & Interception Time Prediction
 When a camera detects a product at time $t_{\text{detect}}$ at position $\mathbf{P}_{\text{detect\_xy}} = [x_{\text{detect}}, y_{\text{detect}}]^T$, the scheduler predicts the point of interception $\mathbf{P}_{\text{pick}}$:
 
@@ -156,7 +158,7 @@ To solve for the interception time $t_{\text{pick}}$ (and its corresponding disp
 2. Calculate predicted interception position $\mathbf{P}_{\text{pick}}^{(k)}$ using $t_{\text{pick}}^{(k)}$.
 3. Build the virtual `goto` trajectory from the current robot position to $\mathbf{P}_{\text{pick}}^{(k)}$.
 4. Compute total duration of this `goto` segment $\Delta t_{\text{goto}}$ based on nominal speeds:
-   $$\Delta t_{\text{segment}} = \max\left(0.08, \frac{d_{xy}}{V_{\text{nom\_xy}}} + \frac{d_z}{V_{\text{nom\_z}}}\right)$$
+   $$\Delta t_{\text{segment}} = \max\left(0.08, \frac{d_{xy}}{V_{\text{nom\_xy}}}, \frac{d_z}{V_{\text{nom\_z}}}\right)$$
 5. Update guess: $t_{\text{pick}}^{(k+1)} = t_{\text{now}} + \sum \Delta t_{\text{goto}} + t_{\text{comm\_delay}}$.
 6. Iterate until $|t_{\text{pick}}^{(k+1)} - t_{\text{pick}}^{(k)}| < 0.01$ s (typically converges in $< 6$ iterations).
 7. If the final converged coordinates $\mathbf{P}_{\text{pick}}$ fall outside the `pickup_window`, the detection is dropped.
@@ -176,31 +178,33 @@ $$t_{\text{dispatch}} = t_{\text{pick}} - t_{\text{robot\_movement\_delay}} - t_
 Every pick-and-place operation consists of two sequential phases, each using a **4-point template** aligned with the 4-slot PLC package.
 
 ```
-       C_goto (Clearance)                 B_goto (Clearance)
-       [Same as B_pick]                   [Same as C_pick]
-             ┌──────────────────────────────────┐
-             │                                  │
-             │                                  │
-             ▼                                  ▼
-         D_goto (Pre-pick)                  A_goto (Home/Start)
-             │
-             │ (mechanical descent)
-             ▼
-         A_pick (Suction ON)
+       B_goto (Clearance) ── mandatory 3D slope down ──> C_goto (Slope transition)
+              ▲                                                  │
+              │                                                  ▼
+        A_goto/start                                     D_goto (Pre-pick)
+                                                                  │
+                                                                  ▼
+                                                           A_pick (Suction ON)
+                                                                  │
+                                                                  ▼
+       C_pick (Clearance) <── mandatory 3D slope up ──── B_pick (Slope transition)
+              │
+              ▼
+       D_pick/place (Release)
 ```
 
 ### 5.1. Goto Trajectory (Moving to Pre-Pick)
 Designed to move the arm from its current resting position $\mathbf{P}_{\text{start}}$ to the pre-pick point above the moving object.
 * **Point A**: Vertical lift to `clearance_height` above $\mathbf{P}_{\text{start}}$. Gripper state: `0` (OFF).
-* **Point B**: Lateral travel toward target, bopped/blended horizontally by `corner_blend_xy`. Gripper state: `0` (OFF).
-* **Point C**: Alignment directly above predicted pickup location at `clearance_height`. Gripper state: `0` (OFF).
+* **Point B**: Clearance-height offset from start toward the predicted pickup XY by `corner_blend_xy`. Gripper state: `0` (OFF).
+* **Point C**: Alignment directly above predicted pickup XY at `slope_transition_height`. The segment `B_goto -> C_goto` is a required 3D slope with both XY and Z motion. Gripper state: `0` (OFF).
 * **Point D**: Vertical descent to `pre_pick_height`. Gripper state: `0` (OFF).
 
 ### 5.2. Pick Trajectory (Pick & Sort)
 Designed to execute the physical grab, lift, transfer, and drop at the bin.
 * **Point A**: Descent to `pickup_height` at the interception coordinate. Gripper state: `1` (ON).
-* **Point B**: Vertical ascent to `clearance_height` (coplanar with Point C of Goto). Gripper state: `1` (ON).
-* **Point C**: Lateral travel to a blended position offset from the sort bin. Gripper state: `1` (ON).
+* **Point B**: Vertical ascent at the pickup XY to `slope_transition_height`. Gripper state: `1` (ON).
+* **Point C**: Clearance-height blended position offset from the sort bin. The segment `B_pick -> C_pick` is a required 3D slope with both XY and Z motion. Gripper state: `1` (ON).
 * **Point D**: Final descent to `place_height` at the bin coordinate. Gripper state: `0` (OFF/Release).
 
 ---

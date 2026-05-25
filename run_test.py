@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Global data collectors for plotting
 data_lock = threading.Lock()
-robot_positions = []  # tuples of (t_rel, x, y, z)
+robot_positions = []  # tuples of (t_rel, x, y, z, e)
 conveyor_speeds = []   # tuples of (t_rel, vx, vy)
 start_time = 0.0
 
@@ -32,11 +32,11 @@ def stream_output(process, prefix):
             # Parse trajectory / speed data
             t_rel = time.monotonic() - start_time
             if is_plc:
-                match = re.search(r"pos_EE=\[([-\d\.]+),\s*([-\d\.]+),\s*([-\d\.]+)\]", cleaned)
+                match = re.search(r"pos_EE=\[([-\d\.]+),\s*([-\d\.]+),\s*([-\d\.]+)\].*?end_effector=(\d+)", cleaned)
                 if match:
-                    x, y, z = map(float, match.groups())
+                    x, y, z, e = map(float, match.groups())
                     with data_lock:
-                        robot_positions.append((t_rel, x, y, z))
+                        robot_positions.append((t_rel, x, y, z, int(e)))
             else:
                 match = re.search(r"\[SPEED\] vx=([-\d\.]+) vy=([-\d\.]+)", cleaned)
                 if match:
@@ -46,7 +46,7 @@ def stream_output(process, prefix):
     process.stdout.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Delta Robot simulation integration test.")
+    parser = argparse.ArgumentParser(description="Run Delta Robot simulation integration test with real-time visualization.")
     parser.add_argument(
         "--scenario",
         default="test_throughput",
@@ -56,8 +56,8 @@ def main():
     parser.add_argument(
         "--duration",
         type=int,
-        default=10,
-        help="Duration of the test in seconds (default: 10)",
+        default=30,
+        help="Duration of the test in seconds (default: 30)",
     )
     args = parser.parse_args()
 
@@ -119,9 +119,111 @@ def main():
     t_plc.start()
     t_main.start()
 
+    # Real-time Plotting setup
+    fig = None
+    ax_traj = None
+    ax_time = None
     try:
-        # Wait for the main scheduler to finish
-        main_proc.wait()
+        import matplotlib
+        matplotlib.use('TkAgg') # Use interactive GUI backend
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        plt.ion() # Turn interactive mode on
+        fig = plt.figure(figsize=(14, 6))
+        ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+        ax_time = fig.add_subplot(1, 2, 2)
+        fig.patch.set_facecolor("#1e1e1e")
+        plt.show(block=False)
+        print("[*] Real-time visualization window initialized successfully.")
+    except Exception as exc:
+        print(f"\n[WARN] Failed to initialize real-time plot window: {exc}")
+        print("[*] Make sure Tkinter is installed: sudo apt-get install python3-tk")
+        fig = None
+
+    try:
+        # Loop and update plots in real-time until main process exits
+        while main_proc.poll() is None:
+            if fig is not None:
+                try:
+                    with data_lock:
+                        positions = list(robot_positions)
+                    
+                    if positions:
+                        ax_traj.clear()
+                        ax_time.clear()
+
+                        # 1. Trajectory Plot: Last 3 pick-and-place cycles (6 trajectories)
+                        phases = []
+                        current_phase = []
+                        for p in positions:
+                            # p is (t_rel, x, y, z, e)
+                            e = p[4] if len(p) > 4 else 0
+                            if not current_phase:
+                                current_phase.append(p)
+                            else:
+                                if e == (current_phase[-1][4] if len(current_phase[-1]) > 4 else 0):
+                                    current_phase.append(p)
+                                else:
+                                    phases.append(current_phase)
+                                    current_phase = [p]
+                        if current_phase:
+                            phases.append(current_phase)
+
+                        last_6_phases = phases[-6:]
+                        for i, phase in enumerate(last_6_phases):
+                            xs = [pt[1] for pt in phase]
+                            ys = [pt[2] for pt in phase]
+                            zs = [pt[3] for pt in phase]
+                            e = phase[0][4] if len(phase[0]) > 4 else 0
+                            color = '#FF007F' if e == 1 else '#00F0FF'
+                            label = 'Pick (Suction ON)' if e == 1 else 'Goto (Suction OFF)'
+                            # Avoid duplicate labels in legend
+                            if i == len(last_6_phases) - 1 or i == len(last_6_phases) - 2:
+                                ax_traj.plot(xs, ys, zs, color=color, linewidth=2.0, label=label)
+                            else:
+                                ax_traj.plot(xs, ys, zs, color=color, linewidth=1.5, alpha=0.4)
+
+                        ax_traj.set_title("3D Trajectory (Last 3 Cycles / 6 Phases)", color="white", weight="bold")
+                        ax_traj.set_xlabel("X (mm)", color="white")
+                        ax_traj.set_ylabel("Y (mm)", color="white")
+                        ax_traj.set_zlabel("Z (mm)", color="white")
+                        ax_traj.grid(True, color="#444444", linestyle="--")
+                        ax_traj.set_facecolor("#111111")
+                        ax_traj.tick_params(colors="white")
+                        ax_traj.xaxis.label.set_color("white")
+                        ax_traj.yaxis.label.set_color("white")
+                        ax_traj.zaxis.label.set_color("white")
+                        ax_traj.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
+
+                        # 2. X, Y, Z coordinates vs Time
+                        t_p = [pt[0] for pt in positions]
+                        x_p = [pt[1] for pt in positions]
+                        y_p = [pt[2] for pt in positions]
+                        z_p = [pt[3] for pt in positions]
+
+                        ax_time.plot(t_p, x_p, color="#00F0FF", label="X", linewidth=1.5)
+                        ax_time.plot(t_p, y_p, color="#39FF14", label="Y", linewidth=1.5)
+                        ax_time.plot(t_p, z_p, color="#FF007F", label="Z", linewidth=1.5)
+
+                        ax_time.set_title("Coordinates vs Time", color="white", weight="bold")
+                        ax_time.set_xlabel("Time (s)", color="white")
+                        ax_time.set_ylabel("Position (mm)", color="white")
+                        ax_time.grid(True, color="#444444", linestyle="--")
+                        ax_time.set_facecolor("#111111")
+                        ax_time.tick_params(colors="white")
+                        ax_time.xaxis.label.set_color("white")
+                        ax_time.yaxis.label.set_color("white")
+                        ax_time.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
+
+                        plt.draw()
+                except Exception as draw_exc:
+                    print(f"[DEBUG] Redraw issue: {draw_exc}")
+            time.sleep(0.1)
+            try:
+                plt.pause(0.01)
+            except Exception:
+                pass
     except KeyboardInterrupt:
         print("\n[*] Interrupted by user. Cleaning up...")
     finally:
@@ -134,115 +236,21 @@ def main():
             plc_proc.wait()
         print("[*] Stopped all processes.")
 
-    # Plot generation at the end of the test
-    generate_plots()
-
-def generate_plots():
-    try:
-        import matplotlib
-        matplotlib.use('Agg')  # Headless backend
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("\n[WARN] matplotlib is not installed. Skipping plot generation.")
-        print("[*] Install it with: pip install matplotlib")
-        return
-
-    with data_lock:
-        positions = list(robot_positions)
-        speeds = list(conveyor_speeds)
-
-    if not positions:
-        print("\n[WARN] No robot positions captured. Skipping plot generation.")
-        return
-
-    # Sort positions by relative time
-    positions.sort(key=lambda x: x[0])
-    speeds.sort(key=lambda x: x[0])
-
-    t_p = [p[0] for p in positions]
-    x_p = [p[1] for p in positions]
-    y_p = [p[2] for p in positions]
-    z_p = [p[3] for p in positions]
-
-    # Calculate robot velocity
-    robot_vel = []
-    t_v = []
-    for i in range(1, len(positions)):
-        dt = t_p[i] - t_p[i-1]
-        if dt > 0.005:  # avoid division by zero or noisy small dt
-            dx = x_p[i] - x_p[i-1]
-            dy = y_p[i] - y_p[i-1]
-            dz = z_p[i] - z_p[i-1]
-            v = math.hypot(math.hypot(dx, dy), dz) / dt
-            robot_vel.append(v)
-            t_v.append(t_p[i])
-
-    # Plotting
-    try:
-        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle("Delta Robot Simulation Analysis (Experimental Plots)", fontsize=16, color="#00F0FF", weight="bold")
-
-        # 1. XY Plane Plot (Top View)
-        axs[0, 0].plot(x_p, y_p, color="#00F0FF", label="EE Path", linewidth=1.5)
-        axs[0, 0].set_title("XY Plane Projection (Top View)", color="white")
-        axs[0, 0].set_xlabel("X (mm)")
-        axs[0, 0].set_ylabel("Y (mm)")
-        axs[0, 0].grid(True, color="#444444", linestyle="--")
-        axs[0, 0].set_facecolor("#111111")
-        axs[0, 0].axis('equal')
-
-        # 2. XZ Plane Plot (Front View)
-        axs[0, 1].plot(x_p, z_p, color="#FF007F", label="EE Path", linewidth=1.5)
-        axs[0, 1].set_title("XZ Plane Projection (Front View)", color="white")
-        axs[0, 1].set_xlabel("X (mm)")
-        axs[0, 1].set_ylabel("Z (mm)")
-        axs[0, 1].grid(True, color="#444444", linestyle="--")
-        axs[0, 1].set_facecolor("#111111")
-
-        # 3. YZ Plane Plot (Side View)
-        axs[1, 0].plot(y_p, z_p, color="#39FF14", label="EE Path", linewidth=1.5)
-        axs[1, 0].set_title("YZ Plane Projection (Side View)", color="white")
-        axs[1, 0].set_xlabel("Y (mm)")
-        axs[1, 0].set_ylabel("Z (mm)")
-        axs[1, 0].grid(True, color="#444444", linestyle="--")
-        axs[1, 0].set_facecolor("#111111")
-
-        # 4. Velocities over time
-        if t_v:
-            axs[1, 1].plot(t_v, robot_vel, color="#00F0FF", label="Mechanism (EE)", linewidth=1.5)
-        if speeds:
-            t_s = [s[0] for s in speeds]
-            v_s = [math.hypot(s[1], s[2]) for s in speeds]
-            axs[1, 1].step(t_s, v_s, where='post', color="#FF007F", label="Conveyor", linewidth=1.5)
-        axs[1, 1].set_title("Velocity Profile over Time", color="white")
-        axs[1, 1].set_xlabel("Time (s)")
-        axs[1, 1].set_ylabel("Velocity (mm/s)")
-        axs[1, 1].grid(True, color="#444444", linestyle="--")
-        axs[1, 1].set_facecolor("#111111")
-        axs[1, 1].legend(loc="upper right", facecolor="#222222", edgecolor="#444444")
-
-        # Color customizations
-        fig.patch.set_facecolor("#1e1e1e")
-        for ax in axs.flat:
-            ax.tick_params(colors="white")
-            ax.xaxis.label.set_color("white")
-            ax.yaxis.label.set_color("white")
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
-        # Save plots
-        brain_dir = Path("/home/tangerine/.gemini/antigravity/brain/0101fdf5-a10b-4f14-8826-f283eca685d6")
-        brain_dir.mkdir(parents=True, exist_ok=True)
-        brain_plots_path = brain_dir / "simulation_plots.png"
-        
-        plt.savefig(brain_plots_path, dpi=150)
-        plt.savefig("./simulation_plots.png", dpi=150)
-        plt.close()
-        print(f"\n[+] Experimental plots saved to: {brain_plots_path}")
-        print("[+] Also saved locally to: ./simulation_plots.png")
-    except Exception as exc:
-        print(f"\n[ERROR] Failed to generate plots: {exc}")
-
+# Save final plots at the end of the test
+    if fig is not None:
+        try:
+            plt.ioff()
+            # Save plots to correct paths
+            brain_dir = Path("/home/tangerine/.gemini/antigravity-ide/brain/c6f806a4-5f6b-4523-8026-46cb11e8198c")
+            brain_dir.mkdir(parents=True, exist_ok=True)
+            brain_plots_path = brain_dir / "simulation_plots.png"
+            fig.savefig(brain_plots_path, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+            fig.savefig("./simulation_plots.png", dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+            print(f"\n[+] Final plots saved to: {brain_plots_path}")
+            print("[+] Also saved locally to: ./simulation_plots.png")
+            plt.close(fig)
+        except Exception as exc:
+            print(f"[ERROR] Failed to save final plots: {exc}")
 
 if __name__ == "__main__":
     main()

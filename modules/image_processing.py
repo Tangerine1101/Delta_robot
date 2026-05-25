@@ -35,6 +35,7 @@ class SimulatedImageProcessing:
         self.counter = 0
         self.throughput_types = list(config.get("throughput_object_types", ["object_A"]))
         self.throughput_lanes = list(config.get("throughput_lanes", [-60.0, 0.0, 60.0]))
+        self.throughput_spawn_y = float(config.get("throughput_spawn_y", -180.0))
         self.throughput_spawn_x = float(config.get("throughput_spawn_x", -180.0))
         self.throughput_emit_interval_s = float(config.get("throughput_emit_interval_s", 0.35))
         self.accuracy_emit_interval_s = float(config.get("accuracy_emit_interval_s", 0.8))
@@ -78,8 +79,8 @@ class SimulatedImageProcessing:
         object_type = self.throughput_types[(self.counter - 1) % len(self.throughput_types)]
         return ObjectDetection(
             object_id=f"throughput-{self.counter:06d}",
-            x=self.throughput_spawn_x,
-            y=float(lane),
+            x=float(lane),
+            y=self.throughput_spawn_y,
             object_type=object_type,
             timestamp=timestamp,
         )

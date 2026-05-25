@@ -150,6 +150,18 @@ class FakePLCState:
                         self.end_effector,
                     )
                 ]
+            elif command_id == COMMAND_ID["goto_relative"]:
+                self.motion_queue = [
+                    MotionTarget(
+                        (
+                            self.position[0] + normalized["argument_x"][0],
+                            self.position[1] + normalized["argument_y"][0],
+                            self.position[2] + normalized["argument_z"][0],
+                        ),
+                        1.0,
+                        self.end_effector,
+                    )
+                ]
             elif command_id == COMMAND_ID["go_trajectory"]:
                 self.motion_queue = self._trajectory_targets(normalized)
             elif command_id == COMMAND_ID["pick"]:
@@ -183,7 +195,7 @@ class FakePLCState:
                         package["argument_y"][index],
                         package["argument_z"][index],
                     ),
-                    1.0,
+                    max(float(package["argument_time"][index]), self.sample_period_s),
                     package["argument_e"][index],
                 )
             )

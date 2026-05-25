@@ -118,6 +118,7 @@ class SchedulerMetrics:
 class SchedulerSettings:
     home_position: Position3D
     clearance_height: float
+    slope_transition_height: float
     pickup_height: float
     pre_pick_height: float
     place_height: float
@@ -141,19 +142,25 @@ class SchedulerSettings:
     throughput_object_types: list[str]
     throughput_lanes: list[float]
     throughput_spawn_x: float
+    throughput_spawn_y: float
     throughput_emit_interval_s: float
     accuracy_emit_interval_s: float
     execution_margin_s: float
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
-        # Therefore, clearance_height must be higher (less negative) than pre_pick_height,
-        # which must be higher than pickup_height.
-        # Format: clearance_height > pre_pick_height > pickup_height
-        if self.clearance_height <= self.pre_pick_height:
+        # Therefore, clearance_height must be higher (less negative) than the
+        # slope transition plane, which must stay above pre-pick and pickup.
+        # Format: clearance_height > slope_transition_height > pre_pick_height > pickup_height
+        if self.clearance_height <= self.slope_transition_height:
             raise ValueError(
                 f"Configuration Error: clearance_height ({self.clearance_height}) must be higher "
-                f"than pre_pick_height ({self.pre_pick_height}) in physical space (less negative)."
+                f"than slope_transition_height ({self.slope_transition_height}) in physical space."
+            )
+        if self.slope_transition_height <= self.pre_pick_height:
+            raise ValueError(
+                f"Configuration Error: slope_transition_height ({self.slope_transition_height}) "
+                f"must be higher than pre_pick_height ({self.pre_pick_height}) in physical space."
             )
         if self.pre_pick_height <= self.pickup_height:
             raise ValueError(
@@ -189,14 +196,24 @@ class SchedulerSettings:
             )
         ]
 
+        clearance_height = float(scheduler_raw.get("clearance_height", -165.0))
+        pre_pick_height = float(scheduler_raw.get("pre_pick_height", -210.0))
+        slope_transition_height = float(
+            scheduler_raw.get(
+                "slope_transition_height",
+                (clearance_height + pre_pick_height) / 2.0,
+            )
+        )
+
         settings = cls(
             home_position=_coerce_position3d(
                 scheduler_raw.get("home_position", [0.0, 0.0, -180.0]),
                 (0.0, 0.0, -180.0),
             ),
-            clearance_height=float(scheduler_raw.get("clearance_height", -165.0)),
+            clearance_height=clearance_height,
+            slope_transition_height=slope_transition_height,
             pickup_height=float(scheduler_raw.get("pickup_height", -230.0)),
-            pre_pick_height=float(scheduler_raw.get("pre_pick_height", -210.0)),
+            pre_pick_height=pre_pick_height,
             place_height=float(scheduler_raw.get("place_height", -205.0)),
             corner_blend_xy=float(scheduler_raw.get("corner_blend_xy", 35.0)),
             intercept_lead_time_s=float(scheduler_raw.get("intercept_lead_time_s", 0.14)),
@@ -207,8 +224,8 @@ class SchedulerSettings:
             speed_timeout_s=float(scheduler_raw.get("speed_timeout_s", 1.0)),
             poll_interval_s=float(scheduler_raw.get("poll_interval_s", 0.05)),
             default_speed=_coerce_vector2d(
-                scheduler_raw.get("default_speed", [80.0, 0.0]),
-                (80.0, 0.0),
+                scheduler_raw.get("default_speed", [0.0, 80.0]),
+                (0.0, 80.0),
             ),
             robot_movement_delay_s=float(scheduler_raw.get("robot_movement_delay_s", 0.05)),
             ethernet_delay_s=float(scheduler_raw.get("ethernet_delay_s", 0.002)),
@@ -227,6 +244,7 @@ class SchedulerSettings:
             throughput_object_types=list(scheduler_raw.get("throughput_object_types", ["object_A"])),
             throughput_lanes=[float(value) for value in scheduler_raw.get("throughput_lanes", [-60.0, 0.0, 60.0])],
             throughput_spawn_x=float(scheduler_raw.get("throughput_spawn_x", -180.0)),
+            throughput_spawn_y=float(scheduler_raw.get("throughput_spawn_y", -180.0)),
             throughput_emit_interval_s=float(scheduler_raw.get("throughput_emit_interval_s", 0.35)),
             accuracy_emit_interval_s=float(scheduler_raw.get("accuracy_emit_interval_s", 0.8)),
             execution_margin_s=float(scheduler_raw.get("execution_margin_s", 0.3)),
@@ -391,8 +409,8 @@ class RealRobotExecutor:
             now = time.monotonic()
             if now >= minimum_deadline:
                 last_status = self.request_status()
-                task_doing = None if last_status is None else last_status.get("task_doing")
-                if task_doing is not None and int(task_doing) != COMMAND_ID["go_trajectory"]:
+                task_state = None if last_status is None else last_status.get("task_state")
+                if task_state is not None and int(task_state) == 0:
                     return
                 if now >= hard_deadline:
                     return
@@ -568,7 +586,13 @@ class PickScheduler:
             predicted_x = detection.x + speed_sample.vx * dt
             predicted_y = detection.y + speed_sample.vy * dt
             pick_position = (predicted_x, predicted_y, self.settings.pickup_height)
-            if not self._within_workspace(pick_position):
+            # Only return None if the object has already passed the downstream boundary
+            # of the workspace, or if it is out of bounds horizontally (X).
+            if (
+                predicted_y > self.settings.pickup_window_y[1]
+                or predicted_x < self.settings.pickup_window_x[0]
+                or predicted_x > self.settings.pickup_window_x[1]
+            ):
                 return None
             goto_points = _build_goto_geometry(
                 self.current_position,
@@ -629,7 +653,11 @@ def _sign(value: float) -> float:
 def _segment_duration(start: Position3D, end: Position3D, settings: SchedulerSettings) -> float:
     horizontal = math.hypot(end[0] - start[0], end[1] - start[1])
     vertical = abs(end[2] - start[2])
-    return max(0.08, horizontal / settings.nominal_xy_speed + vertical / settings.nominal_z_speed)
+    return max(
+        0.08,
+        horizontal / settings.nominal_xy_speed if settings.nominal_xy_speed > 0.0 else 0.0,
+        vertical / settings.nominal_z_speed if settings.nominal_z_speed > 0.0 else 0.0,
+    )
 
 
 def _build_goto_geometry(
@@ -652,8 +680,8 @@ def _build_goto_geometry(
         (start_position[0], start_position[1], settings.clearance_height),
         # B_goto: blend offset from start toward pick, at clearance
         (start_position[0] + u_x * blend, start_position[1] + u_y * blend, settings.clearance_height),
-        # C_goto: directly above pick position at clearance (shared with B_pick)
-        (pick_position[0], pick_position[1], settings.clearance_height),
+        # C_goto: end of the mandatory 3D slope, still above pre-pick
+        (pick_position[0], pick_position[1], settings.slope_transition_height),
         # D_goto: descend to pre-pick height above pick
         (pick_position[0], pick_position[1], settings.pre_pick_height),
     ]
@@ -691,9 +719,9 @@ def _build_pick_geometry(
     return [
         # A_pick: at pickup height (suction ON)
         pick_position,
-        # B_pick: directly above pick at clearance height (shared with C_goto)
-        (pick_position[0], pick_position[1], settings.clearance_height),
-        # C_pick: blend offset from sort toward pick, at clearance
+        # B_pick: lift to the slope transition plane before moving toward the bin
+        (pick_position[0], pick_position[1], settings.slope_transition_height),
+        # C_pick: end of the mandatory 3D slope toward the sorting bin
         (sorting_position[0] - u_x * blend, sorting_position[1] - u_y * blend, settings.clearance_height),
         # D_pick: at sorting position, place height
         (sorting_position[0], sorting_position[1], settings.place_height),
@@ -750,6 +778,7 @@ def run_scheduler_scenario(
             "throughput_object_types": settings.throughput_object_types,
             "throughput_lanes": settings.throughput_lanes,
             "throughput_spawn_x": settings.throughput_spawn_x,
+            "throughput_spawn_y": settings.throughput_spawn_y,
             "throughput_emit_interval_s": settings.throughput_emit_interval_s,
             "accuracy_emit_interval_s": settings.accuracy_emit_interval_s,
             "accuracy_points": settings.accuracy_points,
@@ -787,7 +816,7 @@ def run_scheduler_scenario(
                     executor.execute(
                         plan,
                         log_samples=scenario_name == "test_accuracy",
-                        real_time=scenario_name == "test_accuracy",
+                        real_time=False,
                         scenario_name=scenario_name,
                     )
                 except Exception as exc:
