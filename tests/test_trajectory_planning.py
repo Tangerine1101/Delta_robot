@@ -38,6 +38,7 @@ def _settings(**overrides):
         ],
         "log_path": "data.log",
         "object_type_map": {"object_A": "object_A"},
+        "object_thickness_mm": {"object_A": 0.0},
         "sorting_positions": {"object_A": (0.0, 90.0, -290.0)},
         "throughput_object_types": ["object_A"],
         "throughput_lanes": [-50.0, 0.0, 50.0],
@@ -65,13 +66,21 @@ class TrajectoryGeometryTests(unittest.TestCase):
         goto_points = _build_goto_geometry(start, pick, settings)
         pick_points = _build_pick_geometry(pick, place, settings, goto_points)
 
-        self.assertGreater(_dxy(goto_points[1], goto_points[2]), 0.0)
-        self.assertLess(goto_points[2][2] - goto_points[1][2], 0.0)
+        # Goto has 7 points
+        self.assertEqual(len(goto_points), 7)
+        # P1 -> P2 is diagonal slope up (XY moves, Z goes up to clearance)
+        self.assertGreater(_dxy(goto_points[0], goto_points[1]), 0.0)
+        self.assertGreater(goto_points[1][2] - goto_points[0][2], 0.0)
 
+        # Pick has 7 points
+        self.assertEqual(len(pick_points), 7)
+        # P2 -> P3 is diagonal slope up (XY moves, Z goes up to clearance)
         self.assertGreater(_dxy(pick_points[1], pick_points[2]), 0.0)
         self.assertGreater(pick_points[2][2] - pick_points[1][2], 0.0)
 
-        self.assertGreater(goto_points[3][2], pick_points[0][2])
+        # pre_pick is higher than pickup (less negative)
+        self.assertGreater(goto_points[6][2], pick_points[0][2])
+        # slope transition height after pickup is higher than pickup
         self.assertGreater(pick_points[1][2], pick_points[0][2])
 
     def test_segment_duration_uses_slowest_axis_not_axis_sum(self):

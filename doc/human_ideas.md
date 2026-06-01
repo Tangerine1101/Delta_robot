@@ -127,67 +127,22 @@ COMMAND_ID = {
 - 2 = error
 
 # Trajectory planning: 
-optimize speed by reduce movement into 4 points and 2 phases: goto and pick phase where goto is when the robot move from current position to the conveyor and pick phase is when robot pick the object and move it to above of sort zone and release the end effector - a suction cup
-C_pick/B_goto->   --------------------  D_pick/A_goto
-                 / <- a slope to maintain speed on trajectory.
-                /
-                | <- C_goto/B_pick
-                |
-                | <- D_goto (a bit higher than A_pick so when the robot press down, the cup will suck and pick up object perpectly)
-        A_pick->|
+(*new) Quỹ đạo 7 điểm:
+            ----------------
+          /                 \
+         /                   \
+        |                     |
+        |                     |
+      
 
-A_goto and D_pick not neccessary to equal, because multiple objects type require different bins location. Similarly for C_pick and B_goto, differents bins require different trajectory.
+# 28-5
+## tình trạng hiện tại
+- mô phỏng hoạt động tạm ổn, thể hiện ra một vài lỗi logic trong lập quỹ đạo. Cần có mô đun xử lý ảnh hoàn chỉnh để test sâu hơn -> tạm thời bỏ qua.
+- về kết nối:
+ - chưa test kết nối với plc siemen. tạm bỏ qua do chưa có chương trình trên plc siemen.
+ - plc omron hoạt động rất tốt. đang có kết hoạch tăng số lượng điểm nội suy và điều chỉnh quỹ đạo.
 
-Chu kỳ gồm 2 phase: GOTO và PICK. Mỗi phase có 4 điểm.
-Mục tiêu quỹ đạo:
-Robot phải tránh các đoạn "đi ngang rồi hạ thẳng đứng" quá gắt. Hai đoạn chính:
-- B_goto -> C_goto
-- B_pick -> C_pick
-
-bắt buộc là đoạn nghiêng 3D, tức là vừa di chuyển XY vừa thay đổi Z, để duy trì tốc độ động cơ tốt hơn và tăng throughput.
-
-PHASE GOTO: đi từ vị trí hiện tại đến gần vật
-A_goto = điểm bắt đầu/điểm thả trước đó, ở cao độ an toàn.
-B_goto = điểm cao, bắt đầu đoạn nghiêng đi xuống về phía vật.
-C_goto = điểm kết thúc đoạn nghiêng, đã gần phía trên vật nhưng vẫn cao hơn D_goto.
-D_goto = điểm pre-pick, cùng X/Y với vật, cao hơn A_pick một chút.
-
-Bắt buộc:
-B_goto -> C_goto là đoạn nghiêng 3D:
-- XY tiến dần về P_pick.
-- Z giảm dần từ clearance_z xuống approach_z/pre_pick_z.
-- Không được tách thành "đi ngang ở clearance rồi hạ thẳng".
-
-PHASE PICK: hút vật và đưa đến bin
-A_pick = điểm chạm/hút vật.
-B_pick = điểm nâng vật lên khỏi mặt băng tải, nhưng chưa lên hẳn clearance.
-C_pick = điểm kết thúc đoạn nghiêng, đã lên cao và tiến về phía bin.
-D_pick = điểm thả vật tại bin.
-
-Bắt buộc:
-B_pick -> C_pick là đoạn nghiêng 3D:
-- XY tiến dần từ P_pick sang P_place.
-- Z tăng dần từ pick/approach height lên clearance/place-transfer height.
-- Không được tách thành "nâng thẳng đứng rồi đi ngang".
-
-D_goto và A_pick:
-- Cùng X/Y tại vị trí vật.
-- D_goto cao hơn A_pick.
-- D_goto là chuẩn bị, A_pick là nhấn xuống hút.
-
-C_goto và B_pick:
-- Không nhất thiết phải hoàn toàn cùng Z nếu muốn tối ưu động học.
-- Chúng nằm gần vùng pick.
-- C_goto là kết thúc đoạn nghiêng khi đi vào.
-- B_pick là bắt đầu đoạn nghiêng khi đi ra.
-
-B_goto và C_pick:
-- Có thể nằm ở vùng cao/clearance.
-- Đây là đầu/cuối của các đoạn nghiêng.
-- B_goto thuộc đường vào vật.
-- C_pick thuộc đường ra bin.
-
-A_goto và D_pick:
-- Không bắt buộc bằng nhau.
-- D_pick phụ thuộc bin của object hiện tại.
-- A_goto của chu kỳ sau chính là vị trí robot đang đứng sau chu kỳ trước.
+## task
+- xây dựng chương trình để hỗ trợ lấy mẫu train model yolo. cần xác định rõ logic trước.
+- tăng số điểm nội suy và điều chỉnh quỹ đạo lên tối đa 11 điểm - cần kiểm chứng tính khả thi sau. điểm nội suy và cơ chế hoạt động hiện tại không phù hợp với ứng dụng bên dưới.
+- xác định rõ ứng dụng xử lý ảnh thực tế, yêu cầu phải thực dụng: phân loại và gắp mạch pcb vào khay tương ứng. hiện có 2 loại hình vuông với 2 size khác nhau (25x25mm và 40x40mm)
