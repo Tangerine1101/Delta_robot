@@ -167,27 +167,45 @@ class MockPLC:
                 pass
             self._socket = None
 
-    def Write(self, tag_name: str, value: Any) -> Any:
+    def Write(self, tag_name: str | list[tuple[str, Any]], value: Any = None) -> Any:
+        class MockResponse:
+            def __init__(self, t: Any = None, v: Any = None, s: str = "Success") -> None:
+                self.TagName = t
+                self.Value = v
+                self.Status = s
+
         if self._socket is None:
             if not self.Connect():
-                class MockResponse:
-                    Status = "Connection Error"
-                return MockResponse()
+                if isinstance(tag_name, list):
+                    return [MockResponse(t, v, "Connection Error") for t, v in tag_name]
+                return MockResponse(tag_name, value, "Connection Error")
         try:
-            req = {"action": "write", "tag": tag_name, "value": value}
-            self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
-            resp_bytes = self._socket.recv(4096)
-            if not resp_bytes:
-                raise ConnectionError("Connection closed by peer")
-            resp = json.loads(resp_bytes.decode("utf-8").strip())
-            class MockResponse:
-                Status = "Success" if resp.get("ok") else resp.get("error", "Error")
-            return MockResponse()
+            if isinstance(tag_name, list):
+                results = []
+                for t, v in tag_name:
+                    req = {"action": "write", "tag": t, "value": v}
+                    self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
+                    resp_bytes = self._socket.recv(4096)
+                    if not resp_bytes:
+                        raise ConnectionError("Connection closed by peer")
+                    resp = json.loads(resp_bytes.decode("utf-8").strip())
+                    status = "Success" if resp.get("ok") else resp.get("error", "Error")
+                    results.append(MockResponse(t, v, status))
+                return results
+            else:
+                req = {"action": "write", "tag": tag_name, "value": value}
+                self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
+                resp_bytes = self._socket.recv(4096)
+                if not resp_bytes:
+                    raise ConnectionError("Connection closed by peer")
+                resp = json.loads(resp_bytes.decode("utf-8").strip())
+                status = "Success" if resp.get("ok") else resp.get("error", "Error")
+                return MockResponse(tag_name, value, status)
         except Exception as exc:
             self.Close()
-            class MockResponse:
-                Status = str(exc)
-            return MockResponse()
+            if isinstance(tag_name, list):
+                return [MockResponse(t, v, str(exc)) for t, v in tag_name]
+            return MockResponse(tag_name, value, str(exc))
 
     def Read(self, tags: list[str]) -> list[Any] | None:
         if self._socket is None:
@@ -505,6 +523,24 @@ class PLCGateway:
             self.connected = False
             raise RuntimeError(f"Write failed for {tag_name}: {getattr(result, 'Status', result)}")
 
+    def _write_tags(self, tags_and_values: list[tuple[str, Any]]) -> None:
+        try:
+            results = self.plc.Write(tags_and_values)
+        except Exception:
+            self.connected = False
+            raise
+        if isinstance(results, list):
+            for r in results:
+                if not self._write_result_ok(r):
+                    self.connected = False
+                    raise RuntimeError(
+                        f"Write failed for {getattr(r, 'TagName', 'unknown')}: {getattr(r, 'Status', r)}"
+                    )
+        else:
+            if not self._write_result_ok(results):
+                self.connected = False
+                raise RuntimeError(f"Write failed: {getattr(results, 'Status', results)}")
+
     def _read_tags(self, tags: list[str]) -> list[Any]:
         try:
             result = self.plc.Read(tags)
@@ -522,12 +558,14 @@ class PLCGateway:
 
         normalized = self._normalize_package(package)
         normalized["bit_doing"] = 1
+
+        tags_and_values = []
         for key, value in normalized.items():
-            if isinstance(value, list):
-                for index, item in enumerate(value):
-                    self._write_tag(f"{self.tag_write}.{key}[{index}]", item)
-            else:
-                self._write_tag(f"{self.tag_write}.{key}", value)
+            if key != "bit_doing":
+                tags_and_values.append((f"{self.tag_write}.{key}", value))
+        tags_and_values.append((f"{self.tag_write}.bit_doing", normalized["bit_doing"]))
+
+        self._write_tags(tags_and_values)
         return normalized
 
     def get_package(self) -> dict[str, Any] | None:

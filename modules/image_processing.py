@@ -33,7 +33,7 @@ class SimulatedImageProcessing:
         self.start_time = start_time
         self.next_emit_at = start_time
         self.counter = 0
-        self.throughput_types = list(config.get("throughput_object_types", ["object_A"]))
+        self.throughput_types = list(config.get("throughput_object_types", ["pcb1", "pcb2"]))
         self.throughput_lanes = list(config.get("throughput_lanes", [-60.0, 0.0, 60.0]))
         self.throughput_spawn_y = float(config.get("throughput_spawn_y", -180.0))
         self.throughput_spawn_x = float(config.get("throughput_spawn_x", -180.0))

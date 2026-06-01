@@ -48,21 +48,21 @@ COMMAND_ID = {
 
 ### 1.3. PLC Data Contract
 PC-to-PLC packet sent to the Omron NX CPU:
-* Struct tag: `pc_package` (fixed array slot count = `4`).
+* Struct tag: `pc_package` (fixed array slot count = `7`).
 * Value layout:
   ```python
   {
       "commandID": int,
       "argument_number": int,
-      "argument_x": [float] * 4,
-      "argument_y": [float] * 4,
-      "argument_z": [float] * 4,
-      "argument_e": [byte] * 4,     # 0 = gripper OFF, 1 = gripper ON
-      "argument_time": [float] * 4,  # Segment duration in seconds
+      "argument_x": [float] * 7,
+      "argument_y": [float] * 7,
+      "argument_z": [float] * 7,
+      "argument_e": [byte] * 7,     # 0 = gripper OFF, 1 = gripper ON
+      "argument_time": [float] * 7,  # Segment duration in seconds
       "doing_bit": byte              # 1 = command ready (PC writes, PLC resets)
   }
   ```
-* Invariant: Even if a command uses $< 4$ points, the arrays must always be padded to `4` elements with `0.0`.
+* Invariant: Even if a command uses $< 7$ points, the arrays must always be padded to `7` elements with `0.0`.
 
 Siemens S7-1200 package structure:
 ```python

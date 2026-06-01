@@ -4,14 +4,20 @@
     "siemens_ip": "192.168.250.2",
     "siemens_port": 1502,
     "period_s": 0.1,
-    "interpolar_points": 4,
+    "interpolar_points": 7,
     "object_types": {
-        "object_A": "object_A"
+        "pcb1": {"destination": "pcb1", "thickness_mm": 1.6},
+        "pcb2": {"destination": "pcb2", "thickness_mm": 1.6}
     },
-    "object_A": [
-        0.0,
+    "pcb1": [
+        -40.0,
         90.0,
-        -290.0
+        -310.0
+    ],
+    "pcb2": [
+        40.0,
+        90.0,
+        -310.0
     ],
     "scheduler": {
         "home_position": [
@@ -23,12 +29,12 @@
         "slope_transition_height": -295.0,
         "pickup_height": -310.0,
         "pre_pick_height": -300.0,
-        "place_height": -290.0,
+        "place_height": -310.0,
         "corner_blend_xy": 25.0,
         "intercept_lead_time_s": 0.14,
         "release_descent_time_s": 0.14,
-        "nominal_xy_speed": 1000.0,
-        "nominal_z_speed": 1000.0,
+        "nominal_xy_speed": 300.0,
+        "nominal_z_speed": 300.0,
         "stale_timeout_s": 5.0,
         "speed_timeout_s": 1.0,
         "poll_interval_s": 0.05,
@@ -47,7 +53,8 @@
             65.0
         ],
         "throughput_object_types": [
-            "object_A"
+            "pcb1",
+            "pcb2"
         ],
         "throughput_lanes": [
             -50.0,

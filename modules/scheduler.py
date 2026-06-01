@@ -138,6 +138,7 @@ class SchedulerSettings:
     accuracy_points: list[Position3D]
     log_path: str
     object_type_map: dict[str, str]
+    object_thickness_mm: dict[str, float]
     sorting_positions: dict[str, Position3D]
     throughput_object_types: list[str]
     throughput_lanes: list[float]
@@ -176,9 +177,17 @@ class SchedulerSettings:
     @classmethod
     def from_config(cls, config: Any) -> "SchedulerSettings":
         scheduler_raw = getattr(config, "scheduler", {}) or {}
-        object_type_map = dict(getattr(config, "object_types", {}) or {})
+        raw_object_types = dict(getattr(config, "object_types", {}) or {})
+        object_type_map: dict[str, str] = {}
+        object_thickness_mm: dict[str, float] = {}
         sorting_positions: dict[str, Position3D] = {}
-        for object_type, destination_name in object_type_map.items():
+        for object_type, type_info in raw_object_types.items():
+            if isinstance(type_info, dict):
+                destination_name = str(type_info.get("destination", object_type))
+                object_thickness_mm[object_type] = float(type_info.get("thickness_mm", 0.0))
+            else:
+                destination_name = str(type_info)
+            object_type_map[object_type] = destination_name
             raw_position = getattr(config, destination_name, None)
             if raw_position is None:
                 continue
@@ -240,6 +249,7 @@ class SchedulerSettings:
             accuracy_points=accuracy_points,
             log_path=str(scheduler_raw.get("log_path", "data.log")),
             object_type_map=object_type_map,
+            object_thickness_mm=object_thickness_mm,
             sorting_positions=sorting_positions,
             throughput_object_types=list(scheduler_raw.get("throughput_object_types", ["object_A"])),
             throughput_lanes=[float(value) for value in scheduler_raw.get("throughput_lanes", [-60.0, 0.0, 60.0])],
@@ -527,7 +537,11 @@ class PickScheduler:
         return self._build_pick_plan(detection, sorting_position, now)
 
     def mark_completed(self, plan: PickPlan) -> None:
-        self.current_position = plan.sorting_position
+        self.current_position = (
+            plan.sorting_position[0],
+            plan.sorting_position[1],
+            self.settings.place_height,
+        )
         self.metrics.completed_picks += 1
 
     def _resolve_sorting_position(self, object_type: str) -> Position3D | None:
@@ -559,7 +573,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 goto_points,
-                [0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
                 goto_times,
             )
         ]
@@ -580,7 +594,7 @@ class PickScheduler:
             TrajectoryPoint(point[0], point[1], point[2], e_value, duration)
             for point, e_value, duration in zip(
                 pick_points,
-                [1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 1, 0],
                 pick_times,
             )
         ]
@@ -729,15 +743,21 @@ def _build_goto_geometry(
     else:
         u_x = 0.0
         u_y = 0.0
-    blend = min(d * 0.5, settings.corner_blend_xy)
+    blend = min(d * 0.2, settings.corner_blend_xy)
     return [
-        # A_goto: lift to clearance height above start position
-        (start_position[0], start_position[1], settings.clearance_height),
-        # B_goto: blend offset from start toward pick, at clearance
+        # P1: Vertical lift from start to slope_transition
+        (start_position[0], start_position[1], settings.slope_transition_height),
+        # P2: Diagonal slope up to clearance (XY moves blend toward pick)
         (start_position[0] + u_x * blend, start_position[1] + u_y * blend, settings.clearance_height),
-        # C_goto: end of the mandatory 3D slope, still above pre-pick
+        # P3: Flat at clearance, blend zone after slope
+        (start_position[0] + u_x * 2 * blend, start_position[1] + u_y * 2 * blend, settings.clearance_height),
+        # P4: Flat at clearance, approaching pick zone
+        (pick_position[0] - u_x * 2 * blend, pick_position[1] - u_y * 2 * blend, settings.clearance_height),
+        # P5: Flat at clearance, blend zone before descent
+        (pick_position[0] - u_x * blend, pick_position[1] - u_y * blend, settings.clearance_height),
+        # P6: Diagonal slope down to slope_transition (XY reaches pick)
         (pick_position[0], pick_position[1], settings.slope_transition_height),
-        # D_goto: descend to pre-pick height above pick
+        # P7: Vertical descent to pre-pick
         (pick_position[0], pick_position[1], settings.pre_pick_height),
     ]
 
@@ -770,15 +790,21 @@ def _build_pick_geometry(
     else:
         u_x = 0.0
         u_y = 0.0
-    blend = min(d * 0.5, settings.corner_blend_xy)
+    blend = min(d * 0.2, settings.corner_blend_xy)
     return [
-        # A_pick: at pickup height (suction ON)
+        # P1: Descend to pickup height (suction ON)
         pick_position,
-        # B_pick: lift to the slope transition plane before moving toward the bin
+        # P2: Vertical lift to slope_transition
         (pick_position[0], pick_position[1], settings.slope_transition_height),
-        # C_pick: end of the mandatory 3D slope toward the sorting bin
+        # P3: Diagonal slope up to clearance (XY moves blend toward sort)
+        (pick_position[0] + u_x * blend, pick_position[1] + u_y * blend, settings.clearance_height),
+        # P4: Flat at clearance, approaching sort zone
+        (sorting_position[0] - u_x * 2 * blend, sorting_position[1] - u_y * 2 * blend, settings.clearance_height),
+        # P5: Flat at clearance, blend zone before descent into sort
         (sorting_position[0] - u_x * blend, sorting_position[1] - u_y * blend, settings.clearance_height),
-        # D_pick: at sorting position, place height
+        # P6: Diagonal slope down to slope_transition at sort
+        (sorting_position[0], sorting_position[1], settings.slope_transition_height),
+        # P7: Vertical descent to place_height (precise placement, suction OFF)
         (sorting_position[0], sorting_position[1], settings.place_height),
     ]
 

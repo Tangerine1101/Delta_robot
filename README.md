@@ -68,6 +68,7 @@ python3 main.py --scheduler --scenario test_throughput
   - Worker Process (`multiprocessing` queue): PLCGateway communication to eliminate network latency blocking.
 * **PLC Package Contract**: Fixed 4-slot coordinate arrays sent to the `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
 * **Interception Math**: Predicts conveyor interception using the object's initial position, dynamic 2D speed vector `[vx, vy]`, and a fixed-point iteration search. The default simulated conveyor moves along positive Y while X stays fixed per lane.
+* **Conveyor Speed Synchronization**: PLC Omron không cần quan tâm đến tốc độ thực tế của băng tải. PC đảm nhận hoàn toàn vai trò đọc tốc độ từ encoder của Siemens S7-1200, quy hoạch quỹ đạo bám đuổi và tính toán thời điểm đón tối ưu, sau đó gửi các tọa độ tĩnh trực tiếp cho Omron. Robot chỉ việc thực thi chính xác theo tọa độ nhận được.
 * **4-Point/2-Phase Trajectory**: Moves in a `goto` phase followed by a `pick` phase. `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not flat-then-vertical moves.
 * **Timing Compensation**: Command is dispatched ahead of interception to account for mechanics and communication:
   $$t_{\text{dispatch}} = t_{\text{pick}} - t_{\text{robot\_movement\_delay}} - t_{\text{ethernet\_delay}}$$
@@ -137,9 +138,15 @@ Detailed documentation files are available in the `doc/` directory:
   $$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
 
 ### Future Roadmap
-1. **Profile Smoothing**: Add jerk/acceleration-limited profiles on top of the mandatory 3D slope waypoints.
-2. **Calibration Utility**: Fix and integrate `modules/calibration.py` to auto-profile Ethernet round-trip latency and mechanical movement delays.
-3. **Vision Integration**: Connect simulated perception queues to real camera segmentation streams.
+1. **Khắc phục lệch định dạng byte (Endianness) và góc xoay trục thứ 4 (Mục tiêu sắp tới)**:
+   - Thay đổi các structure giao tiếp Siemens từ `ctypes.Structure` sang `ctypes.BigEndianStructure` trong [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) để tự động tương thích định dạng Big-Endian của S7-1200.
+   - Loại bỏ giá trị góc xoay 90.0 độ gán cứng trong `RealRobotExecutor` của [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py#L386-391), cập nhật góc xoay động theo góc nghiêng $\theta$ của PCB do hệ thống xử lý ảnh cung cấp.
+2. **Tích hợp Thị giác máy (Vision Integration - Mục tiêu tiếp theo)**: 
+   - Thiết lập camera thực tế và xây dựng module xử lý ảnh để nhận diện loại PCB (25x25mm và 40x40mm) cũng như đo góc xoay $\theta$ của mạch bằng thư viện OpenCV hoặc mô hình YOLO.
+3. **Giới hạn không gian an toàn trên PC**:
+   - Thêm cơ chế kiểm tra giới hạn tầm với vật lý của robot (Workspace/Kinematic check) trên chương trình PC ở giai đoạn cuối đồ án như một lớp bảo vệ dự phòng (hiện tại giới hạn không gian di chuyển hiện tại đã được hardcode cứng trực tiếp trên PLC để đảm bảo chương trình Python trên PC được linh động tối đa).
+4. **Profile Smoothing**: Add jerk/acceleration-limited profiles on top of the mandatory 3D slope waypoints.
+5. **Calibration Utility**: Fix and integrate `modules/calibration.py` to auto-profile Ethernet round-trip latency and mechanical movement delays.
 
 ---
 
@@ -158,9 +165,13 @@ Detailed documentation files are available in the `doc/` directory:
 ### 6.2. Hạn chế tích hợp PLC & Giả lập
 1. **Mảng `argument_time` vô dụng trên thực tế**:
    - *Chi tiết*: Code PLC hiện tại chưa quy hoạch thời gian thực hiện quỹ đạo, tốc độ chuyển động thực tế của robot không bị ảnh hưởng bởi tham số thời gian gửi từ PC.
-2. **Lệnh di chuyển tương đối chưa được hỗ trợ**:
+2. **Bắt buộc tách rời quỹ đạo GOTO và PICK**:
+   - *Chi tiết*: Do PLC Omron chưa hỗ trợ quy hoạch thời gian quỹ đạo nội bộ (thời gian di chuyển giữa các điểm gửi từ PC là ẩn số), chương trình PC bắt buộc phải tách quỹ đạo làm hai pha riêng biệt để chủ động căn chỉnh thời điểm gắp ứng với lúc vật trôi đến điểm đón. Thí nghiệm thực tế đã chứng minh chuyển động của robot vẫn mượt mà nhờ quãng đường hạ xuống và nhặt lên đủ ngắn.
+3. **Thiếu nhất quán trong tên tag**:
+   - *Chi tiết*: Tên tag kích hoạt lệnh chính xác trên PLC là `bit_doing`. Cần đồng bộ hóa từ khóa này trong toàn bộ các cấu trúc dữ liệu giao tiếp phía PC.
+4. **Lệnh di chuyển tương đối chưa được hỗ trợ**:
    - *Chi tiết*: Mã lệnh `goto_relative` (ID = 1) chưa được lập trình dưới PLC thực tế.
-3. **Lỗi kiểm thử hiệu chuẩn cơ học (`calibration.py`)**:
+5. **Lỗi kiểm thử hiệu chuẩn cơ học (`calibration.py`)**:
    - *Chi tiết*: Hàm hiệu chuẩn mechanical delay gửi lệnh `stop` (ID = 0) và đợi phản hồi `task_doing == 1`. Tuy nhiên, mock PLC cập nhật `task_doing` bằng chính ID lệnh (là 0 cho lệnh `stop`). Do đó, bước hiệu chuẩn này luôn bị timeout.
-5. **Gán cứng đường dẫn biểu đồ trong `run_test.py`**:
+6. **Gán cứng đường dẫn biểu đồ trong `run_test.py`**:
    - *Chi tiết*: Đường dẫn lưu trữ biểu đồ của `generate_plots()` bị chỉ định cố định vào một phiên làm việc cũ không tồn tại hoặc sai quyền ghi.

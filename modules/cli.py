@@ -116,7 +116,11 @@ def _cartesian_command(
     ).to_dict(interpolar_points)
 
 
-def _parse_plan(line: str, interpolar_points: int = INTERPOLAR_POINTS) -> CommandPlan:
+def _parse_plan(
+    line: str,
+    interpolar_points: int = INTERPOLAR_POINTS,
+    request_status: Callable[[], dict[str, Any] | None] | None = None,
+) -> CommandPlan:
     tokens = shlex.split(line)
     if not tokens:
         return CommandPlan(packages=[])
@@ -194,6 +198,99 @@ def _parse_plan(line: str, interpolar_points: int = INTERPOLAR_POINTS) -> Comman
         return CommandPlan(
             packages=[{"commandID": COMMAND_ID["plan_siemen"], "CommandID": COMMAND_ID["plan_siemen"], "rotate": float(tokens[1]), "speed": float(tokens[2])}]
         )
+    if command == "grab":
+        if len(tokens) not in (5, 6):
+            raise ValueError("grab expects: grab <object> <x> <y> <z> [rotate]")
+        obj_name = tokens[1]
+        x = float(tokens[2])
+        y = float(tokens[3])
+        z = float(tokens[4])
+        rotate_angle = float(tokens[5]) if len(tokens) == 6 else None
+
+        from modules.EthernetCom import load_config
+        config = load_config()
+        scheduler_raw = getattr(config, "scheduler", {}) or {}
+        clearance = float(scheduler_raw.get("clearance_height", -290.0))
+
+        packages = []
+        if rotate_angle is not None:
+            packages.append({
+                "commandID": COMMAND_ID["rotate_absolute"],
+                "CommandID": COMMAND_ID["rotate_absolute"],
+                "rotate": rotate_angle,
+                "speed": 0.0
+            })
+        packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
+        packages.append(_cartesian_command("goto_absolute", x, y, z, interpolar_points))
+        packages.append(_zero_command("pick", interpolar_points))
+        packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
+        return CommandPlan(packages=packages)
+    if command == "place":
+        if len(tokens) not in (5, 6):
+            raise ValueError("place expects: place <object> <x> <y> <z> [rotate]")
+        obj_name = tokens[1]
+        x = float(tokens[2])
+        y = float(tokens[3])
+        z = float(tokens[4])
+        rotate_angle = float(tokens[5]) if len(tokens) == 6 else None
+
+        from modules.EthernetCom import load_config
+        config = load_config()
+        scheduler_raw = getattr(config, "scheduler", {}) or {}
+        clearance = float(scheduler_raw.get("clearance_height", -290.0))
+
+        packages = []
+        if rotate_angle is not None:
+            packages.append({
+                "commandID": COMMAND_ID["rotate_absolute"],
+                "CommandID": COMMAND_ID["rotate_absolute"],
+                "rotate": rotate_angle,
+                "speed": 0.0
+            })
+        packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
+        packages.append(_cartesian_command("goto_absolute", x, y, z, interpolar_points))
+        packages.append(_zero_command("release", interpolar_points))
+        packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
+        return CommandPlan(packages=packages)
+    if command == "jog":
+        if len(tokens) != 3:
+            raise ValueError("jog expects: jog <x|y|z> <distance>")
+        axis = tokens[1].lower()
+        if axis not in ("x", "y", "z"):
+            raise ValueError("jog axis must be x, y, or z")
+        val = float(tokens[2])
+
+        if request_status is None:
+            dx = val if axis == "x" else 0.0
+            dy = val if axis == "y" else 0.0
+            dz = val if axis == "z" else 0.0
+            return CommandPlan(packages=[
+                _cartesian_command("goto_relative", dx, dy, dz, interpolar_points)
+            ])
+
+        status = request_status()
+        if not status:
+            raise RuntimeError("Cannot retrieve robot status to execute jog command")
+        pos = status.get("pos_EE")
+        if not pos or len(pos) != 3:
+            raise RuntimeError("Invalid pos_EE in robot status")
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        if axis == "x":
+            x += val
+        elif axis == "y":
+            y += val
+        elif axis == "z":
+            z += val
+
+        return CommandPlan(packages=[
+            _cartesian_command("goto_absolute", x, y, z, interpolar_points)
+        ])
+    if command == "snap":
+        print("[INFO] snap command is a placeholder (empty)")
+        return CommandPlan(packages=[])
+    if command == "autocollect":
+        print("[INFO] autocollect command is a placeholder (empty)")
+        return CommandPlan(packages=[])
 
     raise ValueError(f"Unknown command: {command}")
 
@@ -208,6 +305,11 @@ def _print_help() -> None:
         "  rotate <angle>                       # Siemens EE suction cup rotation\n"
         "  setspeed <speed>                     # Siemens conveyor speed\n"
         "  plan_siemen <rotate> <speed>         # Siemens plan\n"
+        "  grab <object> <x> <y> <z> [rotate]   # manual grab sequence\n"
+        "  place <object> <x> <y> <z> [rotate]  # manual place sequence\n"
+        "  jog <x|y|z> <distance>               # jog axis\n"
+        "  snap [filename]                      # snap photo (placeholder)\n"
+        "  autocollect                          # auto data collection (placeholder)\n"
         "  calib\n"
         "  pick\n"
         "  release\n"
@@ -251,7 +353,7 @@ def run_interactive(
             continue
 
         try:
-            plan = _parse_plan(line, interpolar_points)
+            plan = _parse_plan(line, interpolar_points, request_status)
         except Exception as exc:
             print(f"[ERROR] {exc}")
             continue
