@@ -68,55 +68,55 @@ python3 main.py --scheduler --scenario test_throughput
   - Worker Process (`multiprocessing` queue): PLCGateway communication to eliminate network latency blocking.
 * **PLC Package Contract**: Fixed 4-slot coordinate arrays sent to the `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
 * **Interception Math**: Predicts conveyor interception using the object's initial position, dynamic 2D speed vector `[vx, vy]`, and a fixed-point iteration search. The default simulated conveyor moves along positive Y while X stays fixed per lane.
-* **Conveyor Speed Synchronization**: PLC Omron không cần quan tâm đến tốc độ thực tế của băng tải. PC đảm nhận hoàn toàn vai trò đọc tốc độ từ encoder của Siemens S7-1200, quy hoạch quỹ đạo bám đuổi và tính toán thời điểm đón tối ưu, sau đó gửi các tọa độ tĩnh trực tiếp cho Omron. Robot chỉ việc thực thi chính xác theo tọa độ nhận được.
+* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of actual conveyor speed. The PC is solely responsible for reading encoder speed from the Siemens S7-1200, planning the interception trajectory, computing the optimal pick timing, and sending pre-calculated static coordinates to the Omron PLC. The robot simply executes the received coordinates.
 * **4-Point/2-Phase Trajectory**: Moves in a `goto` phase followed by a `pick` phase. `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not flat-then-vertical moves.
 * **Timing Compensation**: Command is dispatched ahead of interception to account for mechanics and communication:
   $$t_{\text{dispatch}} = t_{\text{pick}} - t_{\text{robot\_movement\_delay}} - t_{\text{ethernet\_delay}}$$
 
 ---
 
-## 3. Configuration Variables (Giải thích các biến cấu hình)
+## 3. Configuration Variables
 
-Các cấu hình hệ thống được lưu trữ trong tệp [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json). Dưới đây là giải thích chi tiết cho từng tham số:
+All system settings are stored in [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json).
 
-### 3.1. Cấu hình Kết nối & PLC (Connection & PLC Settings)
-* `ip_address` (string): Địa chỉ IP của PLC Omron NX1P2 (mặc định: `192.168.250.1`).
-* `port` (int): Cổng TCP kết nối với PLC Omron (mặc định: `44818` cho EtherNet/IP).
-* `siemens_ip` (string): Địa chỉ IP của PLC Siemens S7-1200 (mặc định: `192.168.250.2`).
-* `siemens_port` (int): Cổng TCP kết nối với PLC Siemens (mặc định: `1502`).
-* `period_s` (float): Chu kỳ lấy mẫu trạng thái hoặc chu kỳ cập nhật dữ liệu (giây).
-* `interpolar_points` (int): Số lượng điểm quỹ đạo tối đa được gửi trong gói tin PC (mặc định: `4` điểm).
-* `object_types` (object): Bản đồ ánh xạ giữa định danh loại vật thể (ví dụ: `object_A`) với tên khay phân loại tương ứng.
-* `object_A` (array): Tọa độ 3D `[x, y, z]` (mm) của khay phân loại dành cho sản phẩm `object_A`.
+### 3.1. Connection & PLC Settings
+* `ip_address` (string): IP address of the Omron NX1P2 PLC (default: `192.168.250.1`).
+* `port` (int): TCP port for Omron PLC connection (default: `44818` for EtherNet/IP).
+* `siemens_ip` (string): IP address of the Siemens S7-1200 PLC (default: `192.168.250.2`).
+* `siemens_port` (int): TCP port for Siemens PLC connection (default: `1502`).
+* `period_s` (float): Status polling period or data update cycle (seconds).
+* `interpolar_points` (int): Maximum number of trajectory points per PC packet (default: `4`).
+* `object_types` (object): Map from object type identifier (e.g. `object_A`) to its sorting bin name.
+* `object_A` (array): 3D coordinates `[x, y, z]` (mm) of the sorting bin for `object_A`.
 
-### 3.2. Cấu hình Bộ lập lịch & Hình học Robot (`scheduler` block)
-* `home_position` (array): Tọa độ 3D `[x, y, z]` của vị trí nghỉ mặc định (Home) của robot Delta.
-* `clearance_height` (float): Độ cao an toàn (tọa độ Z âm) để di chuyển ngang giữa các khay và băng tải (ví dụ: `-290.0`).
-* `slope_transition_height` (float): Độ cao bắt đầu chuyển tiếp quỹ đạo nghiêng 3D để tối ưu chuyển động cơ học (ví dụ: `-295.0`).
-* `pickup_height` (float): Độ cao gắp vật thể trên băng tải (ví dụ: `-310.0`).
-* `pre_pick_height` (float): Độ cao tiếp cận phía trên vật thể trước khi thực hiện cú gắp (ví dụ: `-300.0`).
-* `place_height` (float): Độ cao thả vật thể tại khay phân loại (ví dụ: `-290.0`).
-* `corner_blend_xy` (float): Bán kính vê góc (blend) tại các góc quỹ đạo để robot di chuyển mượt mà hơn.
-* `intercept_lead_time_s` (float): Khoảng thời gian ước lượng tối thiểu ban đầu để tính điểm hội tụ gắp vật thể.
-* `release_descent_time_s` (float): Thời gian chờ xả giác hút tại điểm thả (giây).
-* `nominal_xy_speed` (float): Tốc độ di chuyển định mức của robot theo phương ngang XY (mm/s).
-* `nominal_z_speed` (float): Tốc độ di chuyển định mức của robot theo phương đứng Z (mm/s).
-* `stale_timeout_s` (float): Thời gian tối đa để lưu vết vật thể trước khi loại bỏ khỏi hàng đợi (giây).
-* `speed_timeout_s` (float): Thời gian hết hạn của dữ liệu tốc độ băng tải nếu không nhận được mẫu mới (giây).
-* `poll_interval_s` (float): Tần suất lặp lại chu kỳ lập lịch (giây).
-* `default_speed` (array): Vector vận tốc mặc định của băng tải `[vx, vy]` (mm/s) khi chạy mô phỏng hoặc mất kết nối PLC.
-* `robot_movement_delay_s` (float): Độ trễ phản hồi cơ học và gia tốc thực tế của robot (giây).
-* `ethernet_delay_s` (float): Độ trễ truyền thông mạng Ethernet một chiều (giây).
-* `pickup_window_x` (array): Phạm vi giới hạn trục X `[xmin, xmax]` của vùng gắp vật thể.
-* `pickup_window_y` (array): Phạm vi giới hạn trục Y `[ymin, ymax]` của vùng gắp vật thể.
-* `throughput_object_types` (array): Danh sách các loại vật thể sinh ra trong kịch bản mô phỏng Throughput.
-* `throughput_lanes` (array): Tọa độ trục X của các làn băng tải nơi sản phẩm được sinh ra.
-* `throughput_spawn_x` & `throughput_spawn_y` (float): Điểm xuất phát của sản phẩm giả lập ở thượng nguồn băng tải.
-* `throughput_emit_interval_s` (float): Khoảng thời gian sinh vật thể tuần tự trong kịch bản Throughput.
-* `accuracy_emit_interval_s` (float): Khoảng thời gian sinh vật thể trong kịch bản kiểm tra Accuracy.
-* `execution_margin_s` (float): Khoảng thời gian an toàn cộng thêm trước khi hết hạn lệnh quỹ đạo.
-* `accuracy_points` (array): Danh sách các tọa độ điểm tĩnh dùng để kiểm tra sai số bám quỹ đạo.
-* `log_path` (string): Đường dẫn lưu trữ dữ liệu log quỹ đạo bám vật thể.
+### 3.2. Scheduler & Robot Geometry (`scheduler` block)
+* `home_position` (array): 3D coordinates `[x, y, z]` of the robot's default rest (Home) position.
+* `clearance_height` (float): Safe Z height (negative) for horizontal travel between bins and conveyor (e.g. `-290.0`).
+* `slope_transition_height` (float): Z height at which the 3D slope segment begins to smooth the approach (e.g. `-295.0`).
+* `pickup_height` (float): Z height at which the gripper picks the object off the conveyor (e.g. `-310.0`).
+* `pre_pick_height` (float): Z height above the object just before the descent to pick (e.g. `-300.0`).
+* `place_height` (float): Z height at which the gripper releases the object into the bin (e.g. `-290.0`).
+* `corner_blend_xy` (float): XY corner blend radius at trajectory waypoints for smoother motion.
+* `intercept_lead_time_s` (float): Minimum initial time estimate used to seed the interception convergence loop (seconds).
+* `release_descent_time_s` (float): Dwell time at the release point while the suction cup deactivates (seconds).
+* `nominal_xy_speed` (float): Nominal horizontal XY travel speed of the robot (mm/s).
+* `nominal_z_speed` (float): Nominal vertical Z travel speed of the robot (mm/s).
+* `stale_timeout_s` (float): Maximum time to track an object before dropping it from the queue (seconds).
+* `speed_timeout_s` (float): Expiry time for conveyor speed data if no new sample is received (seconds).
+* `poll_interval_s` (float): Scheduler loop repeat period (seconds).
+* `default_speed` (array): Default conveyor velocity vector `[vx, vy]` (mm/s) used in simulation or when PLC is disconnected.
+* `robot_movement_delay_s` (float): Mechanical response and acceleration lag of the physical robot (seconds).
+* `ethernet_delay_s` (float): One-way Ethernet communication latency (seconds).
+* `pickup_window_x` (array): X-axis bounding limit `[xmin, xmax]` of the valid pickup zone.
+* `pickup_window_y` (array): Y-axis bounding limit `[ymin, ymax]` of the valid pickup zone.
+* `throughput_object_types` (array): Object types spawned in the throughput simulation scenario.
+* `throughput_lanes` (array): X coordinates of the conveyor lanes where simulated objects are spawned.
+* `throughput_spawn_x` & `throughput_spawn_y` (float): Upstream spawn origin of simulated objects on the conveyor.
+* `throughput_emit_interval_s` (float): Time interval between successive object spawns in the Throughput scenario.
+* `accuracy_emit_interval_s` (float): Time interval between object spawns in the Accuracy scenario.
+* `execution_margin_s` (float): Additional safety buffer added before a trajectory command expires (seconds).
+* `accuracy_points` (array): List of static target coordinates used for tracking error profiling.
+* `log_path` (string): File path for trajectory tracking data logs.
 
 ---
 
@@ -138,40 +138,40 @@ Detailed documentation files are available in the `doc/` directory:
   $$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
 
 ### Future Roadmap
-1. **Khắc phục lệch định dạng byte (Endianness) và góc xoay trục thứ 4 (Mục tiêu sắp tới)**:
-   - Thay đổi các structure giao tiếp Siemens từ `ctypes.Structure` sang `ctypes.BigEndianStructure` trong [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) để tự động tương thích định dạng Big-Endian của S7-1200.
-   - Loại bỏ giá trị góc xoay 90.0 độ gán cứng trong `RealRobotExecutor` của [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py#L386-391), cập nhật góc xoay động theo góc nghiêng $\theta$ của PCB do hệ thống xử lý ảnh cung cấp.
-2. **Tích hợp Thị giác máy (Vision Integration - Mục tiêu tiếp theo)**: 
-   - Thiết lập camera thực tế và xây dựng module xử lý ảnh để nhận diện loại PCB (25x25mm và 40x40mm) cũng như đo góc xoay $\theta$ của mạch bằng thư viện OpenCV hoặc mô hình YOLO.
-3. **Giới hạn không gian an toàn trên PC**:
-   - Thêm cơ chế kiểm tra giới hạn tầm với vật lý của robot (Workspace/Kinematic check) trên chương trình PC ở giai đoạn cuối đồ án như một lớp bảo vệ dự phòng (hiện tại giới hạn không gian di chuyển hiện tại đã được hardcode cứng trực tiếp trên PLC để đảm bảo chương trình Python trên PC được linh động tối đa).
+1. **Endianness Fix & 4th-Axis Rotation (Upcoming)**:
+   - Change Siemens communication structs from `ctypes.Structure` to `ctypes.BigEndianStructure` in [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) for automatic S7-1200 big-endian compatibility. *(Done)*
+   - Remove the hardcoded 90.0° rotation value in `RealRobotExecutor` in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py#L386-391) and replace with a dynamic $\theta$ angle supplied by the vision system.
+2. **Vision Integration (Next milestone)**:
+   - Set up a real camera and build an image processing module to classify PCB types (25×25 mm and 40×40 mm) and measure the PCB tilt angle $\theta$ using OpenCV or a YOLO model.
+3. **PC-side Workspace Safety Check**:
+   - Add a kinematic workspace boundary check on the PC as a redundant safety layer (current motion limits are hardcoded directly on the PLC to keep the Python layer flexible).
 4. **Profile Smoothing**: Add jerk/acceleration-limited profiles on top of the mandatory 3D slope waypoints.
 5. **Calibration Utility**: Fix and integrate `modules/calibration.py` to auto-profile Ethernet round-trip latency and mechanical movement delays.
 
 ---
 
-## 6. Known Bugs & Limitations (Các lỗi đã biết & Hạn chế)
+## 6. Known Bugs & Limitations
 
-### 6.1. Lỗi logic & Thuật toán
-1. **Lỗi thoát sớm trong dự đoán vị trí gắp (`_predict_pick_position` trong `scheduler.py`)** - **[ĐÃ KHẮC PHỤC]**:
-   - *Chi tiết*: Phép kiểm tra vùng làm việc nằm bên trong vòng lặp tìm điểm hội tụ. Đã được sửa bằng cách giới hạn chu kỳ hội tụ dựa trên thời điểm vật đi vào vùng gắp `t_enter`.
-2. **Thời gian phân đoạn gắp/thả bị gán cứng (`_build_pick_timing` trong `scheduler.py`)** - **[ĐÃ KHẮC PHỤC]**:
-   - *Chi tiết*: Phân đoạn thời gian gắp/thả đã được tính toán lại động theo quãng đường thực tế di chuyển chéo (`blend`) và tốc độ định mức.
-3. **Rò rỉ bộ nhớ (Memory Leak) trong bộ lập lịch** - **[ĐÃ KHẮC PHỤC]**:
-   - *Chi tiết*: Tập hợp `self.seen_object_ids` lưu trữ vô hạn đã được chuyển thành kiểu từ điển và dọn dẹp định kỳ các ID cũ hơn `stale_timeout_s`.
-4. **Chỉ số thống kê bị bỏ sót** - **[ĐÃ KHẮC PHỤC]**:
-   - *Chi tiết*: Bộ đếm `skipped_outside_workspace` đã được bổ sung và tăng lên chính xác khi vật trôi qua khỏi giới hạn dưới của vùng làm việc.
+### 6.1. Logic & Algorithm
+1. **Early exit in pick position prediction (`_predict_pick_position` in `scheduler.py`)** — **[FIXED]**:
+   - Workspace boundary check was inside the convergence loop. Fixed by bounding iterations to when the object enters the pickup window (`t_enter`).
+2. **Hardcoded pick/release segment timing (`_build_pick_timing` in `scheduler.py`)** — **[FIXED]**:
+   - Timing is now computed dynamically from actual diagonal blend distance and nominal speeds.
+3. **Memory leak in scheduler** — **[FIXED]**:
+   - `self.seen_object_ids` was an unbounded set; converted to a dict and pruned periodically using `stale_timeout_s`.
+4. **Missing statistics counter** — **[FIXED]**:
+   - `skipped_outside_workspace` counter added and incremented correctly when an object drifts past the lower workspace boundary.
 
-### 6.2. Hạn chế tích hợp PLC & Giả lập
-1. **Mảng `argument_time` vô dụng trên thực tế**:
-   - *Chi tiết*: Code PLC hiện tại chưa quy hoạch thời gian thực hiện quỹ đạo, tốc độ chuyển động thực tế của robot không bị ảnh hưởng bởi tham số thời gian gửi từ PC.
-2. **Bắt buộc tách rời quỹ đạo GOTO và PICK**:
-   - *Chi tiết*: Do PLC Omron chưa hỗ trợ quy hoạch thời gian quỹ đạo nội bộ (thời gian di chuyển giữa các điểm gửi từ PC là ẩn số), chương trình PC bắt buộc phải tách quỹ đạo làm hai pha riêng biệt để chủ động căn chỉnh thời điểm gắp ứng với lúc vật trôi đến điểm đón. Thí nghiệm thực tế đã chứng minh chuyển động của robot vẫn mượt mà nhờ quãng đường hạ xuống và nhặt lên đủ ngắn.
-3. **Thiếu nhất quán trong tên tag**:
-   - *Chi tiết*: Tên tag kích hoạt lệnh chính xác trên PLC là `bit_doing`. Cần đồng bộ hóa từ khóa này trong toàn bộ các cấu trúc dữ liệu giao tiếp phía PC.
-4. **Lệnh di chuyển tương đối chưa được hỗ trợ**:
-   - *Chi tiết*: Mã lệnh `goto_relative` (ID = 1) chưa được lập trình dưới PLC thực tế.
-5. **Lỗi kiểm thử hiệu chuẩn cơ học (`calibration.py`)**:
-   - *Chi tiết*: Hàm hiệu chuẩn mechanical delay gửi lệnh `stop` (ID = 0) và đợi phản hồi `task_doing == 1`. Tuy nhiên, mock PLC cập nhật `task_doing` bằng chính ID lệnh (là 0 cho lệnh `stop`). Do đó, bước hiệu chuẩn này luôn bị timeout.
-6. **Gán cứng đường dẫn biểu đồ trong `run_test.py`**:
-   - *Chi tiết*: Đường dẫn lưu trữ biểu đồ của `generate_plots()` bị chỉ định cố định vào một phiên làm việc cũ không tồn tại hoặc sai quyền ghi.
+### 6.2. PLC Integration & Simulation Limitations
+1. **`argument_time` array has no effect on real hardware**:
+   - The current PLC program does not implement trajectory time planning; actual robot motion speed is unaffected by the timing values sent from the PC.
+2. **GOTO and PICK trajectories must be sent as separate phases**:
+   - The Omron PLC has no internal trajectory time planner (segment travel time is opaque to the PC), so the PC must split the motion into two separate phases to control pick timing precisely. Real hardware testing confirmed smooth motion because the descent and ascent segments are short enough.
+3. **Tag name inconsistency**:
+   - The correct PLC-side command trigger tag is `bit_doing`. This key must be synchronized across all PC-side communication data structures.
+4. **`goto_relative` command not implemented on PLC**:
+   - Command ID 1 (`goto_relative`) has not been programmed on the physical PLC.
+5. **Calibration test failure in `calibration.py`**:
+   - The mechanical delay calibration sends a `stop` command (ID = 0) and waits for `task_doing == 1`. The mock PLC sets `task_doing` to the command ID (0 for `stop`), so the calibration step always times out.
+6. **Hardcoded plot path in `run_test.py`**:
+   - `generate_plots()` writes to a hardcoded path from an old session that may not exist or may not be writable.
