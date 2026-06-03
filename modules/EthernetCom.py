@@ -25,18 +25,16 @@ SIEMENS_DB_WRITE_OFFSET = 0   # Offset byte bắt đầu ghi lệnh
 SIEMENS_DB_READ = 2           # DB để đọc trạng thái phản hồi từ PLC (ví dụ DB2)
 SIEMENS_DB_READ_OFFSET = 0    # Offset byte bắt đầu đọc trạng thái
 
-class SiemensSendPacket(ctypes.Structure):
+class SiemensSendPacket(ctypes.BigEndianStructure):
     """Cấu trúc gói tin gửi từ PC xuống Siemens PLC (PC -> PLC)"""
-    _pack_ = 1
     _fields_ = [
         ("CommandID", ctypes.c_int32),  # Kiểu int (4 bytes)
         ("rotate", ctypes.c_float),     # Kiểu float (4 bytes)
         ("speed", ctypes.c_float),      # Kiểu float (4 bytes)
     ]
 
-class SiemensReceivePacket(ctypes.Structure):
+class SiemensReceivePacket(ctypes.BigEndianStructure):
     """Cấu trúc gói tin đọc từ Siemens PLC lên PC (PLC -> PC)"""
-    _pack_ = 1
     _fields_ = [
         ("rotate_current", ctypes.c_float), # Kiểu float (4 bytes)
         ("speed_current", ctypes.c_float),  # Kiểu float (4 bytes)
