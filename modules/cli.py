@@ -176,10 +176,27 @@ def _parse_plan(
         )
     if command == "calib":
         return CommandPlan(packages=[_zero_command("calibrate", interpolar_points)])
-    if command == "pick":
-        return CommandPlan(packages=[_zero_command("pick", interpolar_points)])
-    if command == "release":
-        return CommandPlan(packages=[_zero_command("release", interpolar_points)])
+    if command in {"pick", "release"}:
+        # Suction is controlled via argument_e inside a go_trajectory packet
+        # (the dedicated pick/release command IDs are no-ops on the real PLC).
+        # Send a 1-point trajectory at the current pos_EE with the gripper bit
+        # set/cleared accordingly.
+        if request_status is None:
+            raise RuntimeError(
+                f"{command} requires robot status to read current pos_EE"
+            )
+        status = request_status()
+        if not status:
+            raise RuntimeError(f"Cannot retrieve robot status to execute {command}")
+        pos = status.get("pos_EE")
+        if not pos or len(pos) != 3:
+            raise RuntimeError("Invalid pos_EE in robot status")
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        e_value = 1 if command == "pick" else 0
+        points = [{"x": x, "y": y, "z": z, "e": e_value, "time": 0.1}]
+        return CommandPlan(
+            packages=[_trajectory_command(command, points, interpolar_points)]
+        )
     if command == "rotate":
         if len(tokens) != 2:
             raise ValueError("rotate expects 1 angle value: rotate <angle>")
