@@ -18,6 +18,8 @@ It contains the current status, command mapping, PLC data contract, and verifica
 - `doc/human_ideas.md` — read for context only; **never edit this file** unless explicitly asked by the user. It is the human team's brainstorming space.
 - `doc/Manuals/*.pdf` — large files. Read only when looking for a specific hardware register or electrical specification.
 
+### Alway write documents in English.
+
 ### Never read or edit:
 - `.trash/` — legacy backups. **Do not open, recover, or reference anything from here** unless the user explicitly asks.
 - `.git/`, `.venv/`, `.agents/`, `__pycache__/`, `modules/__pycache__/` — system metadata and cache. Ignore completely.
@@ -107,6 +109,7 @@ clearance_height > slope_transition_height > pre_pick_height > pickup_height
   t_dispatch = t_pick - t_robot_movement_delay - t_ethernet_delay
   ```
 - Do not introduce `time.sleep()` on the main scheduler loop — it blocks the pick window.
+- **Omron NX1P2 firmware ignores `argument_time`** and runs servos at a fixed maximum speed. PC-side `nominal_xy_speed` / `nominal_z_speed` are scheduler-side timing approximations only — they do not throttle motion. For true mechanism-speed measurement, gate the next phase on `pos_EE` convergence (see the `evaluate` scenario), not on `argument_time`. See `doc/ai_context.md` section 3.
 
 ### 4.6. Command IDs
 

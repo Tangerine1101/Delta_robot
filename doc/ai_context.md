@@ -96,6 +96,7 @@ Siemens S7-1200 package structure:
 2. **Vision Integration**: Active perception is mocked using `SimulatedImageProcessing`. Real camera frames are not integrated yet.
 3. **4-DOF Physical Actuation**: Command IDs $7, 8, 9$ are defined for S7-1200 rotation and conveyor adjustment, but actual driver communication code needs integration.
 4. **Git clean state**: Ensure log files (`data.log`, `test_module.log`) and cache files (`__pycache__`) are ignored by git in local development.
+5. **PLC fixed motor speed (Omron NX1P2)**: The PLC firmware drives the servo motors at a fixed maximum speed and **ignores the `argument_time` field** of each trajectory point. PC-side `nominal_xy_speed` / `nominal_z_speed` only affect scheduler-side timing (pick-prediction, log timestamps) — they do not throttle actual robot motion. To measure true mechanism speed, gate phase progression on `pos_EE` convergence (see `evaluate` scenario) rather than wall-clock from `argument_time`.
 
 ---
 
@@ -115,4 +116,8 @@ python3 main.py --scheduler --scenario test_accuracy --duration 0.2 --simulate-e
 
 # 4. Verify test module logic with a dry run
 python3 -m modules.test_module --port 1502 --self-test --duration 1.0
+
+# 5. Run evaluate scenario (continuous box <-> 3 accuracy_points; Ctrl-C to stop).
+#    --duration is optional and useful for CI smoke tests.
+python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 2.0
 ```

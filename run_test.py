@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import sys
 import subprocess
 import threading
@@ -11,8 +12,10 @@ from pathlib import Path
 
 # Global data collectors for plotting
 data_lock = threading.Lock()
-robot_positions = []  # tuples of (t_rel, x, y, z, e)
+robot_positions = []   # tuples of (t_rel, x, y, z, e)  — from pos_EE (real/fake PLC)
 conveyor_speeds = []   # tuples of (t_rel, vx, vy)
+planned_waypoints = [] # tuples of (t_rel, x, y, z, e)  — from [TRAJ] lines (evaluate)
+cycle_metrics = []     # tuples of (t_rel, dict)          — from [CYCLE] lines (evaluate)
 start_time = 0.0
 
 def stream_output(process, prefix):
@@ -28,7 +31,7 @@ def stream_output(process, prefix):
                     last_print_time = now
             else:
                 print(f"{prefix} {cleaned}")
-            
+
             # Parse trajectory / speed data
             t_rel = time.monotonic() - start_time
             if is_plc:
@@ -38,11 +41,41 @@ def stream_output(process, prefix):
                     with data_lock:
                         robot_positions.append((t_rel, x, y, z, int(e)))
             else:
+                # [SPEED] lines (throughput / accuracy scenarios)
                 match = re.search(r"\[SPEED\] vx=([-\d\.]+) vy=([-\d\.]+)", cleaned)
                 if match:
                     vx, vy = map(float, match.groups())
                     with data_lock:
                         conveyor_speeds.append((t_rel, vx, vy))
+
+                # [TRAJ] lines (evaluate scenario) — planned waypoints for trajectory viz
+                if "[TRAJ]" in cleaned:
+                    traj_match = re.search(r"\[TRAJ\] (\{.*\})", cleaned)
+                    if traj_match:
+                        try:
+                            traj_data = json.loads(traj_match.group(1))
+                            e_val = 1 if traj_data.get("phase") == "pick" else 0
+                            for pt in traj_data.get("waypoints", []):
+                                with data_lock:
+                                    planned_waypoints.append((
+                                        t_rel,
+                                        float(pt["x"]),
+                                        float(pt["y"]),
+                                        float(pt["z"]),
+                                        int(pt.get("e", e_val)),
+                                    ))
+                        except Exception:
+                            pass
+
+                # [CYCLE] lines (evaluate scenario) — throughput metrics over time
+                if "[CYCLE]" in cleaned:
+                    cycle_match = re.search(r"\[CYCLE\] (\{.*\})", cleaned)
+                    if cycle_match:
+                        try:
+                            with data_lock:
+                                cycle_metrics.append((t_rel, json.loads(cycle_match.group(1))))
+                        except Exception:
+                            pass
     process.stdout.close()
 
 def main():
@@ -50,16 +83,18 @@ def main():
     parser.add_argument(
         "--scenario",
         default="test_throughput",
-        choices=["test_throughput", "test_accuracy"],
+        choices=["test_throughput", "test_accuracy", "evaluate"],
         help="Test scenario to run (default: test_throughput)",
     )
     parser.add_argument(
         "--duration",
         type=int,
-        default=30,
-        help="Duration of the test in seconds (default: 30)",
+        default=None,
+        help="Duration of the test in seconds (default: 30 for throughput/accuracy, 60 for evaluate)",
     )
     args = parser.parse_args()
+    if args.duration is None:
+        args.duration = 60 if args.scenario == "evaluate" else 30
 
     port = 1502
     # Start the PLC fake module with duration slightly longer to allow clean shutdown of client first
@@ -152,43 +187,54 @@ def main():
                         positions = list(robot_positions)
                         c_speeds = list(conveyor_speeds)
                     
-                    if positions:
+                    with data_lock:
+                        waypoints = list(planned_waypoints)
+                        c_metrics = list(cycle_metrics)
+
+                    # Choose data source for 3D trajectory:
+                    # evaluate: use planned waypoints; others: use pos_EE from PLC.
+                    traj_source = waypoints if args.scenario == "evaluate" else positions
+                    has_data = len(traj_source) > 0 or len(positions) > 0
+
+                    if has_data:
                         ax_traj.clear()
                         ax_time.clear()
                         ax_vel.clear()
 
-                        # 1. Trajectory Plot: Last 3 pick-and-place cycles (6 trajectories)
-                        phases = []
-                        current_phase = []
-                        for p in positions:
-                            # p is (t_rel, x, y, z, e)
-                            e = p[4] if len(p) > 4 else 0
-                            if not current_phase:
-                                current_phase.append(p)
-                            else:
-                                if e == (current_phase[-1][4] if len(current_phase[-1]) > 4 else 0):
+                        # --- Chart 1: 3D Trajectory ---
+                        traj_title = "3D Planned Trajectory (evaluate)" if args.scenario == "evaluate" else "3D Trajectory (Last 3 Cycles)"
+                        if traj_source:
+                            phases = []
+                            current_phase = []
+                            for p in traj_source:
+                                e = p[4] if len(p) > 4 else 0
+                                if not current_phase:
+                                    current_phase.append(p)
+                                elif e == (current_phase[-1][4] if len(current_phase[-1]) > 4 else 0):
                                     current_phase.append(p)
                                 else:
                                     phases.append(current_phase)
                                     current_phase = [p]
-                        if current_phase:
-                            phases.append(current_phase)
+                            if current_phase:
+                                phases.append(current_phase)
 
-                        last_6_phases = phases[-6:]
-                        for i, phase in enumerate(last_6_phases):
-                            xs = [pt[1] for pt in phase]
-                            ys = [pt[2] for pt in phase]
-                            zs = [pt[3] for pt in phase]
-                            e = phase[0][4] if len(phase[0]) > 4 else 0
-                            color = '#FF007F' if e == 1 else '#00F0FF'
-                            label = 'Pick (Suction ON)' if e == 1 else 'Goto (Suction OFF)'
-                            # Avoid duplicate labels in legend
-                            if i == len(last_6_phases) - 1 or i == len(last_6_phases) - 2:
-                                ax_traj.plot(xs, ys, zs, color=color, linewidth=2.0, label=label)
-                            else:
-                                ax_traj.plot(xs, ys, zs, color=color, linewidth=1.5, alpha=0.4)
+                            last_6_phases = phases[-6:]
+                            for i, phase in enumerate(last_6_phases):
+                                xs = [pt[1] for pt in phase]
+                                ys = [pt[2] for pt in phase]
+                                zs = [pt[3] for pt in phase]
+                                e = phase[0][4] if len(phase[0]) > 4 else 0
+                                color = '#FF007F' if e == 1 else '#00F0FF'
+                                label = 'Pick (Suction ON)' if e == 1 else 'Goto (Suction OFF)'
+                                alpha = 1.0 if i >= len(last_6_phases) - 2 else 0.4
+                                lw = 2.0 if alpha == 1.0 else 1.5
+                                show_label = i >= len(last_6_phases) - 2
+                                ax_traj.plot(xs, ys, zs, color=color, linewidth=lw, alpha=alpha,
+                                             label=label if show_label else None)
+                                # Mark waypoints as dots
+                                ax_traj.scatter(xs, ys, zs, color=color, s=18, alpha=alpha, zorder=5)
 
-                        ax_traj.set_title("3D Trajectory (Last 3 Cycles)", color="white", weight="bold")
+                        ax_traj.set_title(traj_title, color="white", weight="bold")
                         ax_traj.set_xlabel("X (mm)", color="white")
                         ax_traj.set_ylabel("Y (mm)", color="white")
                         ax_traj.set_zlabel("Z (mm)", color="white")
@@ -200,17 +246,19 @@ def main():
                         ax_traj.zaxis.label.set_color("white")
                         ax_traj.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
 
-                        # 2. X, Y, Z coordinates vs Time
-                        t_p = [pt[0] for pt in positions]
-                        x_p = [pt[1] for pt in positions]
-                        y_p = [pt[2] for pt in positions]
-                        z_p = [pt[3] for pt in positions]
+                        # --- Chart 2: Coordinates vs Time ---
+                        coord_source = waypoints if (args.scenario == "evaluate" and waypoints) else positions
+                        if coord_source:
+                            t_p = [pt[0] for pt in coord_source]
+                            x_p = [pt[1] for pt in coord_source]
+                            y_p = [pt[2] for pt in coord_source]
+                            z_p = [pt[3] for pt in coord_source]
+                            ax_time.plot(t_p, x_p, color="#00F0FF", label="X", linewidth=1.5)
+                            ax_time.plot(t_p, y_p, color="#39FF14", label="Y", linewidth=1.5)
+                            ax_time.plot(t_p, z_p, color="#FF007F", label="Z", linewidth=1.5)
 
-                        ax_time.plot(t_p, x_p, color="#00F0FF", label="X", linewidth=1.5)
-                        ax_time.plot(t_p, y_p, color="#39FF14", label="Y", linewidth=1.5)
-                        ax_time.plot(t_p, z_p, color="#FF007F", label="Z", linewidth=1.5)
-
-                        ax_time.set_title("Coordinates vs Time", color="white", weight="bold")
+                        coord_label = "Planned Waypoints" if args.scenario == "evaluate" else "pos_EE"
+                        ax_time.set_title(f"Coordinates vs Time ({coord_label})", color="white", weight="bold")
                         ax_time.set_xlabel("Time (s)", color="white")
                         ax_time.set_ylabel("Position (mm)", color="white")
                         ax_time.grid(True, color="#444444", linestyle="--")
@@ -220,39 +268,54 @@ def main():
                         ax_time.yaxis.label.set_color("white")
                         ax_time.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
 
-                        # 3. Velocities vs Time
-                        ee_times = []
-                        ee_speeds = []
-                        for i in range(1, len(positions)):
-                            dt = positions[i][0] - positions[i-1][0]
-                            if dt > 0.001:
-                                dx = positions[i][1] - positions[i-1][1]
-                                dy = positions[i][2] - positions[i-1][2]
-                                dz = positions[i][3] - positions[i-1][3]
-                                speed = math.sqrt(dx*dx + dy*dy + dz*dz) / dt
-                                ee_times.append(positions[i][0])
-                                ee_speeds.append(speed)
+                        # --- Chart 3: Velocity / Metrics ---
+                        if args.scenario == "evaluate" and c_metrics:
+                            # Plot throughput and avg_speed over time from [CYCLE] logs
+                            ct = [cm[0] for cm in c_metrics]
+                            throughput = [cm[1].get("throughput_pick_per_min", 0) for cm in c_metrics]
+                            avg_speed = [cm[1].get("avg_speed_mm_s", 0) for cm in c_metrics]
+                            ax_vel.plot(ct, throughput, color="#FF007F", label="Throughput (pick/min)", linewidth=2.0)
+                            ax2 = ax_vel.twinx()
+                            ax2.plot(ct, avg_speed, color="#39FF14", label="Avg speed (mm/s)", linewidth=1.5, linestyle="--")
+                            ax2.set_ylabel("Avg speed (mm/s)", color="#39FF14")
+                            ax2.tick_params(colors="#39FF14")
+                            ax_vel.set_title("Evaluate Metrics vs Time", color="white", weight="bold")
+                            ax_vel.set_xlabel("Time (s)", color="white")
+                            ax_vel.set_ylabel("Throughput (pick/min)", color="#FF007F")
+                            lines1, labels1 = ax_vel.get_legend_handles_labels()
+                            lines2, labels2 = ax2.get_legend_handles_labels()
+                            ax_vel.legend(lines1 + lines2, labels1 + labels2, loc="upper left",
+                                          facecolor="#222222", edgecolor="#444444", labelcolor="white")
+                        else:
+                            # Standard velocity from pos_EE diffs
+                            ee_times = []
+                            ee_speeds = []
+                            for i in range(1, len(positions)):
+                                dt = positions[i][0] - positions[i-1][0]
+                                if dt > 0.001:
+                                    dx = positions[i][1] - positions[i-1][1]
+                                    dy = positions[i][2] - positions[i-1][2]
+                                    dz = positions[i][3] - positions[i-1][3]
+                                    speed = math.sqrt(dx*dx + dy*dy + dz*dz) / dt
+                                    ee_times.append(positions[i][0])
+                                    ee_speeds.append(speed)
+                            conv_times = [cs[0] for cs in c_speeds]
+                            conv_speeds_list = [math.sqrt(cs[1]**2 + cs[2]**2) for cs in c_speeds]
+                            if ee_times:
+                                ax_vel.plot(ee_times, ee_speeds, color="#FF007F", label="End-Effector (3D)", linewidth=1.5)
+                            if conv_times:
+                                ax_vel.plot(conv_times, conv_speeds_list, color="#39FF14", label="Conveyor", linewidth=1.5)
+                            ax_vel.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
 
-                        conv_times = []
-                        conv_speeds_list = []
-                        for cs in c_speeds:
-                            conv_times.append(cs[0])
-                            conv_speeds_list.append(math.sqrt(cs[1]**2 + cs[2]**2))
-
-                        if ee_times:
-                            ax_vel.plot(ee_times, ee_speeds, color="#FF007F", label="End-Effector (3D)", linewidth=1.5)
-                        if conv_times:
-                            ax_vel.plot(conv_times, conv_speeds_list, color="#39FF14", label="Conveyor", linewidth=1.5)
-
-                        ax_vel.set_title("Velocity vs Time", color="white", weight="bold")
-                        ax_vel.set_xlabel("Time (s)", color="white")
-                        ax_vel.set_ylabel("Speed (mm/s)", color="white")
                         ax_vel.grid(True, color="#444444", linestyle="--")
                         ax_vel.set_facecolor("#111111")
                         ax_vel.tick_params(colors="white")
                         ax_vel.xaxis.label.set_color("white")
                         ax_vel.yaxis.label.set_color("white")
-                        ax_vel.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
+                        if args.scenario != "evaluate":
+                            ax_vel.set_title("Velocity vs Time", color="white", weight="bold")
+                            ax_vel.set_xlabel("Time (s)", color="white")
+                            ax_vel.set_ylabel("Speed (mm/s)", color="white")
 
                         plt.draw()
                 except Exception as draw_exc:
