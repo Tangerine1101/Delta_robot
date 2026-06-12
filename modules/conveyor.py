@@ -41,8 +41,8 @@ _T_X = -50.0
 _T_Y = -100.0
 
 F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (_COS_T, -_SIN_T, _T_X),
-    (_SIN_T,  _COS_T, _T_Y),
+    (_SIN_T, -_COS_T, 485),
+    (_COS_T, _SIN_T, _T_Y),
     (0.0,     0.0,    1.0),
 )
 
@@ -50,9 +50,23 @@ F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
 # Placeholder: identity in u,v with a pixel-to-mm scale of 0.5 mm/pixel.
 # Replace with H homography times F once camera is calibrated.
 M_CAMERA_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (0.5 * _COS_T, -0.5 * _SIN_T, _T_X),
-    (0.5 * _SIN_T,  0.5 * _COS_T, _T_Y),
-    (0.0,           0.0,          1.0),
+    (-_COS_T, _SIN_T, 20),
+    (_SIN_T,  _COS_T, 43),
+    (0.0,     0.0,    1.0),
+)
+
+# Vision ROI frame → C-frame (u, v) transform.
+# Vision ROI origin = bottom-left of ROI polygon; X = cross-belt; Y = along belt (upstream→downstream).
+# Placeholder: u = y_mm + u_trigger_offset, v = x_mm + v_offset.
+# Replace matrix values after physical calibration of trigger-line position and belt alignment.
+_U_TRIGGER_OFFSET_MM = 500.0   # u position in C-frame where trigger line sits
+_V_BELT_CENTER_MM = 0.0        # v shift from ROI X-zero to belt centre
+M_VISION_TO_CONVEYOR: tuple[tuple[float, float, float], ...] = (
+    # row 0 → u = 0*x_mm + 1*y_mm + _U_TRIGGER_OFFSET_MM
+    (0.0, 1.0, _U_TRIGGER_OFFSET_MM),
+    # row 1 → v = 1*x_mm + 0*y_mm + _V_BELT_CENTER_MM
+    (1.0, 0.0, _V_BELT_CENTER_MM),
+    (0.0, 0.0, 1.0),
 )
 
 
@@ -282,6 +296,7 @@ class BeltTracker:
             obj = self._objects[detection.object_id]
             obj.last_seen_at = detection.timestamp
             obj.confidence = detection.confidence
+            obj.rotation_rad = math.radians(detection.angle_deg)
             return obj
 
         obj = TrackedObject(
@@ -289,6 +304,7 @@ class BeltTracker:
             object_type=detection.object_type,
             conveyor_uv=(detection.x, detection.y),
             belt_pos_anchor=p_now,
+            rotation_rad=math.radians(detection.angle_deg),
             w_mm=dims[0],
             h_mm=dims[1],
             last_seen_at=detection.timestamp,

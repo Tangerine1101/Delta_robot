@@ -6,25 +6,37 @@
     "period_s": 1,
     "interpolar_points": 7,
     "object_types": {
-        "pcb1": {"destination": "pcb1", "thickness_mm": 1.6, "w": 30.0, "h": 50.0},
-        "pcb2": {"destination": "pcb2", "thickness_mm": 1.6, "w": 25.0, "h": 40.0}
+        "QFP":  {"destination": "QFP",  "thickness_mm": 1.6, "w": 30.0, "h": 40.0},
+        "TQFP": {"destination": "TQFP", "thickness_mm": 1.6, "w": 40.0, "h": 50.0}
     },
     "conveyor": {
         "encoder_constant_mm_per_pulse": 0.1,
         "length_mm": 800.0,
         "camera_window_uv": [50.0, 250.0, -75.0, 75.0],
-        "workspace_window_uv": [450.0, 620.0, -65.0, 65.0]
+        "workspace_window_uv": [450.0, 620.0, -65.0, 65.0],
+        "accuracy_points_uv": [
+            [480.0, 40.0, -310.0],
+            [535.0, 0.0, -310.0],
+            [590.0, -40.0, -310.0]
+        ]
     },
-    "pcb1": [
+    "QFP": [
         90.0,
         -40.0,
         -285.0
     ],
-    "pcb2": [
+    "TQFP": [
         40.0,
         90.0,
         -310.0
     ],
+    "vision": {
+        "yolo_dir": "YOLO_OBB",
+        "system_config": "YOLO_OBB/config/system_config.yaml",
+        "class_map": {"QFP": "QFP", "TQFP": "TQFP"},
+        "camera_source": null,
+        "min_conf": null
+    },
     "scheduler": {
         "home_position": [
             0.0,
@@ -50,9 +62,10 @@
         ],
         "robot_movement_delay_s": 0.05,
         "ethernet_delay_s": 0.00016,
+        "rotate_offset_deg": 0.0,
         "throughput_object_types": [
-            "pcb1",
-            "pcb2"
+            "QFP",
+            "TQFP"
         ],
         "throughput_lanes": [
             -40.0,

@@ -142,7 +142,7 @@ COMMAND_ID = {
 
 ```bash
 # Compile check
-python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py
+python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py
 
 # Throughput simulation
 python3 main.py --scheduler --scenario test_throughput --duration 12.0 --simulate-executor
@@ -155,4 +155,16 @@ python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 1
 
 # Test module dry run (fake PLC self-test)
 python3 -m modules.test_module --port 1502 --self-test --duration 2.0
+
+# Vision smoke test (requires physical camera + board on belt)
+python3 -m modules.image_processing --duration 15
+
+# Production dry-run (real vision, simulated robot)
+python3 main.py --scheduler --scenario production --simulate-executor --duration 20
 ```
+
+**Vision dependencies** (install once into `.venv`):
+```bash
+.venv/bin/pip install "ultralytics>=8.3.0" "opencv-python>=4.9.0" "PyYAML>=6.0"
+```
+`YOLO_OBB/` is the teammate's repo — gitignored, treated read-only.

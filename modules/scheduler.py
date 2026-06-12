@@ -17,10 +17,10 @@ from modules.conveyor import (
     TrackedObject,
     UVWindow,
 )
-from modules.image_processing import ObjectDetection, SimulatedImageProcessing
+from modules.image_processing import ObjectDetection, SimulatedImageProcessing, VisionImageProcessing
 
 
-SCENARIO_NAMES = {"test_accuracy", "test_throughput", "evaluate"}
+SCENARIO_NAMES = {"test_accuracy", "test_throughput", "evaluate", "production"}
 
 Position3D = tuple[float, float, float]
 
@@ -76,6 +76,8 @@ class PickPlan:
     # C-frame anchor used for late-dispatch re-prediction (set at plan build time)
     object_uv_anchor: tuple[float, float] = (0.0, 0.0)
     belt_pos_anchor: float = 0.0
+    # Rotation angle for the 4th-DOF Siemens suction cup (degrees).
+    rotate_deg: float = 0.0
 
     def total_duration(self) -> float:
         return sum(point.time_s for point in self.trajectory_goto + self.trajectory_pick)
@@ -100,6 +102,7 @@ class PickPlan:
             ],
             "sorting_position": [round(value, 3) for value in self.sorting_position],
             "duration_s": round(self.total_duration(), 3),
+            "rotate_deg": round(self.rotate_deg, 2),
             "status": self.status,
         }
 
@@ -203,6 +206,10 @@ class SchedulerSettings:
     encoder_constant_mm_per_pulse: float
     object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
+    # Optional C-frame (u, v, z) test points inside workspace_window_uv. When
+    # provided, the evaluate scenario transforms these into R-frame XYZ via F so
+    # the trajectory tracks the physical workspace regardless of belt calibration.
+    accuracy_points_uv: list[Position3D]
     # (u, v) spawn positions used only by test_accuracy SimulatedImageProcessing.
     # Must lie inside workspace_window_uv so objects are pickable at belt speed=0.
     accuracy_spawn_uv: list[tuple[float, float]]
@@ -225,6 +232,8 @@ class SchedulerSettings:
     # fallback is armed.  Prevents accepting "stable" at the starting position
     # if the PLC servo start latency exceeds the stability window.
     evaluate_stability_arm_mm: float = 3.0
+    # Offset added to the vision angle_deg before sending rotate_absolute.
+    rotate_offset_deg: float = 0.0
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -347,6 +356,10 @@ class SchedulerSettings:
             ),
             object_dimensions=object_dimensions,
             accuracy_points=accuracy_points,
+            accuracy_points_uv=[
+                _coerce_position3d(point, (500.0, 0.0, -310.0))
+                for point in conveyor_raw.get("accuracy_points_uv", [])
+            ],
             accuracy_spawn_uv=accuracy_spawn_uv,
             log_path=str(scheduler_raw.get("log_path", "data.log")),
             object_type_map=object_type_map,
@@ -374,6 +387,7 @@ class SchedulerSettings:
             evaluate_stability_arm_mm=float(
                 scheduler_raw.get("evaluate_stability_arm_mm", 3.0)
             ),
+            rotate_offset_deg=float(scheduler_raw.get("rotate_offset_deg", 0.0)),
         )
         settings.validate()
         return settings
@@ -597,7 +611,7 @@ class RealRobotExecutor:
             rotate_pkg = {
                 "commandID": COMMAND_ID["rotate_absolute"],
                 "CommandID": COMMAND_ID["rotate_absolute"],
-                "rotate": 90.0,
+                "rotate": plan.rotate_deg,
                 "speed": 0.0,
             }
             self.dispatch(rotate_pkg)
@@ -1188,6 +1202,8 @@ class PickScheduler:
         self.metrics.total_planning_latency += max(now - obj.last_seen_at, 0.0)
         self.metrics.planning_events += 1
 
+        rotate_deg = math.degrees(obj.rotation_rad) + self.settings.rotate_offset_deg
+
         return PickPlan(
             plan_id=f"plan-{self.plan_counter:06d}",
             object_id=obj.object_id,
@@ -1204,6 +1220,7 @@ class PickScheduler:
             trajectory_pick=trajectory_pick,
             object_uv_anchor=obj.conveyor_uv,
             belt_pos_anchor=self.latest_speed.position_mm,
+            rotate_deg=rotate_deg,
             debug_info={
                 "pick_position_3d": pick_position,
                 "timing_formula": {
@@ -1513,7 +1530,7 @@ def _build_evaluate_plan(
     return PickPlan(
         plan_id=plan_id,
         object_id=plan_id,
-        object_type="pcb1",
+        object_type="QFP",
         detected_at=time.monotonic(),
         source_position_2d=(pick_xy[0], pick_xy[1]),
         cycle_start_position=current_position,
@@ -1603,21 +1620,35 @@ def _run_evaluate_loop(
     executor: Any,
     duration_s: float | None,
 ) -> None:
-    box = settings.sorting_positions.get("pcb1")
+    box = settings.sorting_positions.get("QFP")
     if box is None:
         raise RuntimeError(
-            "evaluate scenario requires a 'pcb1' destination in config (top-level 'pcb1' key)."
-        )
-    if len(settings.accuracy_points) < 3:
-        raise RuntimeError(
-            f"evaluate scenario requires >= 3 accuracy_points, got {len(settings.accuracy_points)}."
+            "evaluate scenario requires a 'QFP' destination in config (top-level 'QFP' key)."
         )
 
     box_xy = (float(box[0]), float(box[1]))
     box_pick_z = float(box[2])
-    targets_3d: list[Position3D] = [
-        (float(p[0]), float(p[1]), float(p[2])) for p in settings.accuracy_points[:3]
-    ]
+
+    # Prefer C-frame test points so the trajectory always lands inside the
+    # configured workspace_window_uv regardless of how F's translation is
+    # calibrated. Fall back to legacy R-frame accuracy_points only if no
+    # accuracy_points_uv is provided.
+    if settings.accuracy_points_uv and len(settings.accuracy_points_uv) >= 3:
+        frame = ConveyorFrame()
+        targets_3d: list[Position3D] = []
+        for u, v, z in settings.accuracy_points_uv[:3]:
+            x_r, y_r = frame.to_robot(u, v)
+            targets_3d.append((x_r, y_r, z))
+    elif len(settings.accuracy_points) >= 3:
+        targets_3d = [
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in settings.accuracy_points[:3]
+        ]
+    else:
+        raise RuntimeError(
+            "evaluate scenario requires >= 3 accuracy_points_uv (preferred) "
+            "or accuracy_points (legacy R-frame fallback)."
+        )
 
     eval_executor: EvaluateExecutor | None = None
     if executor is not None and hasattr(executor, "dispatch") and hasattr(executor, "request_status"):
@@ -1721,20 +1752,26 @@ def run_scheduler_scenario(
         return
 
     start_time = time.monotonic()
-    image_processing = SimulatedImageProcessing(
-        scenario_name,
-        {
-            "throughput_object_types": settings.throughput_object_types,
-            "throughput_lanes": settings.throughput_lanes,
-            "throughput_spawn_x": settings.throughput_spawn_x,
-            "throughput_spawn_y": settings.throughput_spawn_y,
-            "throughput_emit_interval_s": settings.throughput_emit_interval_s,
-            "accuracy_emit_interval_s": settings.accuracy_emit_interval_s,
-            "accuracy_points": settings.accuracy_points,
-            "accuracy_spawn_uv": settings.accuracy_spawn_uv,
-        },
-        start_time,
-    )
+    vision_config = dict(getattr(config, "vision", {}) or {})
+    if scenario_name == "production":
+        image_processing: SimulatedImageProcessing | VisionImageProcessing = VisionImageProcessing(
+            vision_config, start_time
+        )
+    else:
+        image_processing = SimulatedImageProcessing(
+            scenario_name,
+            {
+                "throughput_object_types": settings.throughput_object_types,
+                "throughput_lanes": settings.throughput_lanes,
+                "throughput_spawn_x": settings.throughput_spawn_x,
+                "throughput_spawn_y": settings.throughput_spawn_y,
+                "throughput_emit_interval_s": settings.throughput_emit_interval_s,
+                "accuracy_emit_interval_s": settings.accuracy_emit_interval_s,
+                "accuracy_points": settings.accuracy_points,
+                "accuracy_spawn_uv": settings.accuracy_spawn_uv,
+            },
+            start_time,
+        )
     frame = ConveyorFrame()
     tracker = BeltTracker(
         frame,
@@ -1806,5 +1843,8 @@ def run_scheduler_scenario(
             time.sleep(settings.poll_interval_s)
     except KeyboardInterrupt:
         print("\n[INFO] Scheduler scenario interrupted by user")
+    finally:
+        if hasattr(image_processing, "stop"):
+            image_processing.stop()
 
     print("[INFO] Scheduler metrics:", json.dumps(scheduler.metrics.as_dict(), ensure_ascii=True))

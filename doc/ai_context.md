@@ -1,6 +1,6 @@
 # AI Context Summary: Delta Robot
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
-> **Status**: Core hardware and CLI modes functional, scheduler simulation handles 2D conveyor velocity vectors and safety checks, 4-DOF rotation command interfaces defined.
+> **Status**: Phase 3 image processing integrated. `VisionImageProcessing` (YOLO26-OBB + centroid tracker) runs in-process via background thread. Scenario `production` wires real camera into the scheduler. Object types renamed to match vision: `QFP` / `TQFP`.
 
 ---
 
@@ -17,7 +17,7 @@
   * [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py): Conveyor frame F, camera frame M, `EncoderDecoder` (encoderA/B → mm), `BeltTracker` for on-belt object tracking.
   * [EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication gateway (PLCGateway) using `pylogix` for Omron.
   * [cli.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): Command parser.
-  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): Phase-1 stub; emits detections whose `(x, y)` are interpreted as C-frame `(u, v)`.
+  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO26-OBB pipeline in background thread). Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`.
   * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits encoder counts proportional to `speed_current`.
   * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (encoder_constant, length_mm, camera_window_uv, workspace_window_uv) and per-PCB `w`/`h` dimensions.
 * **`doc/`**:
@@ -109,10 +109,11 @@ Siemens S7-1200 status structure (PLC → PC, 24 bytes Phase 1):
 
 ## 3. Current Limitations & Key Development Constraints
 1. **Conveyor Speed Vector**: Speed has been updated to a 2D velocity vector `[vx, vy]`. Simulated components support this, but physical S7-1200 integration is pending.
-2. **Vision Integration**: Active perception is mocked using `SimulatedImageProcessing`. Real camera frames are not integrated yet.
-3. **4-DOF Physical Actuation**: Command IDs $7, 8, 9$ are defined for S7-1200 rotation and conveyor adjustment, but actual driver communication code needs integration.
-4. **Git clean state**: Ensure log files (`data.log`, `test_module.log`) and cache files (`__pycache__`) are ignored by git in local development.
-5. **PLC fixed motor speed (Omron NX1P2)**: The PLC firmware drives the servo motors at a fixed maximum speed and **ignores the `argument_time` field** of each trajectory point. PC-side `nominal_xy_speed` / `nominal_z_speed` only affect scheduler-side timing (pick-prediction, log timestamps) — they do not throttle actual robot motion. To measure true mechanism speed, gate phase progression on `pos_EE` convergence (see `evaluate` scenario) rather than wall-clock from `argument_time`.
+2. **Vision Integration**: `VisionImageProcessing` runs YOLO26-OBB in-process (background thread). **Calibration pending**: `M_VISION_TO_CONVEYOR` in `conveyor.py` is a placeholder — calibrate once physical rig is assembled. Vision deps: `ultralytics>=8.3.0`, `opencv-python>=4.9.0` in `.venv`. `YOLO_OBB/` is the teammate's repo (external, gitignored).
+3. **Object types**: renamed to match vision classes — `QFP` and `TQFP`. Config keys and destinations updated throughout.
+4. **4-DOF rotation**: `plan.rotate_deg` (from `angle_deg` + `rotate_offset_deg` config) is sent to the Siemens S7-1200 via `rotate_absolute` command at pick dispatch time.
+5. **Git clean state**: Ensure log files (`data.log`, `test_module.log`) and cache files (`__pycache__`) are ignored by git in local development. `YOLO_OBB/` is gitignored (nested repo).
+6. **PLC fixed motor speed (Omron NX1P2)**: The PLC firmware drives the servo motors at a fixed maximum speed and **ignores the `argument_time` field** of each trajectory point. PC-side `nominal_xy_speed` / `nominal_z_speed` only affect scheduler-side timing (pick-prediction, log timestamps) — they do not throttle actual robot motion. To measure true mechanism speed, gate phase progression on `pos_EE` convergence (see `evaluate` scenario) rather than wall-clock from `argument_time`.
 
 ---
 
@@ -135,4 +136,10 @@ python3 -m modules.test_module --port 1502 --self-test --duration 2.0
 
 # 5. Run evaluate scenario (continuous box <-> 3 accuracy_points; Ctrl-C to stop).
 python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 10.0
+
+# 6. Vision smoke test (requires physical camera + board crossing trigger line)
+python3 -m modules.image_processing --duration 15
+
+# 7. Production dry-run (real vision, simulated robot)
+python3 main.py --scheduler --scenario production --simulate-executor --duration 20
 ```
