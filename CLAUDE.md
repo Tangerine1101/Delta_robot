@@ -36,7 +36,7 @@ It contains the current status, command mapping, PLC data contract, and verifica
 - **Never change** the default `interpolar_points` value in `config.json` without updating every downstream array that pads to that size.
 - After any change to `EthernetCom.py`, `scheduler.py`, or `cli.py`, run the compile check:
   ```bash
-  python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py
+  python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py
   ```
 
 ---
@@ -65,7 +65,7 @@ It contains the current status, command mapping, PLC data contract, and verifica
 | 4 | `rotate` | REAL | 4 B |
 | 8 | `speed` | REAL | 4 B |
 
-**DB2 (PLC → PC, 16 bytes total):**
+**DB2 (PLC → PC, 24 bytes total):**
 
 | Offset | Python field | PLC type | Size |
 |--------|-------------|----------|------|
@@ -73,6 +73,8 @@ It contains the current status, command mapping, PLC data contract, and verifica
 | 4 | `speed_current` | REAL | 4 B |
 | 8 | `task_doing` | DINT | 4 B |
 | 12 | `task_state` | DINT | 4 B |
+| 16 | `encoderA` | DINT | 4 B |
+| 20 | `encoderB` | DINT | 4 B |
 
 - TIA Portal DB must have **"Optimized block access" disabled** for snap7 raw byte access to work.
 - CPU must have **"Permit access with PUT/GET"** enabled under Protection & Security.
@@ -88,11 +90,14 @@ All packets to Omron tag `pc_package` must be **padded to exactly `interpolar_po
     "argument_y": [float] * 7,
     "argument_z": [float] * 7,
     "argument_e": [0 or 1] * 7,   # gripper: 0=OFF, 1=ON
-    "argument_time": [float] * 7,  # segment duration in seconds
-    "doing_bit": 1,                # PC sets 1; PLC resets to 0 after ingestion
+    "argument_time": [float] * 7,  # segment duration in seconds — PLC firmware ignores this array; still send all 7 elements to maintain struct contract
+    "bit_doing": 1,                # PC sets 1; PLC resets to 0 after ingestion
 }
 ```
 - For `goto_absolute` commands, `argument_e` must always be all zeros.
+- **`argument_time` is ignored by Omron firmware** — robots run at fixed maximum speed. `nominal_xy_speed` / `nominal_z_speed` in `SchedulerSettings` are PC-side timing approximations only.
+- **`task_state`** — PLC behavior is inconsistent: values 0/1/2 observed; 2 = done; no error value exists. `bit_doing` has replaced its role as the primary completion signal. All existing `task_state` references in code are intentionally kept.
+- **`grab` / `place` CLI commands** — these do NOT actuate suction on the real PLC. The `pick`/`release` command IDs (5/6) are no-ops in the current PLC program; `grab`/`place` fall back to `goto_absolute` with `argument_e=0`. Known limitation — not fixed in Phase 1.
 
 ### 4.4. Safety Invariants
 
@@ -102,8 +107,8 @@ clearance_height > slope_transition_height > pre_pick_height > pickup_height
 ```
 *(Z-axis is negative-down. Less negative = higher. Example: -290 > -295 > -300 > -310)*
 
-- Horizontal travel must stay at or above `clearance_height`.
-- Coordinates outside `pickup_window_x` / `pickup_window_y` must be discarded, not clamped.
+- XY travel during slope segments (between `slope_transition_height` and `clearance_height`) is permitted — the 7-point trajectory geometry uses diagonal slopes at the pick/place endpoints.
+- Coordinates outside `workspace_window_uv` (C-frame) must be **discarded**, not clamped.
 
 ### 4.5. Timing & Dispatch
 
@@ -140,11 +145,14 @@ COMMAND_ID = {
 python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py
 
 # Throughput simulation
-python3 main.py --scheduler --scenario test_throughput --duration 1.0 --simulate-executor
+python3 main.py --scheduler --scenario test_throughput --duration 12.0 --simulate-executor
 
 # Accuracy simulation
-python3 main.py --scheduler --scenario test_accuracy --duration 0.2 --simulate-executor
+python3 main.py --scheduler --scenario test_accuracy --duration 5.0 --simulate-executor
 
-# Test module dry run
-python3 -m modules.test_module --port 1502 --self-test --duration 1.0
+# Evaluate simulation
+python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 10.0
+
+# Test module dry run (fake PLC self-test)
+python3 -m modules.test_module --port 1502 --self-test --duration 2.0
 ```

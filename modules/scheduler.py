@@ -203,6 +203,9 @@ class SchedulerSettings:
     encoder_constant_mm_per_pulse: float
     object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
+    # (u, v) spawn positions used only by test_accuracy SimulatedImageProcessing.
+    # Must lie inside workspace_window_uv so objects are pickable at belt speed=0.
+    accuracy_spawn_uv: list[tuple[float, float]]
     log_path: str
     object_type_map: dict[str, str]
     object_thickness_mm: dict[str, float]
@@ -286,6 +289,17 @@ class SchedulerSettings:
             )
         ]
 
+        # Default accuracy_spawn_uv places objects inside workspace_window_uv
+        # so test_accuracy can plan picks at belt speed = 0.
+        default_spawn_uv = [[470.0, 40.0], [520.0, 10.0], [560.0, -30.0]]
+        accuracy_spawn_uv: list[tuple[float, float]] = [
+            (float(pt[0]), float(pt[1]))
+            for pt in scheduler_raw.get("accuracy_spawn_uv", default_spawn_uv)
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2
+        ]
+        if not accuracy_spawn_uv:
+            accuracy_spawn_uv = [(float(p[0]), float(p[1])) for p in default_spawn_uv]
+
         clearance_height = float(scheduler_raw.get("clearance_height", -165.0))
         pre_pick_height = float(scheduler_raw.get("pre_pick_height", -210.0))
         slope_transition_height = float(
@@ -333,6 +347,7 @@ class SchedulerSettings:
             ),
             object_dimensions=object_dimensions,
             accuracy_points=accuracy_points,
+            accuracy_spawn_uv=accuracy_spawn_uv,
             log_path=str(scheduler_raw.get("log_path", "data.log")),
             object_type_map=object_type_map,
             object_thickness_mm=object_thickness_mm,
@@ -1716,6 +1731,7 @@ def run_scheduler_scenario(
             "throughput_emit_interval_s": settings.throughput_emit_interval_s,
             "accuracy_emit_interval_s": settings.accuracy_emit_interval_s,
             "accuracy_points": settings.accuracy_points,
+            "accuracy_spawn_uv": settings.accuracy_spawn_uv,
         },
         start_time,
     )

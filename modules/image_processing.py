@@ -40,7 +40,9 @@ class SimulatedImageProcessing:
     Phase 1: emits detections at C-frame `(u, v)` coordinates.
     - `throughput_spawn_y` is reused as the upstream `u_spawn`.
     - `throughput_lanes` is reused as the per-object `v_lane` values.
-    - `accuracy_points` are read as `(u, v, _)` triples.
+    - `accuracy_spawn_uv`: list of [u, v] points inside workspace_window_uv used
+      by test_accuracy. Separate from `accuracy_points` (which are robot-frame XYZ
+      targets used only by the evaluate scenario).
     """
 
     def __init__(self, scenario_name: str, config: dict[str, Any], start_time: float) -> None:
@@ -54,15 +56,11 @@ class SimulatedImageProcessing:
         self.u_spawn = float(config.get("throughput_spawn_y", -50.0))
         self.throughput_emit_interval_s = float(config.get("throughput_emit_interval_s", 0.35))
         self.accuracy_emit_interval_s = float(config.get("accuracy_emit_interval_s", 0.8))
-        raw_points = config.get(
-            "accuracy_points",
-            [
-                [40.0, -60.0, -300.0],
-                [0.0, 0.0, -300.0],
-                [-40.0, 60.0, -300.0],
-            ],
+        raw_spawn_uv = config.get(
+            "accuracy_spawn_uv",
+            [[470.0, 40.0], [520.0, 10.0], [560.0, -30.0]],
         )
-        self.accuracy_points = [(float(point[0]), float(point[1])) for point in raw_points]
+        self.accuracy_spawn_uv = [(float(pt[0]), float(pt[1])) for pt in raw_spawn_uv]
 
     def poll(self, now: float) -> list[ObjectDetection]:
         detections: list[ObjectDetection] = []
@@ -80,7 +78,7 @@ class SimulatedImageProcessing:
     def _build_detection(self, timestamp: float) -> ObjectDetection:
         self.counter += 1
         if self.scenario_name == "test_accuracy":
-            u, v = self.accuracy_points[(self.counter - 1) % len(self.accuracy_points)]
+            u, v = self.accuracy_spawn_uv[(self.counter - 1) % len(self.accuracy_spawn_uv)]
             object_type = self.throughput_types[(self.counter - 1) % len(self.throughput_types)]
             return ObjectDetection(
                 object_id=f"accuracy-{self.counter:06d}",

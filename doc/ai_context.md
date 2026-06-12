@@ -59,11 +59,14 @@ PC-to-PLC packet sent to the Omron NX CPU:
       "argument_y": [float] * 7,
       "argument_z": [float] * 7,
       "argument_e": [byte] * 7,     # 0 = gripper OFF, 1 = gripper ON
-      "argument_time": [float] * 7,  # Segment duration in seconds
-      "doing_bit": byte              # 1 = command ready (PC writes, PLC resets)
+      "argument_time": [float] * 7,  # Segment duration in seconds — Omron firmware ignores this; still send all 7 elements
+      "bit_doing": byte              # 1 = command ready (PC writes, PLC resets to 0)
   }
   ```
 * Invariant: Even if a command uses $< 7$ points, the arrays must always be padded to `7` elements with `0.0`.
+* **`argument_time`**: Omron NX1P2 firmware **ignores** this field. Robots run at fixed maximum speed. PC-side `nominal_xy_speed` / `nominal_z_speed` are scheduler-side timing approximations only.
+* **`task_state`**: PLC behavior is inconsistent — values 0/1/2; `2` = done; no error value exists. `bit_doing` has replaced its role as the primary completion signal. All code referencing `task_state` is intentionally preserved.
+* **`grab`/`place` CLI commands**: Do **not** actuate suction on the real PLC. Command IDs 5/6 (pick/release) are no-ops; `grab`/`place` use `goto_absolute` with `argument_e=0`. Known limitation, not fixed in Phase 1.
 
 Siemens S7-1200 package structure (PC → PLC):
 ```python
@@ -119,18 +122,17 @@ Run these commands to verify that code changes did not break the existing module
 
 ```bash
 # 1. Compile check all python files
-python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py
+python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py
 
 # 2. Run scheduler simulation throughput scenario
-python3 main.py --scheduler --scenario test_throughput --duration 1.0 --simulate-executor
+python3 main.py --scheduler --scenario test_throughput --duration 12.0 --simulate-executor
 
 # 3. Run scheduler simulation accuracy scenario
-python3 main.py --scheduler --scenario test_accuracy --duration 0.2 --simulate-executor
+python3 main.py --scheduler --scenario test_accuracy --duration 5.0 --simulate-executor
 
 # 4. Verify test module logic with a dry run
-python3 -m modules.test_module --port 1502 --self-test --duration 1.0
+python3 -m modules.test_module --port 1502 --self-test --duration 2.0
 
 # 5. Run evaluate scenario (continuous box <-> 3 accuracy_points; Ctrl-C to stop).
-#    --duration is optional and useful for CI smoke tests.
-python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 2.0
+python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 10.0
 ```

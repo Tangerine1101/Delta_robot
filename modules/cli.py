@@ -216,6 +216,7 @@ def _parse_plan(
             packages=[{"commandID": COMMAND_ID["plan_siemen"], "CommandID": COMMAND_ID["plan_siemen"], "rotate": float(tokens[1]), "speed": float(tokens[2])}]
         )
     if command == "grab":
+        print("[WARN] grab/place do not actuate suction on the real PLC — known limitation")
         if len(tokens) not in (5, 6):
             raise ValueError("grab expects: grab <object> <x> <y> <z> [rotate]")
         obj_name = tokens[1]
@@ -243,6 +244,7 @@ def _parse_plan(
         packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
         return CommandPlan(packages=packages)
     if command == "place":
+        print("[WARN] grab/place do not actuate suction on the real PLC — known limitation")
         if len(tokens) not in (5, 6):
             raise ValueError("place expects: place <object> <x> <y> <z> [rotate]")
         obj_name = tokens[1]
