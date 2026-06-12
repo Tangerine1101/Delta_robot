@@ -541,33 +541,56 @@ class PLCGateway:
             raise RuntimeError(f"Write failed for {tag_name}: {getattr(result, 'Status', result)}")
 
     def _write_tags(self, tags_and_values: list[tuple[str, Any]]) -> None:
-        try:
-            results = self.plc.Write(tags_and_values)
-        except Exception:
-            self.connected = False
-            raise
-        if isinstance(results, list):
-            for r in results:
-                if not self._write_result_ok(r):
-                    self.connected = False
-                    raise RuntimeError(
-                        f"Write failed for {getattr(r, 'TagName', 'unknown')}: {getattr(r, 'Status', r)}"
-                    )
-        else:
-            if not self._write_result_ok(results):
+        for attempt in range(2):
+            try:
+                results = self.plc.Write(tags_and_values)
+            except Exception as exc:
                 self.connected = False
-                raise RuntimeError(f"Write failed: {getattr(results, 'Status', results)}")
+                if attempt == 0:
+                    print(f"[WARN] PLCGateway write error (attempt 1), reconnecting: {exc}")
+                    self.connect()
+                    continue
+                raise
+            ok = True
+            if isinstance(results, list):
+                for r in results:
+                    if not self._write_result_ok(r):
+                        ok = False
+                        err_msg = f"Write failed for {getattr(r, 'TagName', 'unknown')}: {getattr(r, 'Status', r)}"
+                        break
+            else:
+                if not self._write_result_ok(results):
+                    ok = False
+                    err_msg = f"Write failed: {getattr(results, 'Status', results)}"
+            if ok:
+                return
+            self.connected = False
+            if attempt == 0:
+                print(f"[WARN] PLCGateway write result error (attempt 1), reconnecting: {err_msg}")
+                self.connect()
+                continue
+            raise RuntimeError(err_msg)
 
     def _read_tags(self, tags: list[str]) -> list[Any]:
-        try:
-            result = self.plc.Read(tags)
-        except Exception:
-            self.connected = False
-            raise
-        if result is None:
-            self.connected = False
-            return []
-        return list(result)
+        for attempt in range(2):
+            try:
+                result = self.plc.Read(tags)
+            except Exception as exc:
+                self.connected = False
+                if attempt == 0:
+                    print(f"[WARN] PLCGateway read error (attempt 1), reconnecting: {exc}")
+                    self.connect()
+                    continue
+                raise
+            if result is None:
+                self.connected = False
+                if attempt == 0:
+                    print("[WARN] PLCGateway read returned None (attempt 1), reconnecting")
+                    self.connect()
+                    continue
+                return []
+            return list(result)
+        return []
 
     def send_package(self, package: dict[str, Any] | RobotPacket) -> dict[str, Any]:
         if not self.connected:

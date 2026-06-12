@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import multiprocessing as mp
 from queue import Empty
 from typing import Any
@@ -8,6 +9,10 @@ from typing import Any
 from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
 from modules.scheduler import RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
+
+# How often (seconds) the worker probes the PLC connection when idle, to prevent
+# EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
+_KEEPALIVE_S = 25.0
 
 
 def _worker(
@@ -31,21 +36,33 @@ def _worker(
     try:
         gateway.connect()
         siemens_gateway.connect()
-        response_queue.put(
-            {
-                "ok": True,
-                "type": "connected",
-                "ip": ip,
-                "port": port,
-            }
-        )
+    except Exception as exc:
+        response_queue.put({"ok": False, "type": "connect_failed", "req_id": None, "error": str(exc)})
+        return
 
+    response_queue.put({"ok": True, "type": "connected", "req_id": None, "ip": ip, "port": port})
+
+    try:
         while True:
-            message = command_queue.get()
+            try:
+                message = command_queue.get(timeout=_KEEPALIVE_S)
+            except Empty:
+                # Idle keepalive: probe both connections to prevent firmware session timeouts.
+                try:
+                    gateway._probe_connection()
+                except Exception:
+                    pass
+                try:
+                    siemens_gateway.get_status()
+                except Exception:
+                    pass
+                continue
+
+            req_id = message.get("req_id")
             message_type = message.get("type")
 
             if message_type == "shutdown":
-                response_queue.put({"ok": True, "type": "shutdown"})
+                response_queue.put({"ok": True, "type": "shutdown", "req_id": req_id})
                 break
 
             if message_type == "status":
@@ -65,9 +82,9 @@ def _worker(
                                 })
                         except Exception as s_exc:
                             print(f"[WARN] Failed to query Siemens status: {s_exc}")
-                    response_queue.put({"ok": True, "type": "status", "data": status})
+                    response_queue.put({"ok": True, "type": "status", "req_id": req_id, "data": status})
                 except Exception as exc:
-                    response_queue.put({"ok": False, "type": "error", "error": str(exc)})
+                    response_queue.put({"ok": False, "type": "error", "req_id": req_id, "error": str(exc)})
                 continue
 
             if message_type == "send":
@@ -81,6 +98,7 @@ def _worker(
                             {
                                 "ok": True,
                                 "type": "sent",
+                                "req_id": req_id,
                                 "commandID": cmd_id,
                                 "package": pkg,
                                 "status": s_status,
@@ -94,19 +112,21 @@ def _worker(
                             {
                                 "ok": True,
                                 "type": "sent",
+                                "req_id": req_id,
                                 "commandID": package.get("commandID"),
                                 "package": package,
                                 "status": status,
                             }
                         )
                 except Exception as exc:
-                    response_queue.put({"ok": False, "type": "error", "error": str(exc)})
+                    response_queue.put({"ok": False, "type": "error", "req_id": req_id, "error": str(exc)})
                 continue
 
             response_queue.put(
                 {
                     "ok": False,
                     "type": "error",
+                    "req_id": req_id,
                     "error": f"Unknown message type: {message_type}",
                 }
             )
@@ -115,47 +135,89 @@ def _worker(
         siemens_gateway.disconnect()
 
 
-def _wait_for_response(response_queue: mp.Queue, timeout: float = 5.0) -> dict[str, Any] | None:
-    try:
-        return response_queue.get(timeout=timeout)
-    except Empty:
+def _wait_for_response(
+    response_queue: mp.Queue,
+    expected_id: int | None,
+    timeout: float = 5.0,
+) -> dict[str, Any] | None:
+    """Drain queue until we get the response with req_id == expected_id.
+
+    Responses with a different (older) req_id are discarded with a warning.
+    Returns None on timeout.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            resp = response_queue.get(timeout=remaining)
+        except Empty:
+            return None
+        if resp.get("req_id") == expected_id:
+            return resp
+        # Stale response from a previous timed-out request.
+        print(f"[WARN] discarding stale IPC response (req_id={resp.get('req_id')}, expected={expected_id})")
+
+
+def _start_worker(
+    ctx: Any,
+    command_queue: mp.Queue,
+    response_queue: mp.Queue,
+    args: argparse.Namespace,
+) -> "mp.Process | None":
+    """Start the PLC worker and wait for connection confirmation.
+
+    Returns the Process on success, None if connection failed.
+    """
+    worker = ctx.Process(
+        target=_worker,
+        args=(command_queue, response_queue, args.ip, args.port, args.interpolar_points),
+        daemon=True,
+    )
+    worker.start()
+    startup = _wait_for_response(response_queue, expected_id=None, timeout=10.0)
+    if startup is None:
+        print("[ERROR] PLC worker did not report readiness in time — aborting.")
+        worker.terminate()
+        worker.join(timeout=2.0)
         return None
+    if not startup.get("ok"):
+        print(f"[ERROR] Worker failed to connect: {startup.get('error')}")
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=2.0)
+        return None
+    print(f"[INFO] Worker connected to {startup.get('ip')}:{startup.get('port')}")
+    return worker
+
+
+def _stop_worker(worker: "mp.Process", command_queue: mp.Queue, response_queue: mp.Queue, req_counter: Any) -> None:
+    req_id = next(req_counter)
+    command_queue.put({"type": "shutdown", "req_id": req_id})
+    _wait_for_response(response_queue, expected_id=req_id, timeout=5.0)
+    worker.join(timeout=5.0)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(timeout=5.0)
 
 
 def _run_cli(args: argparse.Namespace) -> None:
     ctx = mp.get_context("spawn")
     command_queue: mp.Queue = ctx.Queue()
     response_queue: mp.Queue = ctx.Queue()
-    worker = ctx.Process(
-        target=_worker,
-        args=(
-            command_queue,
-            response_queue,
-            args.ip,
-            args.port,
-            args.interpolar_points,
-        ),
-        daemon=True,
-    )
-    worker.start()
+    req_counter = itertools.count(1)
 
-    startup = _wait_for_response(response_queue, timeout=10.0)
-    if startup is None:
-        print("[WARN] PLC worker did not report readiness in time")
-    elif startup.get("ok"):
-        print(f"[INFO] Worker connected to {startup.get('ip')}:{startup.get('port')}")
-    else:
-        print(f"[ERROR] Worker failed to start: {startup.get('error')}")
-        command_queue.put({"type": "shutdown"})
-        worker.join(timeout=2.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=2.0)
+    worker = _start_worker(ctx, command_queue, response_queue, args)
+    if worker is None:
         return
 
     def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
-        command_queue.put({"type": "send", "package": package})
-        response = _wait_for_response(response_queue, timeout=10.0)
+        req_id = next(req_counter)
+        command_queue.put({"type": "send", "package": package, "req_id": req_id})
+        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
         if response is None:
             print("[WARN] no response from PLC worker")
             return None
@@ -165,8 +227,9 @@ def _run_cli(args: argparse.Namespace) -> None:
         return response.get("status")
 
     def request_status() -> dict[str, Any] | None:
-        command_queue.put({"type": "status"})
-        response = _wait_for_response(response_queue, timeout=10.0)
+        req_id = next(req_counter)
+        command_queue.put({"type": "status", "req_id": req_id})
+        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
         if response is None:
             print("[WARN] no response from PLC worker")
             return None
@@ -183,12 +246,7 @@ def _run_cli(args: argparse.Namespace) -> None:
             prompt=args.prompt,
         )
     finally:
-        command_queue.put({"type": "shutdown"})
-        _wait_for_response(response_queue, timeout=5.0)
-        worker.join(timeout=5.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=5.0)
+        _stop_worker(worker, command_queue, response_queue, req_counter)
 
 
 def _run_scheduler(args: argparse.Namespace) -> None:
@@ -203,36 +261,16 @@ def _run_scheduler(args: argparse.Namespace) -> None:
     ctx = mp.get_context("spawn")
     command_queue: mp.Queue = ctx.Queue()
     response_queue: mp.Queue = ctx.Queue()
-    worker = ctx.Process(
-        target=_worker,
-        args=(
-            command_queue,
-            response_queue,
-            args.ip,
-            args.port,
-            args.interpolar_points,
-        ),
-        daemon=True,
-    )
-    worker.start()
+    req_counter = itertools.count(1)
 
-    startup = _wait_for_response(response_queue, timeout=10.0)
-    if startup is None:
-        print("[WARN] PLC worker did not report readiness in time")
-    elif startup.get("ok"):
-        print(f"[INFO] Worker connected to {startup.get('ip')}:{startup.get('port')}")
-    else:
-        print(f"[ERROR] Worker failed to start: {startup.get('error')}")
-        command_queue.put({"type": "shutdown"})
-        worker.join(timeout=2.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=2.0)
+    worker = _start_worker(ctx, command_queue, response_queue, args)
+    if worker is None:
         return
 
     def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
-        command_queue.put({"type": "send", "package": package})
-        response = _wait_for_response(response_queue, timeout=10.0)
+        req_id = next(req_counter)
+        command_queue.put({"type": "send", "package": package, "req_id": req_id})
+        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
         if response is None:
             raise TimeoutError("no response from PLC worker while sending scheduler package")
         if not response.get("ok", False):
@@ -240,8 +278,9 @@ def _run_scheduler(args: argparse.Namespace) -> None:
         return response.get("status")
 
     def request_status() -> dict[str, Any] | None:
-        command_queue.put({"type": "status"})
-        response = _wait_for_response(response_queue, timeout=10.0)
+        req_id = next(req_counter)
+        command_queue.put({"type": "status", "req_id": req_id})
+        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
         if response is None:
             raise TimeoutError("no response from PLC worker while polling status")
         if not response.get("ok", False):
@@ -268,12 +307,7 @@ def _run_scheduler(args: argparse.Namespace) -> None:
             executor=executor,
         )
     finally:
-        command_queue.put({"type": "shutdown"})
-        _wait_for_response(response_queue, timeout=5.0)
-        worker.join(timeout=5.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=5.0)
+        _stop_worker(worker, command_queue, response_queue, req_counter)
 
 
 def main() -> None:
