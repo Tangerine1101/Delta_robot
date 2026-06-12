@@ -1,1 +1,0 @@
-[INFO] Evaluate metrics: {"cycles_completed": 2, "picks_completed": 12, "throughput_pick_per_min": 19.99, "avg_speed_mm_s": 145.37, "peak_speed_mm_s": 180.8, "total_path_mm": 5234.93, "total_phase_wall_time_s": 36.0121, "avg_phase_s": 1.5005, "min_phase_s": 1.0725, "max_phase_s": 1.8728, "p95_phase_s": 1.8621, "position_wait_timeouts": 0, "position_stability_accepts": 16}
