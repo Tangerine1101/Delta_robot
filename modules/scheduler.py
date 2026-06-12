@@ -73,6 +73,9 @@ class PickPlan:
     trajectory_pick: list[TrajectoryPoint]
     status: str = "planned"
     debug_info: dict[str, Any] = field(default_factory=dict)
+    # C-frame anchor used for late-dispatch re-prediction (set at plan build time)
+    object_uv_anchor: tuple[float, float] = (0.0, 0.0)
+    belt_pos_anchor: float = 0.0
 
     def total_duration(self) -> float:
         return sum(point.time_s for point in self.trajectory_goto + self.trajectory_pick)
@@ -522,6 +525,10 @@ class RealRobotExecutor:
         self.interpolar_points = interpolar_points
         self.wait_margin_s = wait_margin_s
         self.status_poll_interval_s = max(status_poll_interval_s, 0.02)
+        # Optional: set by run_scheduler_scenario for late-dispatch re-prediction (B2).
+        self.speed_source: Any = None
+        self.frame: Any = None
+        self.settings: "SchedulerSettings | None" = None
 
     def execute(
         self,
@@ -533,36 +540,131 @@ class RealRobotExecutor:
     ) -> None:
         del log_samples, real_time, scenario_name
         packets = plan.to_robot_packets(self.interpolar_points)
-        for phase_name, packet in zip(("goto", "pick"), packets):
-            if phase_name == "pick":
-                self._wait_until_pick_dispatch(plan)
-                try:
-                    rotate_pkg = {
-                        "commandID": COMMAND_ID["rotate_absolute"],
-                        "CommandID": COMMAND_ID["rotate_absolute"],
-                        "rotate": 90.0,
-                        "speed": 0.0,
-                    }
-                    self.dispatch(rotate_pkg)
-                except Exception as s_exc:
-                    print(f"[WARN] Failed to dispatch Siemens rotation: {s_exc}")
+        pick_packet = packets[1]
+
+        # --- goto phase ---
+        goto_packet = packets[0]
+        print(
+            "[EXEC]",
+            json.dumps(
+                {"plan_id": plan.plan_id, "phase": "goto",
+                 "commandID": goto_packet.get("commandID"),
+                 "argument_number": goto_packet.get("argument_number")},
+                ensure_ascii=True,
+            ),
+        )
+        status = self.dispatch(goto_packet)
+        if status is not None:
+            print("[PLC]", json.dumps(status, ensure_ascii=True))
+        self._wait_for_phase_completion(goto_packet)
+
+        # --- pre-pick: wait for dispatch window then optionally re-predict ---
+        self._wait_until_pick_dispatch(plan)
+        try:
+            rotate_pkg = {
+                "commandID": COMMAND_ID["rotate_absolute"],
+                "CommandID": COMMAND_ID["rotate_absolute"],
+                "rotate": 90.0,
+                "speed": 0.0,
+            }
+            self.dispatch(rotate_pkg)
+        except Exception as s_exc:
+            print(f"[WARN] Failed to dispatch Siemens rotation: {s_exc}")
+
+        # B2: re-predict pick position using latest encoder reading at dispatch time.
+        pick_packet = self._repredicted_pick_packet(plan, pick_packet)
+        if pick_packet is None:
+            plan.status = "aborted"
             print(
-                "[EXEC]",
+                "[WARN]",
                 json.dumps(
-                    {
-                        "plan_id": plan.plan_id,
-                        "phase": phase_name,
-                        "commandID": packet.get("commandID"),
-                        "argument_number": packet.get("argument_number"),
-                    },
+                    {"plan_id": plan.plan_id, "event": "pick_aborted_outside_workspace"},
                     ensure_ascii=True,
                 ),
             )
-            status = self.dispatch(packet)
-            if status is not None:
-                print("[PLC]", json.dumps(status, ensure_ascii=True))
-            self._wait_for_phase_completion(packet)
+            return
+
+        print(
+            "[EXEC]",
+            json.dumps(
+                {"plan_id": plan.plan_id, "phase": "pick",
+                 "commandID": pick_packet.get("commandID"),
+                 "argument_number": pick_packet.get("argument_number")},
+                ensure_ascii=True,
+            ),
+        )
+        status = self.dispatch(pick_packet)
+        if status is not None:
+            print("[PLC]", json.dumps(status, ensure_ascii=True))
+        self._wait_for_phase_completion(pick_packet)
         plan.status = "completed"
+
+    def _repredicted_pick_packet(
+        self, plan: PickPlan, original_packet: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Re-compute the pick waypoints using the latest encoder position.
+
+        Returns the updated packet, or None if the updated pick position is
+        outside the workspace window (plan must be aborted in that case).
+        If speed_source / frame / settings are not wired up, returns the
+        original packet unchanged.
+        """
+        if self.speed_source is None or self.frame is None or self.settings is None:
+            return original_packet
+
+        try:
+            sample = self.speed_source.sample(time.monotonic())
+        except Exception as exc:
+            print(f"[WARN] late re-prediction: speed_source.sample failed: {exc}")
+            return original_packet
+
+        u_anchor, v_anchor = plan.object_uv_anchor
+        u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
+        command_delay_s = (
+            self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
+        )
+        pre_pick_z = self.settings.pre_pick_height
+        pick_z = self.settings.pickup_height
+        descent_time = _segment_duration(
+            (0.0, 0.0, pre_pick_z), (0.0, 0.0, pick_z), self.settings
+        )
+        u_contact = u_now + sample.speed_uv * (command_delay_s + descent_time)
+
+        if not self.frame.is_in_window_uv(u_contact, v_anchor, self.settings.workspace_window_uv):
+            return None
+
+        pick_xy = self.frame.to_robot(u_contact, v_anchor)
+        new_pick_position: Position3D = (pick_xy[0], pick_xy[1], pick_z)
+
+        # Rebuild pick phase geometry from last goto waypoint as starting point.
+        last_goto_pt = plan.trajectory_goto[-1]
+        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
+        new_pick_points = _build_pick_geometry(
+            new_pick_position, plan.sorting_position, self.settings, plan.trajectory_goto
+        )
+        new_pick_times = _build_pick_timing(
+            new_pick_position, new_pick_points, self.settings, plan.trajectory_goto
+        )
+        new_trajectory_pick = [
+            TrajectoryPoint(pt[0], pt[1], pt[2], e_val, dur)
+            for pt, e_val, dur in zip(
+                new_pick_points, [1, 1, 1, 1, 1, 1, 0], new_pick_times
+            )
+        ]
+        print(
+            "[REPREDICT]",
+            json.dumps(
+                {
+                    "plan_id": plan.plan_id,
+                    "original_xy": [round(plan.predicted_pick_position_2d[0], 3),
+                                    round(plan.predicted_pick_position_2d[1], 3)],
+                    "updated_xy": [round(new_pick_position[0], 3), round(new_pick_position[1], 3)],
+                    "delta_u_mm": round(u_contact - (u_anchor + (sample.position_mm - plan.belt_pos_anchor)), 3),
+                },
+                ensure_ascii=True,
+            ),
+        )
+        return _trajectory_packet(new_trajectory_pick, self.interpolar_points)
 
     def _wait_until_pick_dispatch(self, plan: PickPlan) -> None:
         remaining_s = plan.pick_dispatch_time - time.monotonic()
@@ -1043,6 +1145,8 @@ class PickScheduler:
             sorting_position=sorting_position,
             trajectory_goto=trajectory_goto,
             trajectory_pick=trajectory_pick,
+            object_uv_anchor=obj.conveyor_uv,
+            belt_pos_anchor=self.latest_speed.position_mm,
             debug_info={
                 "pick_position_3d": pick_position,
                 "timing_formula": {
@@ -1115,7 +1219,11 @@ class PickScheduler:
                 goto_points,
                 self.settings,
             )
-            new_guess = now + sum(goto_times) + command_delay_s
+            # B3 fix: include final descent (pre_pick → pickup) so the prediction
+            # accounts for the time the robot spends descending while the belt moves.
+            pre_pick_pos: Position3D = (pick_xy[0], pick_xy[1], self.settings.pre_pick_height)
+            descent_time = _segment_duration(pre_pick_pos, pick_position, self.settings)
+            new_guess = now + sum(goto_times) + descent_time + command_delay_s
             new_guess = max(new_guess, t_enter)
             if abs(new_guess - guess_pick_time) < 0.01:
                 guess_pick_time = new_guess
@@ -1587,6 +1695,11 @@ def run_scheduler_scenario(
             speed_source = SimulatedSpeedSource(
                 scenario_name, settings, start_time, frame
             )
+        # Wire speed_source, frame, settings into RealRobotExecutor for B2 re-prediction.
+        if isinstance(executor, RealRobotExecutor):
+            executor.speed_source = speed_source
+            executor.frame = frame
+            executor.settings = settings
     scheduler = PickScheduler(settings, interpolar_points, frame, tracker)
 
     print(f"[INFO] Running scheduler scenario: {scenario_name}")
