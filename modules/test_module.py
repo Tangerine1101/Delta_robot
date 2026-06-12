@@ -45,6 +45,13 @@ class FakePLCState:
         self.speed_current = 80.0
         self.siemens_task_doing = 0
         self.siemens_task_state = 0
+        # Fake quadrature encoder state — accumulated counts; both channels
+        # advance together (PLC firmware does X4 decoding upstream).
+        self.encoderA: int = 0
+        self.encoderB: int = 0
+        self.encoder_pulse_distance_mm: float = 0.1  # mm per pulse on the fake belt
+        self._encoder_residual_mm: float = 0.0  # carry-over between ticks
+        self._encoder_last_tick: float = time.monotonic()
         self.accumulated_pc_package = {
             "commandID": COMMAND_ID["stop"],
             "argument_number": 0,
@@ -108,12 +115,26 @@ class FakePLCState:
                         values[tag] = None
         return values
 
+    def _advance_encoder(self) -> None:
+        """Accumulate encoder counts since the last call based on current belt speed."""
+        now = time.monotonic()
+        dt = max(0.0, now - self._encoder_last_tick)
+        self._encoder_last_tick = now
+        if dt <= 0.0 or self.encoder_pulse_distance_mm <= 0.0:
+            return
+        distance_mm = self.speed_current * dt + self._encoder_residual_mm
+        pulses = int(distance_mm / self.encoder_pulse_distance_mm)
+        self._encoder_residual_mm = distance_mm - pulses * self.encoder_pulse_distance_mm
+        self.encoderA += pulses
+        self.encoderB += pulses
+
     def accept_siemens_package(self, package: dict[str, Any]) -> dict[str, Any]:
         command_id = int(package.get("CommandID", package.get("commandID", 0)))
         rotate = float(package.get("rotate", 0.0))
         speed = float(package.get("speed", 0.0))
 
         with self.lock:
+            self._advance_encoder()
             self.siemens_task_doing = command_id
             self.siemens_task_state = 1
 
@@ -135,6 +156,8 @@ class FakePLCState:
                 "speed_current": self.speed_current,
                 "task_doing": self.siemens_task_doing,
                 "task_state": self.siemens_task_state,
+                "encoderA": self.encoderA,
+                "encoderB": self.encoderB,
             }
 
         self.log_event("accept_siemens", response)
@@ -254,6 +277,8 @@ class FakePLCState:
             "speed_current": self.speed_current,
             "siemens_task_doing": self.siemens_task_doing,
             "siemens_task_state": self.siemens_task_state,
+            "encoderA": self.encoderA,
+            "encoderB": self.encoderB,
         })
         parts = []
         for key, value in pkg.items():

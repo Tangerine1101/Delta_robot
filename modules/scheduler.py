@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config
+from modules.conveyor import (
+    BeltTracker,
+    ConveyorFrame,
+    EncoderDecoder,
+    TrackedObject,
+    UVWindow,
+)
 from modules.image_processing import ObjectDetection, SimulatedImageProcessing
 
 
@@ -23,6 +30,12 @@ class SpeedSample:
     vx: float
     vy: float
     timestamp: float
+    # Belt position along +u in C-frame (mm). Used as the anchor reference for
+    # encoder-based dead reckoning. May be 0.0 if no encoder source is wired up.
+    position_mm: float = 0.0
+    # Scalar belt speed along +u in C-frame (mm/s). Phase 1 keeps both the
+    # scalar and the projected (vx, vy) so callers can pick whichever they need.
+    speed_uv: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -181,8 +194,11 @@ class SchedulerSettings:
     default_speed: tuple[float, float]
     robot_movement_delay_s: float
     ethernet_delay_s: float
-    pickup_window_x: tuple[float, float]
-    pickup_window_y: tuple[float, float]
+    workspace_window_uv: UVWindow            # (u_min, u_max, v_min, v_max) on belt
+    camera_window_uv: UVWindow
+    conveyor_length_mm: float
+    encoder_constant_mm_per_pulse: float
+    object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
     log_path: str
     object_type_map: dict[str, str]
@@ -229,14 +245,20 @@ class SchedulerSettings:
     @classmethod
     def from_config(cls, config: Any) -> "SchedulerSettings":
         scheduler_raw = getattr(config, "scheduler", {}) or {}
+        conveyor_raw = getattr(config, "conveyor", {}) or {}
         raw_object_types = dict(getattr(config, "object_types", {}) or {})
         object_type_map: dict[str, str] = {}
         object_thickness_mm: dict[str, float] = {}
+        object_dimensions: dict[str, tuple[float, float]] = {}
         sorting_positions: dict[str, Position3D] = {}
         for object_type, type_info in raw_object_types.items():
             if isinstance(type_info, dict):
                 destination_name = str(type_info.get("destination", object_type))
                 object_thickness_mm[object_type] = float(type_info.get("thickness_mm", 0.0))
+                object_dimensions[object_type] = (
+                    float(type_info.get("w", 0.0)),
+                    float(type_info.get("h", 0.0)),
+                )
             else:
                 destination_name = str(type_info)
             object_type_map[object_type] = destination_name
@@ -290,14 +312,19 @@ class SchedulerSettings:
             ),
             robot_movement_delay_s=float(scheduler_raw.get("robot_movement_delay_s", 0.05)),
             ethernet_delay_s=float(scheduler_raw.get("ethernet_delay_s", 0.002)),
-            pickup_window_x=_coerce_range(
-                scheduler_raw.get("pickup_window_x", [-120.0, 120.0]),
-                (-120.0, 120.0),
+            workspace_window_uv=_coerce_uv_window(
+                conveyor_raw.get("workspace_window_uv", [0.0, 200.0, -60.0, 60.0]),
+                (0.0, 200.0, -60.0, 60.0),
             ),
-            pickup_window_y=_coerce_range(
-                scheduler_raw.get("pickup_window_y", [-120.0, 120.0]),
-                (-120.0, 120.0),
+            camera_window_uv=_coerce_uv_window(
+                conveyor_raw.get("camera_window_uv", [0.0, 200.0, -75.0, 75.0]),
+                (0.0, 200.0, -75.0, 75.0),
             ),
+            conveyor_length_mm=float(conveyor_raw.get("length_mm", 800.0)),
+            encoder_constant_mm_per_pulse=float(
+                conveyor_raw.get("encoder_constant_mm_per_pulse", 0.1)
+            ),
+            object_dimensions=object_dimensions,
             accuracy_points=accuracy_points,
             log_path=str(scheduler_raw.get("log_path", "data.log")),
             object_type_map=object_type_map,
@@ -327,42 +354,95 @@ class SchedulerSettings:
         return settings
 
 
+def _default_belt_scalar_speed(default_xy: tuple[float, float]) -> float:
+    """Pre-conveyor-frame migration the config stored an R-frame default speed.
+    Treat its magnitude as the scalar belt speed along +u for backwards
+    compatibility until a dedicated config key is added."""
+    return math.hypot(default_xy[0], default_xy[1])
+
+
 class SimulatedSpeedSource:
-    def __init__(self, scenario_name: str, settings: SchedulerSettings, start_time: float) -> None:
+    """Produce a synthetic belt speed + synthetic encoder position in C-frame."""
+
+    def __init__(
+        self,
+        scenario_name: str,
+        settings: SchedulerSettings,
+        start_time: float,
+        frame: ConveyorFrame,
+    ) -> None:
         self.scenario_name = scenario_name
         self.settings = settings
         self.start_time = start_time
+        self.frame = frame
+        self._last_sample_time: float | None = None
+        self._integrated_position_mm: float = 0.0
 
     def sample(self, now: float) -> SpeedSample:
         if self.scenario_name == "test_accuracy":
-            return SpeedSample(vx=0.0, vy=0.0, timestamp=now)
+            self._last_sample_time = now
+            return SpeedSample(
+                vx=0.0, vy=0.0, timestamp=now,
+                position_mm=self._integrated_position_mm, speed_uv=0.0,
+            )
 
         elapsed = now - self.start_time
         band = int(elapsed // 4.0) % 3
         scale = [0.8, 1.0, 1.2][band]
-        vx = self.settings.default_speed[0] * scale
-        vy = self.settings.default_speed[1] * scale
-        return SpeedSample(vx=vx, vy=vy, timestamp=now)
+        scalar = _default_belt_scalar_speed(self.settings.default_speed) * scale
+
+        if self._last_sample_time is not None:
+            dt = max(0.0, now - self._last_sample_time)
+            self._integrated_position_mm += scalar * dt
+        self._last_sample_time = now
+
+        vx, vy = self.frame.velocity_to_robot(scalar)
+        return SpeedSample(
+            vx=vx, vy=vy, timestamp=now,
+            position_mm=self._integrated_position_mm, speed_uv=scalar,
+        )
 
 
-class RealSpeedSource:
-    """Read conveyor speed from the status callback."""
+class EncoderSpeedSource:
+    """Derive belt speed and position from the Siemens encoderA/encoderB fields."""
 
-    def __init__(self, request_status, scenario_name: str = "") -> None:
+    def __init__(
+        self,
+        request_status,
+        frame: ConveyorFrame,
+        decoder: EncoderDecoder,
+        scenario_name: str = "",
+    ) -> None:
         self.request_status = request_status
+        self.frame = frame
+        self.decoder = decoder
         self.scenario_name = scenario_name
 
     def sample(self, now: float) -> SpeedSample:
         if self.scenario_name == "test_accuracy":
-            return SpeedSample(vx=0.0, vy=0.0, timestamp=now)
+            return SpeedSample(
+                vx=0.0, vy=0.0, timestamp=now,
+                position_mm=self.decoder.position_mm, speed_uv=0.0,
+            )
+
         try:
             status = self.request_status()
-            if status is not None:
-                speed = float(status.get("speed_current", 80.0) or 80.0)
-                return SpeedSample(vx=0.0, vy=speed, timestamp=now)
         except Exception as exc:
-            print(f"[WARN] RealSpeedSource failed to read speed: {exc}")
-        return SpeedSample(vx=0.0, vy=80.0, timestamp=now)
+            print(f"[WARN] EncoderSpeedSource failed to read status: {exc}")
+            status = None
+
+        if status is not None:
+            encoder_a = status.get("encoderA")
+            encoder_b = status.get("encoderB")
+            if encoder_a is not None and encoder_b is not None:
+                self.decoder.update(int(encoder_a), int(encoder_b), now)
+
+        scalar = self.decoder.velocity_mm_per_s
+        vx, vy = self.frame.velocity_to_robot(scalar)
+        return SpeedSample(
+            vx=vx, vy=vy, timestamp=now,
+            position_mm=self.decoder.position_mm, speed_uv=scalar,
+        )
 
 
 class SimulatedExecutor:
@@ -797,37 +877,47 @@ class EvaluateExecutor:
 
 
 class PickScheduler:
-    def __init__(self, settings: SchedulerSettings, interpolar_points: int) -> None:
+    def __init__(
+        self,
+        settings: SchedulerSettings,
+        interpolar_points: int,
+        frame: ConveyorFrame,
+        tracker: BeltTracker,
+    ) -> None:
         self.settings = settings
         self.interpolar_points = interpolar_points
-        self.pending_objects: list[ObjectDetection] = []
+        self.frame = frame
+        self.tracker = tracker
         self.seen_object_ids: dict[str, float] = {}
         self.metrics = SchedulerMetrics()
         self.current_position: Position3D = settings.home_position
         self.latest_speed: SpeedSample | None = None
         self.plan_counter = 0
 
-    def ingest_detections(self, detections: list[ObjectDetection]) -> None:
+    def ingest_detections(self, detections: list[ObjectDetection], p_now: float) -> None:
         for detection in detections:
             self.metrics.total_detections += 1
-            if detection.object_id in self.seen_object_ids:
-                continue
+            self.tracker.ingest_detection(
+                detection, p_now, object_dimensions=self.settings.object_dimensions
+            )
             self.seen_object_ids[detection.object_id] = detection.timestamp
-            self.pending_objects.append(detection)
-        self.metrics.queue_peak = max(self.metrics.queue_peak, len(self.pending_objects))
+        self.metrics.queue_peak = max(
+            self.metrics.queue_peak, len(list(self.tracker.objects()))
+        )
 
     def update_speed(self, sample: SpeedSample) -> None:
         self.latest_speed = sample
-        print(f"[SPEED] vx={sample.vx:.4f} vy={sample.vy:.4f} t={sample.timestamp:.4f}", flush=True)
+        print(
+            f"[SPEED] vx={sample.vx:.4f} vy={sample.vy:.4f} "
+            f"p={sample.position_mm:.3f} t={sample.timestamp:.4f}",
+            flush=True,
+        )
 
     def prune_stale(self, now: float) -> None:
-        kept: list[ObjectDetection] = []
-        for detection in self.pending_objects:
-            if now - detection.timestamp > self.settings.stale_timeout_s:
-                self.metrics.stale_drops += 1
-                continue
-            kept.append(detection)
-        self.pending_objects = kept
+        if self.latest_speed is None:
+            return
+        removed = self.tracker.prune(self.latest_speed.position_mm, now)
+        self.metrics.stale_drops += removed
 
         # Prune seen_object_ids to prevent memory leaks
         limit = now - self.settings.stale_timeout_s
@@ -841,39 +931,33 @@ class PickScheduler:
         if now - self.latest_speed.timestamp > self.settings.speed_timeout_s:
             return None
 
-        candidates: list[tuple[float, ObjectDetection, Position3D]] = []
-        kept_pending: list[ObjectDetection] = []
-        for detection in self.pending_objects:
-            sorting_position = self._resolve_sorting_position(detection.object_type)
+        sample = self.latest_speed
+        candidates: list[tuple[float, TrackedObject, Position3D]] = []
+        for obj in self.tracker.objects():
+            sorting_position = self._resolve_sorting_position(obj.object_type)
             if sorting_position is None:
                 self.metrics.skipped_unknown_type += 1
                 continue
 
-            prediction = self._predict_pick_position(detection, self.latest_speed, now)
+            prediction = self._predict_pick_position(obj, sample, now)
             if prediction is None:
-                # Check if it has passed downstream boundary
-                dt = max(0.0, now - detection.timestamp)
-                current_y = detection.y + self.latest_speed.vy * dt
-                if current_y > self.settings.pickup_window_y[1]:
+                # If the object is already downstream of the workspace, drop it.
+                u_now, _ = obj.current_uv(sample.position_mm)
+                if u_now > self.settings.workspace_window_uv[1]:
                     self.metrics.skipped_outside_workspace += 1
-                else:
-                    kept_pending.append(detection)
+                    self.tracker.remove(obj.object_id)
                 continue
             predicted_pick_time, _, pick_position = prediction
-            candidates.append((predicted_pick_time, detection, sorting_position))
-            kept_pending.append(detection)
-
-        self.pending_objects = kept_pending
+            candidates.append((predicted_pick_time, obj, sorting_position))
 
         if not candidates:
             return None
 
         candidates.sort(key=lambda item: item[0])
-        _, detection, sorting_position = candidates[0]
-        self.pending_objects = [
-            item for item in self.pending_objects if item.object_id != detection.object_id
-        ]
-        return self._build_pick_plan(detection, sorting_position, now)
+        _, obj, sorting_position = candidates[0]
+        plan = self._build_pick_plan(obj, sorting_position, now)
+        self.tracker.remove(obj.object_id)
+        return plan
 
     def mark_completed(self, plan: PickPlan) -> None:
         self.current_position = (
@@ -889,11 +973,13 @@ class PickScheduler:
 
     def _build_pick_plan(
         self,
-        detection: ObjectDetection,
+        obj: TrackedObject,
         sorting_position: Position3D,
         now: float,
     ) -> PickPlan:
-        prediction = self._predict_pick_position(detection, self.latest_speed, now)
+        if self.latest_speed is None:
+            raise RuntimeError("Cannot build pick plan without a current speed sample.")
+        prediction = self._predict_pick_position(obj, self.latest_speed, now)
         if prediction is None:
             raise RuntimeError("Unable to build pick plan for an unreachable detection.")
 
@@ -940,15 +1026,15 @@ class PickScheduler:
 
         self.plan_counter += 1
         self.metrics.planned_picks += 1
-        self.metrics.total_planning_latency += max(now - detection.timestamp, 0.0)
+        self.metrics.total_planning_latency += max(now - obj.last_seen_at, 0.0)
         self.metrics.planning_events += 1
 
         return PickPlan(
             plan_id=f"plan-{self.plan_counter:06d}",
-            object_id=detection.object_id,
-            object_type=detection.object_type,
-            detected_at=detection.timestamp,
-            source_position_2d=(detection.x, detection.y),
+            object_id=obj.object_id,
+            object_type=obj.object_type,
+            detected_at=obj.last_seen_at,
+            source_position_2d=obj.conveyor_uv,
             cycle_start_position=self.current_position,
             assumed_speed=(self.latest_speed.vx, self.latest_speed.vy),
             predicted_pick_time=predicted_pick_time,
@@ -974,33 +1060,51 @@ class PickScheduler:
 
     def _predict_pick_position(
         self,
-        detection: ObjectDetection,
+        obj: TrackedObject,
         speed_sample: SpeedSample,
         now: float,
     ) -> tuple[float, float, Position3D] | None:
-        command_delay_s = self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
-        guess_pick_time = now + max(self.settings.intercept_lead_time_s, command_delay_s)
+        """Iteratively solve for t_pick in the C-frame and project to R-frame.
 
-        t_enter = detection.timestamp
-        if speed_sample.vy > 0.001 and detection.y < self.settings.pickup_window_y[0]:
-            t_enter = detection.timestamp + (self.settings.pickup_window_y[0] - detection.y) / speed_sample.vy
+        The object's anchor is fixed in C-frame; its u-coordinate at time t is
+        `u_anchor + (p_now - p_anchor) + v_belt * (t - now)`. We pick t such
+        that the resulting workspace u is inside the workspace window AND the
+        robot can fly to (u, v) within (t - now) seconds.
+        """
+        command_delay_s = (
+            self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
+        )
+        guess_pick_time = now + max(
+            self.settings.intercept_lead_time_s, command_delay_s
+        )
+
+        u_anchor, v_anchor = obj.conveyor_uv
+        p_now = speed_sample.position_mm
+        u_now = u_anchor + (p_now - obj.belt_pos_anchor)
+        v_now = v_anchor
+        belt_speed = speed_sample.speed_uv
+
+        u_min, u_max, v_min, v_max = self.settings.workspace_window_uv
+
+        # If we're upstream of the workspace, require the object to first reach
+        # u_min before any pick attempt can succeed.
+        t_enter = now
+        if belt_speed > 0.001 and u_now < u_min:
+            t_enter = now + (u_min - u_now) / belt_speed
             guess_pick_time = max(guess_pick_time, t_enter)
 
-        predicted_x = detection.x
-        predicted_y = detection.y
+        # Outside lateral bounds — no chance, the belt's u motion won't fix v.
+        if v_now < v_min or v_now > v_max:
+            return None
+
         for _ in range(6):
-            dt = max(0.0, guess_pick_time - detection.timestamp)
-            predicted_x = detection.x + speed_sample.vx * dt
-            predicted_y = detection.y + speed_sample.vy * dt
-            pick_position = (predicted_x, predicted_y, self.settings.pickup_height)
-            # Only return None if the object has already passed the downstream boundary
-            # of the workspace, or if it is out of bounds horizontally (X).
-            if (
-                predicted_y > self.settings.pickup_window_y[1]
-                or predicted_x < self.settings.pickup_window_x[0]
-                or predicted_x > self.settings.pickup_window_x[1]
-            ):
+            dt_future = max(0.0, guess_pick_time - now)
+            u_pick = u_now + belt_speed * dt_future
+            v_pick = v_now
+            if u_pick > u_max:
                 return None
+            pick_xy = self.frame.to_robot(u_pick, v_pick)
+            pick_position = (pick_xy[0], pick_xy[1], self.settings.pickup_height)
             goto_points = _build_goto_geometry(
                 self.current_position,
                 pick_position,
@@ -1017,20 +1121,18 @@ class PickScheduler:
                 guess_pick_time = new_guess
                 break
             guess_pick_time = new_guess
-        dt = max(0.0, guess_pick_time - detection.timestamp)
-        predicted_x = detection.x + speed_sample.vx * dt
-        predicted_y = detection.y + speed_sample.vy * dt
-        pick_position = (predicted_x, predicted_y, self.settings.pickup_height)
-        if not self._within_workspace(pick_position):
+
+        dt_future = max(0.0, guess_pick_time - now)
+        u_pick = u_now + belt_speed * dt_future
+        v_pick = v_now
+        if not self.frame.is_in_window_uv(
+            u_pick, v_pick, self.settings.workspace_window_uv
+        ):
             return None
+        pick_xy = self.frame.to_robot(u_pick, v_pick)
+        pick_position = (pick_xy[0], pick_xy[1], self.settings.pickup_height)
         pick_dispatch_time = guess_pick_time - command_delay_s
         return guess_pick_time, pick_dispatch_time, pick_position
-
-    def _within_workspace(self, position: Position3D) -> bool:
-        return (
-            self.settings.pickup_window_x[0] <= position[0] <= self.settings.pickup_window_x[1]
-            and self.settings.pickup_window_y[0] <= position[1] <= self.settings.pickup_window_y[1]
-        )
 
 
 def _coerce_position3d(raw_value: Any, fallback: Position3D) -> Position3D:
@@ -1050,6 +1152,16 @@ def _coerce_range(raw_value: Any, fallback: tuple[float, float]) -> tuple[float,
         return fallback
     start, end = float(raw_value[0]), float(raw_value[1])
     return min(start, end), max(start, end)
+
+
+def _coerce_uv_window(
+    raw_value: Any,
+    fallback: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    if not isinstance(raw_value, (list, tuple)) or len(raw_value) != 4:
+        return fallback
+    u_a, u_b, v_a, v_b = (float(v) for v in raw_value)
+    return (min(u_a, u_b), max(u_a, u_b), min(v_a, v_b), max(v_a, v_b))
 
 
 def _sign(value: float) -> float:
@@ -1452,15 +1564,30 @@ def run_scheduler_scenario(
         },
         start_time,
     )
+    frame = ConveyorFrame()
+    tracker = BeltTracker(
+        frame,
+        workspace_window_uv=settings.workspace_window_uv,
+        stale_timeout_s=settings.stale_timeout_s,
+    )
+    decoder = EncoderDecoder(
+        encoder_constant_mm_per_pulse=settings.encoder_constant_mm_per_pulse
+    )
     if executor is None:
         executor = SimulatedExecutor(settings.log_path, settings.poll_interval_s)
-        speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
+        speed_source: Any = SimulatedSpeedSource(
+            scenario_name, settings, start_time, frame
+        )
     else:
         if hasattr(executor, "request_status"):
-            speed_source = RealSpeedSource(executor.request_status, scenario_name)
+            speed_source = EncoderSpeedSource(
+                executor.request_status, frame, decoder, scenario_name
+            )
         else:
-            speed_source = SimulatedSpeedSource(scenario_name, settings, start_time)
-    scheduler = PickScheduler(settings, interpolar_points)
+            speed_source = SimulatedSpeedSource(
+                scenario_name, settings, start_time, frame
+            )
+    scheduler = PickScheduler(settings, interpolar_points, frame, tracker)
 
     print(f"[INFO] Running scheduler scenario: {scenario_name}")
     print(f"[INFO] Fixed PLC slot count: {interpolar_points}")
@@ -1476,10 +1603,13 @@ def run_scheduler_scenario(
             if deadline is not None and now >= deadline:
                 break
 
+            # Sample speed FIRST so that ingest_detections can anchor detections
+            # to the latest encoder reading.
+            sample = speed_source.sample(now)
+            scheduler.update_speed(sample)
             detections = image_processing.poll(now)
-            scheduler.ingest_detections(detections)
+            scheduler.ingest_detections(detections, sample.position_mm)
             scheduler.prune_stale(now)
-            scheduler.update_speed(speed_source.sample(now))
 
             plan = scheduler.plan_next(now)
             if plan is not None:

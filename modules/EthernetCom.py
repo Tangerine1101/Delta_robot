@@ -40,6 +40,8 @@ class SiemensReceivePacket(ctypes.BigEndianStructure):
         ("speed_current", ctypes.c_float),  # float (4 bytes)
         ("task_doing", ctypes.c_int32),     # int (4 bytes)
         ("task_state", ctypes.c_int32),     # int (4 bytes)
+        ("encoderA", ctypes.c_int32),       # int (4 bytes) — raw quadrature count channel A
+        ("encoderB", ctypes.c_int32),       # int (4 bytes) — raw quadrature count channel B
     ]
 # =============================================================
 
@@ -347,6 +349,8 @@ class SiemensGateway:
                     "speed_current": recv_data.speed_current,
                     "task_doing": recv_data.task_doing,
                     "task_state": recv_data.task_state,
+                    "encoderA": recv_data.encoderA,
+                    "encoderB": recv_data.encoderB,
                 }
             except Exception as exc:
                 print(f"[ERROR] Siemens gateway communication error (Real): {exc}")
@@ -370,6 +374,8 @@ class SiemensGateway:
                     "speed_current": recv_data.speed_current,
                     "task_doing": recv_data.task_doing,
                     "task_state": recv_data.task_state,
+                    "encoderA": recv_data.encoderA,
+                    "encoderB": recv_data.encoderB,
                 }
             except Exception as exc:
                 print(f"[ERROR] Siemens gateway communication error (Real): {exc}")

@@ -10,6 +10,11 @@ import re
 import math
 from pathlib import Path
 
+# Make sibling modules importable so we can reuse F, windows, length.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from modules.conveyor import ConveyorFrame  # noqa: E402
+from modules.EthernetCom import load_config  # noqa: E402
+
 # Global data collectors for plotting
 data_lock = threading.Lock()
 robot_positions = []   # tuples of (t_rel, x, y, z, e)  — from pos_EE (real/fake PLC)
@@ -17,6 +22,20 @@ conveyor_speeds = []   # tuples of (t_rel, vx, vy)
 planned_waypoints = [] # tuples of (t_rel, x, y, z, e)  — from [TRAJ] lines (evaluate)
 cycle_metrics = []     # tuples of (t_rel, dict)          — from [CYCLE] lines (evaluate)
 start_time = 0.0
+
+
+def _uv_window_to_corners(frame: ConveyorFrame, window, z):
+    """Project a C-frame (u_min, u_max, v_min, v_max) rectangle onto R-frame
+    corners at constant Z, closed polygon (5 points)."""
+    u_min, u_max, v_min, v_max = window
+    uv = [(u_min, v_min), (u_max, v_min), (u_max, v_max), (u_min, v_max), (u_min, v_min)]
+    xs, ys = [], []
+    for u, v in uv:
+        x, y = frame.to_robot(u, v)
+        xs.append(x)
+        ys.append(y)
+    zs = [z] * len(xs)
+    return xs, ys, zs
 
 def stream_output(process, prefix):
     is_plc = "[PLC]" in prefix
@@ -122,6 +141,29 @@ def main():
         "--duration",
         str(args.duration),
     ]
+
+    # --- Geometry: belt frame and windows (loaded once for plot overlays) ---
+    cfg = load_config()
+    conveyor_cfg = getattr(cfg, "conveyor", {}) or {}
+    scheduler_cfg = getattr(cfg, "scheduler", {}) or {}
+    frame = ConveyorFrame()
+    workspace_window = tuple(conveyor_cfg.get("workspace_window_uv", [450.0, 620.0, -65.0, 65.0]))
+    camera_window = tuple(conveyor_cfg.get("camera_window_uv", [50.0, 250.0, -75.0, 75.0]))
+    belt_length_mm = float(conveyor_cfg.get("length_mm", 800.0))
+    pickup_height = float(scheduler_cfg.get("pickup_height", -310.0))
+    clearance_height = float(scheduler_cfg.get("clearance_height", -240.0))
+    # Sorting bin XY locations (just to anchor the X/Y view bounds).
+    bin1 = list(getattr(cfg, "pcb1", [0.0, 0.0, -300.0]))[:2]
+    bin2 = list(getattr(cfg, "pcb2", [0.0, 0.0, -300.0]))[:2]
+    # Compute belt vector endpoints in robot frame, then derive fixed axes bounds.
+    belt_start_R = frame.to_robot(0.0, 0.0)
+    belt_end_R = frame.to_robot(belt_length_mm, 0.0)
+    all_x = [belt_start_R[0], belt_end_R[0], bin1[0], bin2[0]]
+    all_y = [belt_start_R[1], belt_end_R[1], bin1[1], bin2[1]]
+    margin = 60.0
+    x_lim = (min(all_x) - margin, max(all_x) + margin)
+    y_lim = (min(all_y) - margin, max(all_y) + margin)
+    z_lim = (pickup_height - 20.0, clearance_height + 20.0)
 
     global start_time
     start_time = time.monotonic()
@@ -234,6 +276,29 @@ def main():
                                 # Mark waypoints as dots
                                 ax_traj.scatter(xs, ys, zs, color=color, s=18, alpha=alpha, zorder=5)
 
+                        # --- Belt vector at pickup height ---
+                        dx_belt = belt_end_R[0] - belt_start_R[0]
+                        dy_belt = belt_end_R[1] - belt_start_R[1]
+                        ax_traj.quiver(
+                            belt_start_R[0], belt_start_R[1], pickup_height,
+                            dx_belt, dy_belt, 0.0,
+                            color="#00FFFF", linewidth=2.0,
+                            arrow_length_ratio=0.05, label="Belt direction (+u)",
+                        )
+                        # --- Camera window (magenta dashed) ---
+                        cx, cy, cz = _uv_window_to_corners(frame, camera_window, pickup_height)
+                        ax_traj.plot(cx, cy, cz, color="#FF00FF", linestyle="--",
+                                     linewidth=1.5, label="Camera window")
+                        # --- Workspace window (green solid) ---
+                        wx, wy, wz = _uv_window_to_corners(frame, workspace_window, pickup_height)
+                        ax_traj.plot(wx, wy, wz, color="#39FF14", linestyle="-",
+                                     linewidth=2.0, label="Workspace (pick zone)")
+                        # --- Sort bin markers ---
+                        ax_traj.scatter([bin1[0]], [bin1[1]], [pickup_height],
+                                        color="#FFB000", s=60, marker="s", label="pcb1 bin")
+                        ax_traj.scatter([bin2[0]], [bin2[1]], [pickup_height],
+                                        color="#FF6F00", s=60, marker="s", label="pcb2 bin")
+
                         ax_traj.set_title(traj_title, color="white", weight="bold")
                         ax_traj.set_xlabel("X (mm)", color="white")
                         ax_traj.set_ylabel("Y (mm)", color="white")
@@ -244,7 +309,15 @@ def main():
                         ax_traj.xaxis.label.set_color("white")
                         ax_traj.yaxis.label.set_color("white")
                         ax_traj.zaxis.label.set_color("white")
-                        ax_traj.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white")
+                        # Fixed axes — prevents the camera frame from drifting between redraws.
+                        ax_traj.set_xlim(*x_lim)
+                        ax_traj.set_ylim(*y_lim)
+                        ax_traj.set_zlim(*z_lim)
+                        try:
+                            ax_traj.set_box_aspect((1.0, 1.0, 0.5))
+                        except Exception:
+                            pass
+                        ax_traj.legend(loc="upper right", facecolor="#222222", edgecolor="#444444", labelcolor="white", fontsize=8)
 
                         # --- Chart 2: Coordinates vs Time ---
                         coord_source = waypoints if (args.scenario == "evaluate" and waypoints) else positions

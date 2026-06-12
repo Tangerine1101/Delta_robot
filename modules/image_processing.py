@@ -1,3 +1,13 @@
+"""
+Phase 1 image-processing stub.
+
+Detection coordinates `(x, y)` produced by this module are interpreted as
+C-frame `(u, v)` by `modules.conveyor.BeltTracker` and the scheduler. This is
+a deliberate shortcut for Phase 1 wiring so the rest of the pipeline can be
+exercised end to end. Phase 3 will replace this whole module with a real
+YOLO + tracker that yields pixel-space detections and routes them through
+`modules.conveyor.CameraFrame` to obtain C-frame coordinates.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,7 +35,13 @@ class ObjectDetection:
 
 
 class SimulatedImageProcessing:
-    """Deterministic fake object stream for scheduler development."""
+    """Deterministic fake object stream for scheduler development.
+
+    Phase 1: emits detections at C-frame `(u, v)` coordinates.
+    - `throughput_spawn_y` is reused as the upstream `u_spawn`.
+    - `throughput_lanes` is reused as the per-object `v_lane` values.
+    - `accuracy_points` are read as `(u, v, _)` triples.
+    """
 
     def __init__(self, scenario_name: str, config: dict[str, Any], start_time: float) -> None:
         self.scenario_name = scenario_name
@@ -34,9 +50,8 @@ class SimulatedImageProcessing:
         self.next_emit_at = start_time
         self.counter = 0
         self.throughput_types = list(config.get("throughput_object_types", ["pcb1", "pcb2"]))
-        self.throughput_lanes = list(config.get("throughput_lanes", [-60.0, 0.0, 60.0]))
-        self.throughput_spawn_y = float(config.get("throughput_spawn_y", -180.0))
-        self.throughput_spawn_x = float(config.get("throughput_spawn_x", -180.0))
+        self.throughput_lanes = list(config.get("throughput_lanes", [-40.0, 0.0, 40.0]))
+        self.u_spawn = float(config.get("throughput_spawn_y", -50.0))
         self.throughput_emit_interval_s = float(config.get("throughput_emit_interval_s", 0.35))
         self.accuracy_emit_interval_s = float(config.get("accuracy_emit_interval_s", 0.8))
         raw_points = config.get(
@@ -65,22 +80,22 @@ class SimulatedImageProcessing:
     def _build_detection(self, timestamp: float) -> ObjectDetection:
         self.counter += 1
         if self.scenario_name == "test_accuracy":
-            x, y = self.accuracy_points[(self.counter - 1) % len(self.accuracy_points)]
+            u, v = self.accuracy_points[(self.counter - 1) % len(self.accuracy_points)]
             object_type = self.throughput_types[(self.counter - 1) % len(self.throughput_types)]
             return ObjectDetection(
                 object_id=f"accuracy-{self.counter:06d}",
-                x=x,
-                y=y,
+                x=u,
+                y=v,
                 object_type=object_type,
                 timestamp=timestamp,
             )
 
-        lane = self.throughput_lanes[(self.counter - 1) % len(self.throughput_lanes)]
+        v_lane = self.throughput_lanes[(self.counter - 1) % len(self.throughput_lanes)]
         object_type = self.throughput_types[(self.counter - 1) % len(self.throughput_types)]
         return ObjectDetection(
             object_id=f"throughput-{self.counter:06d}",
-            x=float(lane),
-            y=self.throughput_spawn_y,
+            x=self.u_spawn,
+            y=float(v_lane),
             object_type=object_type,
             timestamp=timestamp,
         )

@@ -13,12 +13,13 @@
   * [main.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/main.py): Primary orchestrator for CLI and scheduler modes.
   * [README.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/README.md): Quickstart and repository entry overview.
 * **`modules/`**: Contains the active logic of the system:
-  * [scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py): Core path planning, safety checks, simulated speed/perception, and executor management.
+  * [scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py): Core path planning, safety checks, simulated speed/perception, and executor management. Now operates in conveyor C-frame for pickup prediction.
+  * [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py): Conveyor frame F, camera frame M, `EncoderDecoder` (encoderA/B → mm), `BeltTracker` for on-belt object tracking.
   * [EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication gateway (PLCGateway) using `pylogix` for Omron.
   * [cli.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): Command parser.
-  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): Mock perception queue.
-  * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator.
-  * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file.
+  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): Phase-1 stub; emits detections whose `(x, y)` are interpreted as C-frame `(u, v)`.
+  * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits encoder counts proportional to `speed_current`.
+  * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (encoder_constant, length_mm, camera_window_uv, workspace_window_uv) and per-PCB `w`/`h` dimensions.
 * **`doc/`**:
   * [system_reference.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/system_reference.md): Full technical, mathematical, and architectural reference manual.
   * [ai_context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/ai_context.md): This file.
@@ -64,12 +65,24 @@ PC-to-PLC packet sent to the Omron NX CPU:
   ```
 * Invariant: Even if a command uses $< 7$ points, the arrays must always be padded to `7` elements with `0.0`.
 
-Siemens S7-1200 package structure:
+Siemens S7-1200 package structure (PC → PLC):
 ```python
 {
     "CommandID": int,
     "rotate": float,
     "speed": float
+}
+```
+
+Siemens S7-1200 status structure (PLC → PC, 24 bytes Phase 1):
+```python
+{
+    "rotate_current": float,
+    "speed_current": float,
+    "task_doing": int,
+    "task_state": int,
+    "encoderA": int,   # raw quadrature count A
+    "encoderB": int,   # raw quadrature count B
 }
 ```
 
@@ -79,7 +92,7 @@ Siemens S7-1200 package structure:
 
 ### 2.1. Coordinate Conventions
 * Delta Robot Z-axis is negative (downward). Points closer to `0.0` are higher.
-* Bounding Box checking is enforced via `pickup_window_x` and `pickup_window_y`.
+* Workspace is a rectangle in conveyor C-frame: `conveyor.workspace_window_uv = [u_min, u_max, v_min, v_max]`. Sorting bins are outside this window by definition.
 * Safety rule: `clearance_height` > `pre_pick_height` > `pickup_height` must hold.
 
 ### 2.2. Interception and Dispatch

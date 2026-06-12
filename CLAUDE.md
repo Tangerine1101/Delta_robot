@@ -1,5 +1,8 @@
 # CLAUDE.md — Delta Robot Project
 
+## 0. Language
+Except the final report messages must be Vietnamese, you can freely use English for thinking and document writing for saving compute sake.
+
 ## 1. Startup Protocol
 
 **Always read `doc/ai_context.md` first** before reading any other file in this project.
