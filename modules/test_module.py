@@ -128,6 +128,20 @@ class FakePLCState:
         self.encoderA += pulses
         self.encoderB += pulses
 
+    def get_siemens_status(self) -> dict[str, Any]:
+        """Return current Siemens state without executing any command (side-effect free)."""
+        with self.lock:
+            self._advance_encoder()
+            response = {
+                "rotate_current": self.rotate_current,
+                "speed_current": self.speed_current,
+                "task_doing": self.siemens_task_doing,
+                "task_state": self.siemens_task_state,
+                "encoderA": self.encoderA,
+                "encoderB": self.encoderB,
+            }
+        return response
+
     def accept_siemens_package(self, package: dict[str, Any]) -> dict[str, Any]:
         command_id = int(package.get("CommandID", package.get("commandID", 0)))
         rotate = float(package.get("rotate", 0.0))
@@ -358,10 +372,17 @@ class FakePLCRequestHandler(socketserver.StreamRequestHandler):
                     tags = message.get("tags", [])
                     values = state.handle_tag_read(tags)
                     response = {"ok": True, "values": values}
-                elif "CommandID" in message or "commandID" in message or "rotate" in message or "speed" in message:
-                    response = state.accept_siemens_package(message)
-                else:
+                elif action == "siemens_status":
+                    response = state.get_siemens_status()
+                elif (
+                    "argument_number" in message
+                    or any(k in message for k in ARRAY_FIELDS)
+                    or "bit_doing" in message
+                    or "doing_bit" in message
+                ):
                     response = state.accept_pc_package(message)
+                else:
+                    response = state.accept_siemens_package(message)
             except Exception as exc:
                 response = {"ok": False, "error": str(exc)}
                 state.log_event("error", response)

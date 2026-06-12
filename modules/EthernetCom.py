@@ -358,9 +358,22 @@ class SiemensGateway:
                 return None
 
     def get_status(self) -> dict[str, Any] | None:
-        """Query state from Siemens PLC."""
+        """Query state from Siemens PLC (read-only; no command side-effects)."""
         if self.is_mock:
-            return self.send_package({"CommandID": 0, "rotate": 0.0, "speed": 0.0})
+            if not self.connected:
+                if not self.connect():
+                    return None
+            try:
+                req = {"action": "siemens_status"}
+                self._socket.sendall((json.dumps(req, ensure_ascii=True) + "\n").encode("utf-8"))
+                resp_bytes = self._socket.recv(4096)
+                if not resp_bytes:
+                    raise ConnectionError("Siemens connection closed by peer")
+                return json.loads(resp_bytes.decode("utf-8").strip())
+            except Exception as exc:
+                print(f"[ERROR] Siemens gateway communication error (Mock): {exc}")
+                self.disconnect()
+                return None
         else:
             if not self.connected:
                 if not self.connect():
