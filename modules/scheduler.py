@@ -218,6 +218,10 @@ class SchedulerSettings:
     evaluate_wait_timeout_s: float = 10.0
     evaluate_stability_window_s: float = 0.4
     evaluate_stability_mm: float = 0.3
+    # Minimum displacement from the phase start before the mechanical-stability
+    # fallback is armed.  Prevents accepting "stable" at the starting position
+    # if the PLC servo start latency exceeds the stability window.
+    evaluate_stability_arm_mm: float = 3.0
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -351,6 +355,9 @@ class SchedulerSettings:
             ),
             evaluate_stability_mm=float(
                 scheduler_raw.get("evaluate_stability_mm", 0.3)
+            ),
+            evaluate_stability_arm_mm=float(
+                scheduler_raw.get("evaluate_stability_arm_mm", 3.0)
             ),
         )
         settings.validate()
@@ -710,8 +717,14 @@ class EvaluateExecutor:
     argument_time, so wall-time measured here reflects the true mechanism speed.
 
     A background thread polls request_status() every `status_poll_interval_s`
-    (default 10 ms) and caches the result. A shared mutex guarantees that
-    polling and packet dispatch never share the communication queue simultaneously.
+    (wired to poll_interval_s from config, default 50 ms) and caches the
+    result. A shared mutex guarantees that polling and packet dispatch never
+    share the communication queue simultaneously.
+
+    Stability-fallback arming: the mechanical-stability fallback is only armed
+    after pos_EE has moved at least `stability_arm_mm` from the phase start.
+    This prevents falsely accepting "stable" while the robot is still at the
+    starting position before servo start latency has elapsed.
     """
 
     def __init__(
@@ -721,10 +734,11 @@ class EvaluateExecutor:
         *,
         interpolar_points: int,
         position_tolerance_mm: float = 0.01,
-        status_poll_interval_s: float = 0.01,
+        status_poll_interval_s: float = 0.05,
         wait_timeout_s: float = 10.0,
         stability_window_s: float = 0.4,
         stability_mm: float = 0.3,
+        stability_arm_mm: float = 3.0,
     ) -> None:
         self._dispatch_fn = dispatch
         self._request_status_fn = request_status
@@ -734,6 +748,7 @@ class EvaluateExecutor:
         self.wait_timeout_s = float(wait_timeout_s)
         self.stability_window_s = max(float(stability_window_s), 0.0)
         self.stability_mm = max(float(stability_mm), 0.0)
+        self.stability_arm_mm = max(float(stability_arm_mm), 0.0)
 
         # Mutex shared between the background poller and dispatch calls.
         # Ensures only one message is in the communication queue at any time.
@@ -839,10 +854,12 @@ class EvaluateExecutor:
         deadline = time.monotonic() + self.wait_timeout_s
         checks = 0
         last_pos: Position3D | None = None
+        initial_pos: Position3D | None = None   # pos_EE captured on first valid sample
         last_distance: float | None = None
         last_task_state: int | None = None
         min_distance: float | None = None
         idle_seen_at: float | None = None
+        stability_armed: bool = False
         # Require task_state==0 to persist for at least two poll cycles before accepting.
         idle_settle_s = self.status_poll_interval_s * 2.0
         # Rolling window of recent pos_EE samples for mechanical-stability detection.
@@ -861,6 +878,8 @@ class EvaluateExecutor:
                     except (TypeError, ValueError):
                         px = py = pz = float("nan")
                     last_pos = (px, py, pz)
+                    if initial_pos is None:
+                        initial_pos = last_pos
                     dx = px - target[0]
                     dy = py - target[1]
                     dz = pz - target[2]
@@ -869,6 +888,15 @@ class EvaluateExecutor:
                         min_distance = last_distance
                     if last_distance < self.position_tolerance_mm:
                         return last_pos
+
+                    # Arm stability fallback once the robot has moved away from
+                    # the start position by at least stability_arm_mm.
+                    if not stability_armed and initial_pos is not None and self.stability_arm_mm > 0.0:
+                        ax = px - initial_pos[0]
+                        ay = py - initial_pos[1]
+                        az = pz - initial_pos[2]
+                        if math.sqrt(ax * ax + ay * ay + az * az) >= self.stability_arm_mm:
+                            stability_armed = True
 
                 ts = status.get("task_state")
                 if ts is not None:
@@ -904,8 +932,10 @@ class EvaluateExecutor:
 
                 # Mechanical-stability fallback: robot is physically stopped even
                 # though PLC firmware hasn't transitioned task_state to 0.
+                # Only active after stability_armed (robot must have left start pos first).
                 if (
-                    self.stability_mm > 0.0
+                    stability_armed
+                    and self.stability_mm > 0.0
                     and self.stability_window_s > 0.0
                     and last_pos is not None
                 ):
@@ -941,6 +971,7 @@ class EvaluateExecutor:
                                         "spread_mm": round(spread, 4),
                                         "stability_mm": self.stability_mm,
                                         "stability_window_s": self.stability_window_s,
+                                        "stability_arm_mm": self.stability_arm_mm,
                                         "samples": len(pos_window),
                                         "last_task_state": last_task_state,
                                         "tolerance_mm": self.position_tolerance_mm,
@@ -1569,6 +1600,7 @@ def _run_evaluate_loop(
             wait_timeout_s=settings.evaluate_wait_timeout_s,
             stability_window_s=settings.evaluate_stability_window_s,
             stability_mm=settings.evaluate_stability_mm,
+            stability_arm_mm=settings.evaluate_stability_arm_mm,
         )
 
     metrics = EvaluateMetrics()
