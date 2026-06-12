@@ -470,8 +470,19 @@ class SimulatedExecutor:
         real_time: bool = False,
         scenario_name: str,
     ) -> None:
+        # A3: wait until the pick dispatch window to mirror RealRobotExecutor timing.
+        remaining_s = plan.pick_dispatch_time - time.monotonic()
+        if remaining_s > 0.0:
+            time.sleep(remaining_s)
+
+        # Sleep the remaining trajectory time (pick phase) so throughput reflects
+        # real robot cycle time rather than completing instantly.
+        pick_duration = sum(pt.time_s for pt in plan.trajectory_pick)
+        if pick_duration > 0.0:
+            time.sleep(pick_duration)
+
         if log_samples:
-            self._log_plan_trace(plan, real_time=real_time, scenario_name=scenario_name)
+            self._log_plan_trace(plan, real_time=False, scenario_name=scenario_name)
         plan.status = "completed"
 
     def _log_plan_trace(self, plan: PickPlan, *, real_time: bool, scenario_name: str) -> None:
@@ -1544,8 +1555,12 @@ def _dispatch_evaluate_plan(
     for phase_name, trajectory, phase_start in zip(
         ("goto", "pick"), trajectories, phase_starts
     ):
-        wall = max(sum(point.time_s for point in trajectory), 0.001)
+        sim_duration = max(sum(point.time_s for point in trajectory), 0.001)
         distance = _path_distance(phase_start, trajectory)
+        t0 = time.monotonic()
+        # A4: sleep to reflect real robot cycle time rather than busy-looping.
+        time.sleep(sim_duration)
+        wall = time.monotonic() - t0
         metrics.phase_wall_times.append(wall)
         metrics.phase_distances.append(distance)
         metrics.total_phase_wall_time_s += wall

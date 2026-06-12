@@ -60,7 +60,7 @@
             40.0
         ],
         "throughput_spawn_x": 0.0,
-        "throughput_spawn_y": -50.0,
+        "throughput_spawn_y": 200.0,
         "throughput_emit_interval_s": 0.35,
         "accuracy_emit_interval_s": 0.7,
         "execution_margin_s": 1,
