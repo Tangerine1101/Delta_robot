@@ -34,6 +34,7 @@
         "yolo_dir": "YOLO_OBB",
         "system_config": "YOLO_OBB/config/system_config.yaml",
         "class_map": {"QFP": "QFP", "TQFP": "TQFP"},
+        "camera_usb_id": "0c45:636b",
         "camera_source": null,
         "min_conf": null
     },

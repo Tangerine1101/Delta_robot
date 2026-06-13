@@ -17,10 +17,11 @@ from modules.EthernetCom import load_config  # noqa: E402
 
 # Global data collectors for plotting
 data_lock = threading.Lock()
-robot_positions = []   # tuples of (t_rel, x, y, z, e)  — from pos_EE (real/fake PLC)
-conveyor_speeds = []   # tuples of (t_rel, vx, vy)
-planned_waypoints = [] # tuples of (t_rel, x, y, z, e)  — from [TRAJ] lines (evaluate)
-cycle_metrics = []     # tuples of (t_rel, dict)          — from [CYCLE] lines (evaluate)
+robot_positions = []     # tuples of (t_rel, x, y, z, e)  — from pos_EE (real/fake PLC)
+conveyor_speeds = []     # tuples of (t_rel, vx, vy)
+planned_waypoints = []   # tuples of (t_rel, x, y, z, e)  — from [TRAJ] lines (evaluate)
+cycle_metrics = []       # tuples of (t_rel, dict)          — from [CYCLE] lines (evaluate)
+predicted_positions = [] # tuples of (t_rel, x, y, z)      — from [PREDICT] lines (test_vision_only)
 start_time = 0.0
 
 
@@ -95,6 +96,16 @@ def stream_output(process, prefix):
                                 cycle_metrics.append((t_rel, json.loads(cycle_match.group(1))))
                         except Exception:
                             pass
+
+                # [PREDICT] lines (test_vision_only) — predicted pick positions
+                predict_match = re.search(r'\[PREDICT\]\s+(\{.*\})', cleaned)
+                if predict_match:
+                    try:
+                        d = json.loads(predict_match.group(1))
+                        with data_lock:
+                            predicted_positions.append((d["t"], d["x"], d["y"], d["z"]))
+                    except Exception:
+                        pass
     process.stdout.close()
 
 def main():
@@ -102,48 +113,73 @@ def main():
     parser.add_argument(
         "--scenario",
         default="test_throughput",
-        choices=["test_throughput", "test_accuracy", "evaluate"],
+        choices=["test_throughput", "test_accuracy", "evaluate", "test_conveyor", "test_vision_only"],
         help="Test scenario to run (default: test_throughput)",
     )
     parser.add_argument(
         "--duration",
         type=int,
         default=None,
-        help="Duration of the test in seconds (default: 30 for throughput/accuracy, 60 for evaluate)",
+        help="Duration of the test in seconds",
     )
     args = parser.parse_args()
     if args.duration is None:
-        args.duration = 60 if args.scenario == "evaluate" else 30
+        if args.scenario == "evaluate":
+            args.duration = 60
+        elif args.scenario in ("test_conveyor", "test_vision_only"):
+            args.duration = 30
+        else:
+            args.duration = 30
 
     port = 1502
-    # Start the PLC fake module with duration slightly longer to allow clean shutdown of client first
-    plc_cmd = [
-        sys.executable,
-        "-m",
-        "modules.test_module",
-        "--port",
-        str(port),
-        "--duration",
-        str(args.duration + 5),
-    ]
 
-    # Start main.py scheduler simulation
-    main_cmd = [
-        sys.executable,
-        "main.py",
-        "--scheduler",
-        "--ip",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--scenario",
-        args.scenario,
-        "--duration",
-        str(args.duration),
-    ]
+    # Load config early so we have the real PLC IP for test_conveyor.
+    cfg_early = load_config()
+
+    # Determine subprocess commands based on scenario.
+    _real_scenarios = {"test_conveyor", "test_vision_only"}
+    if args.scenario in _real_scenarios:
+        # No fake PLC — connect directly to real hardware (or simulated executor).
+        plc_cmd = None
+        if args.scenario == "test_vision_only":
+            main_cmd = [
+                sys.executable,
+                "main.py",
+                "--scheduler",
+                "--scenario", args.scenario,
+                "--simulate-executor",
+                "--duration", str(args.duration),
+            ]
+        else:  # test_conveyor — real PLC IP from config
+            main_cmd = [
+                sys.executable,
+                "main.py",
+                "--scheduler",
+                "--scenario", args.scenario,
+                "--ip", str(getattr(cfg_early, "ip_address", "192.168.250.1")),
+                "--port", str(getattr(cfg_early, "port", 44818)),
+                "--duration", str(args.duration),
+            ]
+    else:
+        # Simulated scenarios — start fake PLC first.
+        plc_cmd = [
+            sys.executable,
+            "-m", "modules.test_module",
+            "--port", str(port),
+            "--duration", str(args.duration + 5),
+        ]
+        main_cmd = [
+            sys.executable,
+            "main.py",
+            "--scheduler",
+            "--ip", "127.0.0.1",
+            "--port", str(port),
+            "--scenario", args.scenario,
+            "--duration", str(args.duration),
+        ]
 
     # --- Geometry: belt frame and windows (loaded once for plot overlays) ---
-    cfg = load_config()
+    cfg = cfg_early  # reuse already-loaded config
     conveyor_cfg = getattr(cfg, "conveyor", {}) or {}
     scheduler_cfg = getattr(cfg, "scheduler", {}) or {}
     frame = ConveyorFrame()
@@ -152,9 +188,9 @@ def main():
     belt_length_mm = float(conveyor_cfg.get("length_mm", 800.0))
     pickup_height = float(scheduler_cfg.get("pickup_height", -310.0))
     clearance_height = float(scheduler_cfg.get("clearance_height", -240.0))
-    # Sorting bin XY locations (just to anchor the X/Y view bounds).
-    bin1 = list(getattr(cfg, "pcb1", [0.0, 0.0, -300.0]))[:2]
-    bin2 = list(getattr(cfg, "pcb2", [0.0, 0.0, -300.0]))[:2]
+    # Sorting bin XY locations (just to anchor the X/Y view bounds). QFP/TQFP with pcb1/pcb2 fallback.
+    bin1 = list(getattr(cfg, "QFP",  getattr(cfg, "pcb1", [0.0, 0.0, -300.0])))[:2]
+    bin2 = list(getattr(cfg, "TQFP", getattr(cfg, "pcb2", [0.0, 0.0, -300.0])))[:2]
     # Compute belt vector endpoints in robot frame, then derive fixed axes bounds.
     belt_start_R = frame.to_robot(0.0, 0.0)
     belt_end_R = frame.to_robot(belt_length_mm, 0.0)
@@ -168,17 +204,18 @@ def main():
     global start_time
     start_time = time.monotonic()
 
-    print(f"[*] Starting simulated PLC on port {port}...")
-    plc_proc = subprocess.Popen(
-        plc_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    # Let the PLC start and bind to the port
-    time.sleep(1.0)
+    plc_proc = None
+    if plc_cmd is not None:
+        print(f"[*] Starting simulated PLC on port {port}...")
+        plc_proc = subprocess.Popen(
+            plc_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        # Let the PLC start and bind to the port
+        time.sleep(1.0)
 
     print(f"[*] Starting scheduler for scenario '{args.scenario}' (duration: {args.duration}s)...")
     main_proc = subprocess.Popen(
@@ -190,10 +227,10 @@ def main():
     )
 
     # Stream outputs in separate threads
-    t_plc = threading.Thread(target=stream_output, args=(plc_proc, "\033[94m[PLC]\033[0m"), daemon=True)
+    if plc_proc is not None:
+        t_plc = threading.Thread(target=stream_output, args=(plc_proc, "\033[94m[PLC]\033[0m"), daemon=True)
+        t_plc.start()
     t_main = threading.Thread(target=stream_output, args=(main_proc, "\033[92m[MAIN]\033[0m"), daemon=True)
-
-    t_plc.start()
     t_main.start()
 
     # Real-time Plotting setup
@@ -295,9 +332,19 @@ def main():
                                      linewidth=2.0, label="Workspace (pick zone)")
                         # --- Sort bin markers ---
                         ax_traj.scatter([bin1[0]], [bin1[1]], [pickup_height],
-                                        color="#FFB000", s=60, marker="s", label="pcb1 bin")
+                                        color="#FFB000", s=60, marker="s", label="QFP bin")
                         ax_traj.scatter([bin2[0]], [bin2[1]], [pickup_height],
-                                        color="#FF6F00", s=60, marker="s", label="pcb2 bin")
+                                        color="#FF6F00", s=60, marker="s", label="TQFP bin")
+
+                        # --- Predicted pick positions (test_vision_only) ---
+                        with data_lock:
+                            pred_pts = list(predicted_positions[-50:])
+                        if pred_pts:
+                            px = [p[1] for p in pred_pts]
+                            py = [p[2] for p in pred_pts]
+                            pz = [p[3] for p in pred_pts]
+                            ax_traj.scatter(px, py, pz, color="#FF8C00", s=40, marker="^",
+                                            zorder=6, label="Predicted pick")
 
                         ax_traj.set_title(traj_title, color="white", weight="bold")
                         ax_traj.set_xlabel("X (mm)", color="white")
@@ -405,7 +452,7 @@ def main():
         if main_proc.poll() is None:
             main_proc.terminate()
             main_proc.wait()
-        if plc_proc.poll() is None:
+        if plc_proc is not None and plc_proc.poll() is None:
             plc_proc.terminate()
             plc_proc.wait()
         print("[*] Stopped all processes.")

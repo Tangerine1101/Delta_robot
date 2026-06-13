@@ -20,7 +20,8 @@ from modules.conveyor import (
 from modules.image_processing import ObjectDetection, SimulatedImageProcessing, VisionImageProcessing
 
 
-SCENARIO_NAMES = {"test_accuracy", "test_throughput", "evaluate", "production"}
+SCENARIO_NAMES = {"test_accuracy", "test_throughput", "evaluate", "production",
+                  "test_conveyor", "test_vision_only"}
 
 Position3D = tuple[float, float, float]
 
@@ -234,6 +235,8 @@ class SchedulerSettings:
     evaluate_stability_arm_mm: float = 3.0
     # Offset added to the vision angle_deg before sending rotate_absolute.
     rotate_offset_deg: float = 0.0
+    # Fixed belt speed (mm/s) for test_conveyor scenario.
+    test_conveyor_belt_speed_mm_s: float = 50.0
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -388,6 +391,9 @@ class SchedulerSettings:
                 scheduler_raw.get("evaluate_stability_arm_mm", 3.0)
             ),
             rotate_offset_deg=float(scheduler_raw.get("rotate_offset_deg", 0.0)),
+            test_conveyor_belt_speed_mm_s=float(
+                scheduler_raw.get("test_conveyor_belt_speed_mm_s", 50.0)
+            ),
         )
         settings.validate()
         return settings
@@ -423,6 +429,18 @@ class SimulatedSpeedSource:
             return SpeedSample(
                 vx=0.0, vy=0.0, timestamp=now,
                 position_mm=self._integrated_position_mm, speed_uv=0.0,
+            )
+
+        if self.scenario_name in ("test_conveyor", "test_vision_only"):
+            scalar = self.settings.test_conveyor_belt_speed_mm_s
+            if self._last_sample_time is not None:
+                dt = max(0.0, now - self._last_sample_time)
+                self._integrated_position_mm += scalar * dt
+            self._last_sample_time = now
+            vx, vy = self.frame.velocity_to_robot(scalar)
+            return SpeedSample(
+                vx=vx, vy=vy, timestamp=now,
+                position_mm=self._integrated_position_mm, speed_uv=scalar,
             )
 
         elapsed = now - self.start_time
@@ -553,6 +571,16 @@ class SimulatedExecutor:
         with self.log_path.open("a", encoding="utf-8") as handle:
             for entry in trace_entries:
                 handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+class NullExecutor:
+    """For test_vision_only: marks plans completed immediately without sending any robot commands."""
+
+    def __init__(self) -> None:
+        pass
+
+    def execute(self, plan: PickPlan, *, log_samples=False, real_time=False, scenario_name="") -> None:
+        plan.status = "completed"
 
 
 class RealRobotExecutor:
@@ -1738,7 +1766,7 @@ def run_scheduler_scenario(
     *,
     duration_s: float | None,
     interpolar_points: int,
-    executor: SimulatedExecutor | RealRobotExecutor | None = None,
+    executor: SimulatedExecutor | RealRobotExecutor | NullExecutor | None = None,
 ) -> None:
     if scenario_name not in SCENARIO_NAMES:
         known = ", ".join(sorted(SCENARIO_NAMES))
@@ -1753,7 +1781,8 @@ def run_scheduler_scenario(
 
     start_time = time.monotonic()
     vision_config = dict(getattr(config, "vision", {}) or {})
-    if scenario_name == "production":
+    _vision_scenarios = ("production", "test_conveyor", "test_vision_only")
+    if scenario_name in _vision_scenarios:
         image_processing: SimulatedImageProcessing | VisionImageProcessing = VisionImageProcessing(
             vision_config, start_time
         )
@@ -1782,7 +1811,10 @@ def run_scheduler_scenario(
         encoder_constant_mm_per_pulse=settings.encoder_constant_mm_per_pulse
     )
     if executor is None:
-        executor = SimulatedExecutor(settings.log_path, settings.poll_interval_s)
+        if scenario_name == "test_vision_only":
+            executor: Any = NullExecutor()
+        else:
+            executor = SimulatedExecutor(settings.log_path, settings.poll_interval_s)
         speed_source: Any = SimulatedSpeedSource(
             scenario_name, settings, start_time, frame
         )
@@ -1810,11 +1842,27 @@ def run_scheduler_scenario(
         print(f"[INFO] Scenario duration: {duration_s:.2f}s")
 
     deadline = None if duration_s is None else start_time + duration_s
+    _conveyor_speed_sent = False
     try:
         while True:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 break
+
+            # Send conveyor speed command once at the start of test_conveyor.
+            if scenario_name == "test_conveyor" and not _conveyor_speed_sent:
+                _conveyor_speed_sent = True
+                if hasattr(executor, "dispatch"):
+                    try:
+                        executor.dispatch({
+                            "commandID": COMMAND_ID["change_speed"],
+                            "CommandID": COMMAND_ID["change_speed"],
+                            "rotate": 0.0,
+                            "speed": settings.test_conveyor_belt_speed_mm_s,
+                        })
+                        print(f"[INFO] Conveyor speed set to {settings.test_conveyor_belt_speed_mm_s} mm/s")
+                    except Exception as exc:
+                        print(f"[WARN] Could not set conveyor speed: {exc}")
 
             # Sample speed FIRST so that ingest_detections can anchor detections
             # to the latest encoder reading.
@@ -1827,6 +1875,13 @@ def run_scheduler_scenario(
             plan = scheduler.plan_next(now)
             if plan is not None:
                 print("[PLAN]", json.dumps(plan.to_summary(), ensure_ascii=True))
+                if scenario_name == "test_vision_only":
+                    print("[PREDICT]", json.dumps({
+                        "t": round(now - start_time, 3),
+                        "x": round(plan.predicted_pick_position_2d[0], 2),
+                        "y": round(plan.predicted_pick_position_2d[1], 2),
+                        "z": round(plan.predicted_pick_position_2d[2], 2),
+                    }, ensure_ascii=True))
                 try:
                     executor.execute(
                         plan,
