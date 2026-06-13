@@ -417,6 +417,13 @@ aligned; no padding is needed or inserted).
 
 ---
 
+## 7.1 Frames Convention (per `doc/frames.png`)
+
+- Camera frame and conveyor frame share the paper-aligned axes: `x_cam = x_con` horizontal-right, `y_cam = y_con` vertical-up.
+- Robot frame is rotated about Z by angle θ relative to the conveyor frame. `F_CONVEYOR_TO_ROBOT` in [modules/conveyor.py](../modules/conveyor.py) has first column `(sin θ, cos θ)` and second column `(-cos θ, sin θ)` to reflect this; the translation column `(t_x, t_y)` is a placeholder until physical calibration.
+- Consequence: any "drop point" used by simulations or scenarios should be expressed in C-frame `(u, v)` and projected through F at runtime. Hardcoding R-frame coordinates couples the test to the placeholder `(t_x, t_y)` and produces visually-misleading trajectories.
+- `config.json.conveyor.accuracy_points_uv` (C-frame) is now the preferred source of evaluate-scenario targets; the legacy R-frame `scheduler.accuracy_points` remains only as a fallback.
+
 ## 8. Implementation Order
 
 | Phase | Scope | Status |
