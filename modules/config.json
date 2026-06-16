@@ -10,7 +10,7 @@
         "TQFP": {"destination": "TQFP", "thickness_mm": 1.6, "w": 40.0, "h": 50.0}
     },
     "conveyor": {
-        "encoder_constant_mm_per_pulse": 0.1,
+        "conveyor_position_scale_mm": 10.0,
         "length_mm": 800.0,
         "camera_window_uv": [50.0, 250.0, -75.0, 75.0],
         "workspace_window_uv": [450.0, 620.0, -65.0, 65.0],
@@ -36,7 +36,9 @@
         "class_map": {"QFP": "QFP", "TQFP": "TQFP"},
         "camera_usb_id": "0c45:636b",
         "camera_source": null,
-        "min_conf": null
+        "min_conf": null,
+        "show_window": true,
+        "camera_controls": {"exposure_dynamic_framerate": 0}
     },
     "scheduler": {
         "home_position": [

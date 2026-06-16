@@ -65,7 +65,7 @@ It contains the current status, command mapping, PLC data contract, and verifica
 | 4 | `rotate` | REAL | 4 B |
 | 8 | `speed` | REAL | 4 B |
 
-**DB2 (PLC → PC, 24 bytes total):**
+**DB2 (PLC → PC, 20 bytes total):**
 
 | Offset | Python field | PLC type | Size |
 |--------|-------------|----------|------|
@@ -73,9 +73,9 @@ It contains the current status, command mapping, PLC data contract, and verifica
 | 4 | `speed_current` | REAL | 4 B |
 | 8 | `task_doing` | DINT | 4 B |
 | 12 | `task_state` | DINT | 4 B |
-| 16 | `encoderA` | DINT | 4 B |
-| 20 | `encoderB` | DINT | 4 B |
+| 16 | `conveyor_position` | REAL | 4 B |
 
+- `conveyor_position` is the belt position in **cm** (the PLC accumulates and reports it pre-decoded). The PC multiplies by `conveyor.conveyor_position_scale_mm` (default 10.0) to get mm. This replaced the former raw `encoderA`/`encoderB` quadrature counts (DB2 shrank from 24 → 20 bytes).
 - TIA Portal DB must have **"Optimized block access" disabled** for snap7 raw byte access to work.
 - CPU must have **"Permit access with PUT/GET"** enabled under Protection & Security.
 

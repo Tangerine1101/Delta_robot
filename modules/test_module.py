@@ -45,12 +45,9 @@ class FakePLCState:
         self.speed_current = 80.0
         self.siemens_task_doing = 0
         self.siemens_task_state = 0
-        # Fake quadrature encoder state — accumulated counts; both channels
-        # advance together (PLC firmware does X4 decoding upstream).
-        self.encoderA: int = 0
-        self.encoderB: int = 0
-        self.encoder_pulse_distance_mm: float = 0.1  # mm per pulse on the fake belt
-        self._encoder_residual_mm: float = 0.0  # carry-over between ticks
+        # Fake belt position — the PLC reports it pre-decoded in cm (REAL).
+        self.conveyor_position: float = 0.0  # cm
+        self._belt_position_mm: float = 0.0  # internal accumulator (mm)
         self._encoder_last_tick: float = time.monotonic()
         self.accumulated_pc_package = {
             "commandID": COMMAND_ID["stop"],
@@ -116,17 +113,14 @@ class FakePLCState:
         return values
 
     def _advance_encoder(self) -> None:
-        """Accumulate encoder counts since the last call based on current belt speed."""
+        """Advance the fake belt position since the last call based on current belt speed."""
         now = time.monotonic()
         dt = max(0.0, now - self._encoder_last_tick)
         self._encoder_last_tick = now
-        if dt <= 0.0 or self.encoder_pulse_distance_mm <= 0.0:
+        if dt <= 0.0:
             return
-        distance_mm = self.speed_current * dt + self._encoder_residual_mm
-        pulses = int(distance_mm / self.encoder_pulse_distance_mm)
-        self._encoder_residual_mm = distance_mm - pulses * self.encoder_pulse_distance_mm
-        self.encoderA += pulses
-        self.encoderB += pulses
+        self._belt_position_mm += self.speed_current * dt
+        self.conveyor_position = self._belt_position_mm / 10.0  # mm -> cm
 
     def get_siemens_status(self) -> dict[str, Any]:
         """Return current Siemens state without executing any command (side-effect free)."""
@@ -137,8 +131,7 @@ class FakePLCState:
                 "speed_current": self.speed_current,
                 "task_doing": self.siemens_task_doing,
                 "task_state": self.siemens_task_state,
-                "encoderA": self.encoderA,
-                "encoderB": self.encoderB,
+                "conveyor_position": self.conveyor_position,
             }
         return response
 
@@ -170,8 +163,7 @@ class FakePLCState:
                 "speed_current": self.speed_current,
                 "task_doing": self.siemens_task_doing,
                 "task_state": self.siemens_task_state,
-                "encoderA": self.encoderA,
-                "encoderB": self.encoderB,
+                "conveyor_position": self.conveyor_position,
             }
 
         self.log_event("accept_siemens", response)
@@ -291,8 +283,7 @@ class FakePLCState:
             "speed_current": self.speed_current,
             "siemens_task_doing": self.siemens_task_doing,
             "siemens_task_state": self.siemens_task_state,
-            "encoderA": self.encoderA,
-            "encoderB": self.encoderB,
+            "conveyor_position": self.conveyor_position,
         })
         parts = []
         for key, value in pkg.items():

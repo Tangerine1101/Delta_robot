@@ -11,9 +11,9 @@ from typing import Any
 
 from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config
 from modules.conveyor import (
+    BeltPositionTracker,
     BeltTracker,
     ConveyorFrame,
-    EncoderDecoder,
     TrackedObject,
     UVWindow,
 )
@@ -32,7 +32,7 @@ class SpeedSample:
     vy: float
     timestamp: float
     # Belt position along +u in C-frame (mm). Used as the anchor reference for
-    # encoder-based dead reckoning. May be 0.0 if no encoder source is wired up.
+    # belt-position dead reckoning. May be 0.0 if no belt-position source is wired up.
     position_mm: float = 0.0
     # Scalar belt speed along +u in C-frame (mm/s). Phase 1 keeps both the
     # scalar and the projected (vx, vy) so callers can pick whichever they need.
@@ -204,7 +204,7 @@ class SchedulerSettings:
     workspace_window_uv: UVWindow            # (u_min, u_max, v_min, v_max) on belt
     camera_window_uv: UVWindow
     conveyor_length_mm: float
-    encoder_constant_mm_per_pulse: float
+    conveyor_position_scale_mm: float   # multiply incoming conveyor_position (cm) by this to get mm
     object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
     # Optional C-frame (u, v, z) test points inside workspace_window_uv. When
@@ -354,8 +354,8 @@ class SchedulerSettings:
                 (0.0, 200.0, -75.0, 75.0),
             ),
             conveyor_length_mm=float(conveyor_raw.get("length_mm", 800.0)),
-            encoder_constant_mm_per_pulse=float(
-                conveyor_raw.get("encoder_constant_mm_per_pulse", 0.1)
+            conveyor_position_scale_mm=float(
+                conveyor_raw.get("conveyor_position_scale_mm", 10.0)
             ),
             object_dimensions=object_dimensions,
             accuracy_points=accuracy_points,
@@ -460,20 +460,22 @@ class SimulatedSpeedSource:
         )
 
 
-class EncoderSpeedSource:
-    """Derive belt speed and position from the Siemens encoderA/encoderB fields."""
+class ConveyorSpeedSource:
+    """Derive belt speed and position from the Siemens `conveyor_position` field (cm)."""
 
     def __init__(
         self,
         request_status,
         frame: ConveyorFrame,
-        decoder: EncoderDecoder,
+        decoder: BeltPositionTracker,
         scenario_name: str = "",
+        position_scale_mm: float = 10.0,
     ) -> None:
         self.request_status = request_status
         self.frame = frame
         self.decoder = decoder
         self.scenario_name = scenario_name
+        self.position_scale_mm = float(position_scale_mm)
 
     def sample(self, now: float) -> SpeedSample:
         if self.scenario_name == "test_accuracy":
@@ -485,14 +487,13 @@ class EncoderSpeedSource:
         try:
             status = self.request_status()
         except Exception as exc:
-            print(f"[WARN] EncoderSpeedSource failed to read status: {exc}")
+            print(f"[WARN] ConveyorSpeedSource failed to read status: {exc}")
             status = None
 
         if status is not None:
-            encoder_a = status.get("encoderA")
-            encoder_b = status.get("encoderB")
-            if encoder_a is not None and encoder_b is not None:
-                self.decoder.update(int(encoder_a), int(encoder_b), now)
+            conveyor_position = status.get("conveyor_position")
+            if conveyor_position is not None:
+                self.decoder.update(float(conveyor_position) * self.position_scale_mm, now)
 
         scalar = self.decoder.velocity_mm_per_s
         vx, vy = self.frame.velocity_to_robot(scalar)
@@ -1807,9 +1808,7 @@ def run_scheduler_scenario(
         workspace_window_uv=settings.workspace_window_uv,
         stale_timeout_s=settings.stale_timeout_s,
     )
-    decoder = EncoderDecoder(
-        encoder_constant_mm_per_pulse=settings.encoder_constant_mm_per_pulse
-    )
+    decoder = BeltPositionTracker()
     if executor is None:
         if scenario_name == "test_vision_only":
             executor: Any = NullExecutor()
@@ -1820,8 +1819,9 @@ def run_scheduler_scenario(
         )
     else:
         if hasattr(executor, "request_status"):
-            speed_source = EncoderSpeedSource(
-                executor.request_status, frame, decoder, scenario_name
+            speed_source = ConveyorSpeedSource(
+                executor.request_status, frame, decoder, scenario_name,
+                position_scale_mm=settings.conveyor_position_scale_mm,
             )
         else:
             speed_source = SimulatedSpeedSource(
@@ -1895,11 +1895,19 @@ def run_scheduler_scenario(
                     break
                 scheduler.mark_completed(plan)
 
+            # Pump the live camera window on the MAIN thread (Qt requirement).
+            if hasattr(image_processing, "render_window"):
+                if not image_processing.render_window():
+                    print("\n[INFO] Vision window closed by user (q)")
+                    break
+
             time.sleep(settings.poll_interval_s)
     except KeyboardInterrupt:
         print("\n[INFO] Scheduler scenario interrupted by user")
     finally:
         if hasattr(image_processing, "stop"):
             image_processing.stop()
+        if hasattr(image_processing, "close_window"):
+            image_processing.close_window()
 
     print("[INFO] Scheduler metrics:", json.dumps(scheduler.metrics.as_dict(), ensure_ascii=True))

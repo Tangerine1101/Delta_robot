@@ -39,6 +39,43 @@ python3 main.py --cli
 python3 main.py --scheduler --scenario test_throughput
 ```
 
+### 1.5. Camera scenarios + live overlay window
+Scenarios that use the real camera open a window showing each tracked board/marker
+(object id, position, rotation angle) plus camera-capture and inference (GPU-max) FPS.
+Set `vision.show_window=false` in `config.json` to run headless.
+```bash
+# Vision only — real camera, no robot; predicted picks shown on the run_test.py plot
+python3 run_test.py --scenario test_vision_only --duration 20
+
+# Conveyor test — real camera + robot + Siemens conveyor_position belt feedback
+python3 run_test.py --scenario test_conveyor --duration 30
+
+# Standalone vision (runs YOLO + shows the same window; q or Ctrl-C to quit)
+python3 -m modules.image_processing                 # runs until q / Ctrl-C
+python3 -m modules.image_processing --duration 15   # or run for a fixed time
+python3 -m modules.image_processing --no-window      # headless (no window)
+```
+> The window is pumped on the main thread; press **q** in the window or **Ctrl-C**
+> in the terminal to stop. Run from the project root using the `.venv` interpreter
+> (`.venv/bin/python -m modules.image_processing`) so `ultralytics`/`opencv` resolve.
+>
+> **Camera FPS notes**: the capture loop runs on its own thread so `CAM` FPS reflects the
+> camera's true rate. USB webcams only reach their rated FPS in **MJPG** (set automatically)
+> and with `exposure_dynamic_framerate=0` (set automatically via `v4l2-ctl`; tune through
+> `vision.camera_controls`) — otherwise auto-exposure throttles them (~30→~18) in dim light.
+> With YOLO inference running concurrently, effective capture settles lower (~17–20 fps) due
+> to the CPython GIL; `PROC` FPS shows the model's per-frame throughput.
+
+### 1.6. Scenarios
+| Scenario | Vision | Robot | Belt source | Camera window | Entry points |
+|----------|--------|-------|-------------|---------------|--------------|
+| `test_throughput` | simulated | sim/real | synthetic | no | main.py, run_test.py |
+| `test_accuracy` | simulated | sim/real | none (static) | no | main.py, run_test.py |
+| `evaluate` | simulated | sim/real | synthetic | no | main.py, run_test.py |
+| `test_vision_only` | real camera | none | sim / `conveyor_position` | yes | main.py (`--simulate-executor`), run_test.py |
+| `test_conveyor` | real camera | real | `conveyor_position` (Siemens) | yes | main.py, run_test.py |
+| `production` | real camera | real | `conveyor_position` (Siemens) | yes | main.py only |
+
 ---
 
 ## 2. Basic Logic & Architecture
@@ -68,7 +105,7 @@ python3 main.py --scheduler --scenario test_throughput
   - Worker Process (`multiprocessing` queue): PLCGateway communication to eliminate network latency blocking.
 * **PLC Package Contract**: Fixed 4-slot coordinate arrays sent to the `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
 * **Interception Math**: Predicts conveyor interception using the object's initial position, dynamic 2D speed vector `[vx, vy]`, and a fixed-point iteration search. The default simulated conveyor moves along positive Y while X stays fixed per lane.
-* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of actual conveyor speed. The PC is solely responsible for reading encoder speed from the Siemens S7-1200, planning the interception trajectory, computing the optimal pick timing, and sending pre-calculated static coordinates to the Omron PLC. The robot simply executes the received coordinates.
+* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of actual conveyor speed. The PC is solely responsible for reading the belt position (`conveyor_position`, cm) from the Siemens S7-1200 and deriving speed from it, planning the interception trajectory, computing the optimal pick timing, and sending pre-calculated static coordinates to the Omron PLC. The robot simply executes the received coordinates.
 * **4-Point/2-Phase Trajectory**: Moves in a `goto` phase followed by a `pick` phase. `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not flat-then-vertical moves.
 * **Timing Compensation**: Command is dispatched ahead of interception to account for mechanics and communication:
   $$t_{\text{dispatch}} = t_{\text{pick}} - t_{\text{robot\_movement\_delay}} - t_{\text{ethernet\_delay}}$$

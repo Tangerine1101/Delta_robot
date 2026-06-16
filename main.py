@@ -77,8 +77,7 @@ def _worker(
                                     "speed_current": s_status.get("speed_current"),
                                     "siemens_task_doing": s_status.get("task_doing"),
                                     "siemens_task_state": s_status.get("task_state"),
-                                    "encoderA": s_status.get("encoderA"),
-                                    "encoderB": s_status.get("encoderB"),
+                                    "conveyor_position": s_status.get("conveyor_position"),
                                 })
                         except Exception as s_exc:
                             print(f"[WARN] Failed to query Siemens status: {s_exc}")

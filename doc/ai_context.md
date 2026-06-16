@@ -1,6 +1,6 @@
 # AI Context Summary: Delta Robot
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
-> **Status**: Phase 3 image processing integrated. `VisionImageProcessing` (YOLO26-OBB + centroid tracker) runs in-process via background thread. Scenario `production` wires real camera into the scheduler. Object types renamed to match vision: `QFP` / `TQFP`.
+> **Status**: Phase 3 image processing integrated. `VisionImageProcessing` (YOLO26-OBB + centroid tracker) runs in-process via background thread and opens a live overlay window (boxes + id/pos/angle + CAM/PROC FPS). Belt position now arrives pre-decoded from Siemens as a single `conveyor_position` field (cm); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_conveyor`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
 
 ---
 
@@ -14,12 +14,12 @@
   * [README.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/README.md): Quickstart and repository entry overview.
 * **`modules/`**: Contains the active logic of the system:
   * [scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py): Core path planning, safety checks, simulated speed/perception, and executor management. Now operates in conveyor C-frame for pickup prediction.
-  * [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py): Conveyor frame F, camera frame M, `EncoderDecoder` (encoderA/B → mm), `BeltTracker` for on-belt object tracking.
+  * [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py): Conveyor frame F, camera frame M, `BeltPositionTracker` (PLC `conveyor_position` cm → mm + velocity), `BeltTracker` for on-belt object tracking.
   * [EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication gateway (PLCGateway) using `pylogix` for Omron.
   * [cli.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): Command parser.
-  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO26-OBB pipeline in background thread). Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`.
-  * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits encoder counts proportional to `speed_current`.
-  * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (encoder_constant, length_mm, camera_window_uv, workspace_window_uv) and per-PCB `w`/`h` dimensions.
+  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO26-OBB pipeline in background thread). Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`. Opens a live overlay window (boxes + id/pos/angle + CAM/PROC FPS) by default for camera scenarios; disable with `vision.show_window=false`.
+  * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits `conveyor_position` (cm) integrated from `speed_current`.
+  * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (`conveyor_position_scale_mm`, length_mm, camera_window_uv, workspace_window_uv), `vision.show_window`, and per-PCB `w`/`h` dimensions.
 * **`doc/`**:
   * [system_reference.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/system_reference.md): Full technical, mathematical, and architectural reference manual.
   * [ai_context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/ai_context.md): This file.
@@ -77,17 +77,39 @@ Siemens S7-1200 package structure (PC → PLC):
 }
 ```
 
-Siemens S7-1200 status structure (PLC → PC, 24 bytes Phase 1):
+Siemens S7-1200 status structure (PLC → PC, **20 bytes**):
 ```python
 {
     "rotate_current": float,
     "speed_current": float,
     "task_doing": int,
     "task_state": int,
-    "encoderA": int,   # raw quadrature count A
-    "encoderB": int,   # raw quadrature count B
+    "conveyor_position": float,   # belt position in cm (REAL @ DB2 offset 16); PC ×10 → mm
 }
 ```
+> Replaces the former raw `encoderA`/`encoderB` quadrature counts. The PLC now
+> accumulates and reports belt position directly. DB2 must be 20 bytes with
+> "Optimized block access" disabled (byte layout must match `SiemensReceivePacket`).
+
+### 1.4. Scenario Reference
+
+All scenarios are selected with `--scenario <name>`. `main.py` runs all six;
+`run_test.py` (subprocess + matplotlib plot) runs every scenario except `production`.
+
+| Scenario | Vision | Robot | Belt source | Camera window | Entry points |
+|----------|--------|-------|-------------|---------------|--------------|
+| `test_throughput` | simulated | sim/real | synthetic | no | main.py, run_test.py |
+| `test_accuracy` | simulated | sim/real | none (static) | no | main.py, run_test.py |
+| `evaluate` | simulated | sim/real | synthetic | no | main.py, run_test.py |
+| `test_vision_only` | **real camera** | none (`NullExecutor`) | sim / `conveyor_position` | **yes** | main.py (`--simulate-executor`), run_test.py |
+| `test_conveyor` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py, run_test.py |
+| `production` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py only |
+
+* `--simulate-executor` swaps the real PLC for `SimulatedExecutor`/`NullExecutor` and the belt
+  feed for `SimulatedSpeedSource` (fixed `test_conveyor_belt_speed_mm_s`). Without it, the
+  scheduler uses `RealRobotExecutor` + `ConveyorSpeedSource` (reads `conveyor_position`).
+* Camera-window scenarios also run standalone: `python3 -m modules.image_processing --duration N`
+  runs YOLO and shows the same overlay window (`--no-window` for headless).
 
 ---
 
@@ -137,9 +159,15 @@ python3 -m modules.test_module --port 1502 --self-test --duration 2.0
 # 5. Run evaluate scenario (continuous box <-> 3 accuracy_points; Ctrl-C to stop).
 python3 main.py --scheduler --scenario evaluate --simulate-executor --duration 10.0
 
-# 6. Vision smoke test (requires physical camera + board crossing trigger line)
-python3 -m modules.image_processing --duration 15
+# 6. Vision smoke test + overlay window (requires physical camera + board crossing trigger line)
+python3 -m modules.image_processing                        # runs until q / Ctrl-C (--duration N, --no-window)
 
 # 7. Production dry-run (real vision, simulated robot)
 python3 main.py --scheduler --scenario production --simulate-executor --duration 20
+
+# 8. Vision-only (real camera, no robot) — shows predicted picks on run_test.py plot
+python3 run_test.py --scenario test_vision_only --duration 20
+
+# 9. Conveyor test (real camera + robot + Siemens conveyor_position feedback)
+python3 run_test.py --scenario test_conveyor --duration 30
 ```

@@ -5,8 +5,8 @@ This module bundles:
 - The homogeneous transform F from conveyor frame (u, v) to robot frame (X, Y).
 - The homogeneous transform M_cam from camera pixels (px, py) directly to robot
   frame (X, Y). M_cam already absorbs the homography H (pixel -> conveyor) and F.
-- EncoderDecoder: converts raw (encoderA, encoderB) DINT counts to belt
-  position (mm) and velocity (mm/s).
+- BeltPositionTracker: stores the pre-decoded belt position (mm) reported by
+  the PLC (`conveyor_position`, cm) and derives velocity (mm/s).
 - BeltTracker: maintains the live list of objects sitting on the belt and
   computes their current robot-frame position from the encoder reading.
 
@@ -158,30 +158,24 @@ class CameraFrame:
 
 
 # ---------------------------------------------------------------------------
-# EncoderDecoder
+# BeltPositionTracker
 # ---------------------------------------------------------------------------
 
 
-class EncoderDecoder:
-    """Decode raw quadrature (encoderA, encoderB) into signed position and velocity.
+class BeltPositionTracker:
+    """Track belt position (mm) and derive velocity from a pre-decoded position.
 
-    The decoder is intentionally simple: it assumes the PLC HSC already
-    accumulates a consistent signed count on both channels. The signed count is
-    the average of the two channels to reject one-bit noise on either channel.
-    Multiply by encoder_constant_mm_per_pulse (signed) to get position in mm.
-    Velocity is the time derivative of position with a small EMA filter to
-    smooth jitter from polling jitter.
-
-    Final decode formula will be locked once the Siemens program is finalized;
-    revisit the body of update() then.
+    The Siemens program now sends the belt position directly (field
+    `conveyor_position`, in cm), so no quadrature decoding is needed here. Feed
+    `update(position_mm, now)` with the position already converted to mm; the
+    tracker stores it and computes velocity as the time derivative with a small
+    EMA filter to smooth polling jitter.
     """
 
     def __init__(
         self,
-        encoder_constant_mm_per_pulse: float,
         velocity_ema_alpha: float = 0.4,
     ) -> None:
-        self.encoder_constant = float(encoder_constant_mm_per_pulse)
         self.velocity_ema_alpha = float(velocity_ema_alpha)
         self._last_position_mm: float | None = None
         self._last_timestamp: float | None = None
@@ -189,14 +183,8 @@ class EncoderDecoder:
         self._velocity_mm_per_s: float = 0.0
         self._initialised: bool = False
 
-    @staticmethod
-    def _decode_signed_count(encoder_a: int, encoder_b: int) -> float:
-        """Combine the two channels into a single signed count."""
-        return (encoder_a + encoder_b) / 2.0
-
-    def update(self, encoder_a: int, encoder_b: int, now: float) -> None:
-        signed_count = self._decode_signed_count(encoder_a, encoder_b)
-        new_position = signed_count * self.encoder_constant
+    def update(self, position_mm: float, now: float) -> None:
+        new_position = float(position_mm)
 
         if not self._initialised:
             self._position_mm = new_position
