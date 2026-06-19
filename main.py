@@ -8,7 +8,7 @@ from typing import Any
 
 from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
-from modules.scheduler import RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
+from modules.scheduler import NullExecutor, RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
 
 # How often (seconds) the worker probes the PLC connection when idle, to prevent
 # EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
@@ -290,13 +290,19 @@ def _run_scheduler(args: argparse.Namespace) -> None:
     scheduler_config = getattr(config, "scheduler", {}) or {}
     wait_margin_s = float(scheduler_config.get("execution_margin_s", 0.3))
     status_poll_interval_s = float(scheduler_config.get("poll_interval_s", 0.05))
-    executor = RealRobotExecutor(
-        dispatch,
-        request_status,
-        interpolar_points=args.interpolar_points,
-        wait_margin_s=wait_margin_s,
-        status_poll_interval_s=status_poll_interval_s,
-    )
+    if args.scenario == "test_vision_only":
+        # Connect the full PLC (Omron + Siemens) for live belt feedback, but keep
+        # the robot idle: NullExecutor reads conveyor_position and sends the belt
+        # speed command without dispatching any Omron trajectory.
+        executor = NullExecutor(dispatch=dispatch, request_status=request_status)
+    else:
+        executor = RealRobotExecutor(
+            dispatch,
+            request_status,
+            interpolar_points=args.interpolar_points,
+            wait_margin_s=wait_margin_s,
+            status_poll_interval_s=status_poll_interval_s,
+        )
 
     try:
         run_scheduler_scenario(

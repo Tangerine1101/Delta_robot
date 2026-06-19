@@ -34,14 +34,14 @@ from modules.image_processing import ObjectDetection
 
 # Belt placed in the (-X, +Y) quadrant of the robot at ~30 degrees off the
 # robot X-axis. Origin O_C at (-50, -100) in robot frame. Replace after calib.
-_THETA_RAD = math.radians(30.0)
+_THETA_RAD = math.radians(28.0)
 _COS_T = math.cos(_THETA_RAD)
 _SIN_T = math.sin(_THETA_RAD)
-_T_X = -50.0
-_T_Y = -100.0
+_T_X = 393.0
+_T_Y = 138.0
 
 F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (_SIN_T, -_COS_T, 485),
+    (_SIN_T, -_COS_T, _T_X),
     (_COS_T, _SIN_T, _T_Y),
     (0.0,     0.0,    1.0),
 )
@@ -50,8 +50,8 @@ F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
 # Placeholder: identity in u,v with a pixel-to-mm scale of 0.5 mm/pixel.
 # Replace with H homography times F once camera is calibrated.
 M_CAMERA_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (-_COS_T, _SIN_T, 20),
-    (_SIN_T,  _COS_T, 43),
+    (-_COS_T, _SIN_T, 133.0),
+    (_SIN_T,  _COS_T, 393.0),
     (0.0,     0.0,    1.0),
 )
 
@@ -59,8 +59,21 @@ M_CAMERA_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
 # Vision ROI origin = bottom-left of ROI polygon; X = cross-belt; Y = along belt (upstream→downstream).
 # Placeholder: u = y_mm + u_trigger_offset, v = x_mm + v_offset.
 # Replace matrix values after physical calibration of trigger-line position and belt alignment.
-_U_TRIGGER_OFFSET_MM = 500.0   # u position in C-frame where trigger line sits
-_V_BELT_CENTER_MM = 0.0        # v shift from ROI X-zero to belt centre
+#
+# INTERIM (not a real calibration): the trigger line lives in the camera's view,
+# which corresponds to camera_window_uv = [50, 250] (upstream). A board crossing
+# the trigger projects to y_mm ≈ 124, so an offset of ~25 puts it at u ≈ 150 —
+# near the camera-window centre and well below workspace u_max (620), so it
+# survives BeltTracker.prune. The old value of 500 dropped fresh detections at
+# u ≈ 624 (past u_max), making prune delete every detection before it was
+# reported. The ROI is ~135 mm wide with x_mm ∈ [0, 135]; shifting by ~-67
+# centres the belt at v ≈ 0 to match the windows' v ∈ [-65, 65].
+# NOTE on the U sign: BeltTracker.current_uv always ADDS delta_p as the belt
+# advances, so along-belt travel must INCREASE u. ROI y_mm decreases as a board
+# moves downstream, so on a moving-belt run the `+y_mm` term below likely needs
+# to become `-y_mm`; verify and flip once the belt is running.
+_U_TRIGGER_OFFSET_MM = 25.0    # u (mm) in C-frame where the trigger line sits
+_V_BELT_CENTER_MM = -67.0      # v shift from ROI X-zero to belt centre
 M_VISION_TO_CONVEYOR: tuple[tuple[float, float, float], ...] = (
     # row 0 → u = 0*x_mm + 1*y_mm + _U_TRIGGER_OFFSET_MM
     (0.0, 1.0, _U_TRIGGER_OFFSET_MM),

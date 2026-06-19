@@ -21,7 +21,8 @@ robot_positions = []     # tuples of (t_rel, x, y, z, e)  — from pos_EE (real/
 conveyor_speeds = []     # tuples of (t_rel, vx, vy)
 planned_waypoints = []   # tuples of (t_rel, x, y, z, e)  — from [TRAJ] lines (evaluate)
 cycle_metrics = []       # tuples of (t_rel, dict)          — from [CYCLE] lines (evaluate)
-predicted_positions = [] # tuples of (t_rel, x, y, z)      — from [PREDICT] lines (test_vision_only)
+predicted_positions = [] # tuples of (t_rel, x, y, z)      — from [PREDICT] lines (real scenarios)
+detected_objects = {}    # object_id -> (t_rel, x, y, z)    — from [DETECT] lines (live tracked objects)
 start_time = 0.0
 
 
@@ -97,13 +98,25 @@ def stream_output(process, prefix):
                         except Exception:
                             pass
 
-                # [PREDICT] lines (test_vision_only) — predicted pick positions
+                # [PREDICT] lines (real scenarios) — predicted pick positions
                 predict_match = re.search(r'\[PREDICT\]\s+(\{.*\})', cleaned)
                 if predict_match:
                     try:
                         d = json.loads(predict_match.group(1))
                         with data_lock:
                             predicted_positions.append((d["t"], d["x"], d["y"], d["z"]))
+                    except Exception:
+                        pass
+
+                # [DETECT] lines — live R-frame positions of every tracked object.
+                detect_match = re.search(r'\[DETECT\]\s+(\{.*\})', cleaned)
+                if detect_match:
+                    try:
+                        d = json.loads(detect_match.group(1))
+                        z = d.get("z", 0.0)
+                        with data_lock:
+                            for obj in d.get("objects", []):
+                                detected_objects[obj["id"]] = (d["t"], obj["x"], obj["y"], z)
                     except Exception:
                         pass
     process.stdout.close()
@@ -120,16 +133,13 @@ def main():
         "--duration",
         type=int,
         default=None,
-        help="Duration of the test in seconds",
+        help="Duration of the test in seconds (default: 99999 — effectively unlimited; "
+             "stop with Ctrl-C). Pass an explicit value to cap the run.",
     )
     args = parser.parse_args()
     if args.duration is None:
-        if args.scenario == "evaluate":
-            args.duration = 60
-        elif args.scenario in ("test_conveyor", "test_vision_only"):
-            args.duration = 30
-        else:
-            args.duration = 30
+        # Default to ~unlimited so a test runs until the operator stops it (Ctrl-C).
+        args.duration = 99999
 
     port = 1502
 
@@ -139,27 +149,20 @@ def main():
     # Determine subprocess commands based on scenario.
     _real_scenarios = {"test_conveyor", "test_vision_only"}
     if args.scenario in _real_scenarios:
-        # No fake PLC — connect directly to real hardware (or simulated executor).
+        # No fake PLC — connect directly to the real hardware. test_vision_only
+        # keeps the robot idle (NullExecutor in main.py) but still reads the real
+        # Siemens conveyor_position, so it needs the live PLC IP just like
+        # test_conveyor — never --simulate-executor (that fabricates belt speed).
         plc_cmd = None
-        if args.scenario == "test_vision_only":
-            main_cmd = [
-                sys.executable,
-                "main.py",
-                "--scheduler",
-                "--scenario", args.scenario,
-                "--simulate-executor",
-                "--duration", str(args.duration),
-            ]
-        else:  # test_conveyor — real PLC IP from config
-            main_cmd = [
-                sys.executable,
-                "main.py",
-                "--scheduler",
-                "--scenario", args.scenario,
-                "--ip", str(getattr(cfg_early, "ip_address", "192.168.250.1")),
-                "--port", str(getattr(cfg_early, "port", 44818)),
-                "--duration", str(args.duration),
-            ]
+        main_cmd = [
+            sys.executable,
+            "main.py",
+            "--scheduler",
+            "--scenario", args.scenario,
+            "--ip", str(getattr(cfg_early, "ip_address", "192.168.250.1")),
+            "--port", str(getattr(cfg_early, "port", 44818)),
+            "--duration", str(args.duration),
+        ]
     else:
         # Simulated scenarios — start fake PLC first.
         plc_cmd = [
@@ -269,11 +272,21 @@ def main():
                     with data_lock:
                         waypoints = list(planned_waypoints)
                         c_metrics = list(cycle_metrics)
+                        detected = dict(detected_objects)
+                        pred_snapshot = list(predicted_positions)
 
                     # Choose data source for 3D trajectory:
                     # evaluate: use planned waypoints; others: use pos_EE from PLC.
                     traj_source = waypoints if args.scenario == "evaluate" else positions
-                    has_data = len(traj_source) > 0 or len(positions) > 0
+                    # Also render when only vision data is present (test_vision_only
+                    # has no robot pos_EE), so detected objects still show up.
+                    has_data = (
+                        len(traj_source) > 0
+                        or len(positions) > 0
+                        or len(detected) > 0
+                        or len(pred_snapshot) > 0
+                        or len(c_speeds) > 0          # belt speed flows from t≈0 in vision scenarios
+                    )
 
                     if has_data:
                         ax_traj.clear()
@@ -336,9 +349,22 @@ def main():
                         ax_traj.scatter([bin2[0]], [bin2[1]], [pickup_height],
                                         color="#FF6F00", s=60, marker="s", label="TQFP bin")
 
-                        # --- Predicted pick positions (test_vision_only) ---
-                        with data_lock:
-                            pred_pts = list(predicted_positions[-50:])
+                        # --- Detected objects (live R-frame positions) ---
+                        # Keep only objects seen in the last ~1.5s (scheduler clock)
+                        # so stale markers fade as objects leave the belt.
+                        if detected:
+                            latest_t = max(v[0] for v in detected.values())
+                            fresh = [v for v in detected.values() if v[0] >= latest_t - 1.5]
+                            if fresh:
+                                dx = [v[1] for v in fresh]
+                                dy = [v[2] for v in fresh]
+                                dz = [v[3] for v in fresh]
+                                ax_traj.scatter(dx, dy, dz, color="#FFFFFF", s=45, marker="o",
+                                                edgecolors="#00F0FF", zorder=7,
+                                                label="Detected objects")
+
+                        # --- Predicted pick positions (real scenarios) ---
+                        pred_pts = pred_snapshot[-50:]
                         if pred_pts:
                             px = [p[1] for p in pred_pts]
                             py = [p[2] for p in pred_pts]

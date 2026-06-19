@@ -1,28 +1,57 @@
 """
-Image processing module.
+Image processing module — self-contained vision pipeline.
 
-- `SimulatedImageProcessing` — deterministic fake stream for test_accuracy /
-  test_throughput (no heavy dependencies).
-- `VisionImageProcessing` — real pipeline backed by the YOLO_OBB repo
-  (ultralytics + OpenCV). Runs the vision loop in a background daemon thread;
-  thread-safe `poll()` drains detections since the last call. Detections are
-  emitted in C-frame (u, v) via M_VISION_TO_CONVEYOR in conveyor.py.
-  Calibrate M_VISION_TO_CONVEYOR after physical rig setup.
+This module was rebuilt from scratch (the previous version was a fragile
+conversion of the teammate's ``YOLO_OBB/src/detect_realtime.py`` Windows/WSL
+script). It no longer imports anything from ``YOLO_OBB/`` at runtime and no
+longer reads ``system_config.yaml`` — every parameter comes from the ``vision``
+section of ``modules/config.json``.
+
+Two public detection sources, both exposing the same ``poll(now)`` interface:
+
+- ``SimulatedImageProcessing`` — deterministic fake stream for the offline
+  scheduler scenarios (test_accuracy / test_throughput / evaluate). No heavy
+  dependencies.
+- ``VisionImageProcessing`` — real-time YOLO-OBB pipeline. Frames are captured
+  with **PyAV** (FFmpeg-backed) in a dedicated thread so the camera runs at its
+  true rate (~30 fps at 1080p MJPG); the previous ``cv2.VideoCapture`` V4L2
+  backend was the real <20 fps bottleneck, not the model or the GPU. Inference
+  runs in a second thread; the OpenCV GUI is pumped from the main thread (Qt
+  requirement). Detections are emitted in conveyor C-frame ``(u, v)`` via
+  ``modules.conveyor.M_VISION_TO_CONVEYOR``.
+
+Also computes a belt-speed estimate from object tracking
+(``BeltVelocityEstimator``). This is **informational only** — it is logged and
+drawn on the overlay but is NOT fed to the scheduler; the operational belt
+position/velocity still comes from the Siemens ``conveyor_position`` field.
 """
 from __future__ import annotations
 
 import collections
+import math
 import os
+import shutil
+import statistics
+import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # OpenCV's bundled Qt has no Wayland plugin; force xcb (X11/XWayland) so the live
-# window actually maps. Respects an explicit override if the user already set it.
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+# window actually maps. Override unconditionally — the desktop may export wayland.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
+# Stop ultralytics from auto-pip-installing optional deps (e.g. albumentations)
+# at predict time — that pulls in `opencv-python-headless`, which has NO GUI and
+# silently breaks `cv2.imshow` (the live window). Keep the GUI `opencv-python`.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
+
+# ---------------------------------------------------------------------------
+# Camera device helpers
+# ---------------------------------------------------------------------------
 
 def _find_camera_by_usb_id(vendor_product: str) -> int | None:
     """Find the lowest /dev/videoN index whose USB vendor:product matches.
@@ -68,31 +97,36 @@ def _find_camera_by_usb_id(vendor_product: str) -> int | None:
     return min(candidates) if candidates else None
 
 
-def _apply_v4l2_controls(device_index: int, controls: dict) -> None:
-    """Best-effort apply v4l2 controls to /dev/video{N} via `v4l2-ctl`.
+def _apply_v4l2_controls(device: str, controls: dict) -> None:
+    """Best-effort apply v4l2 controls to a /dev/videoN device via `v4l2-ctl`.
 
-    The key default control is `exposure_dynamic_framerate=0`: UVC webcams
-    otherwise let auto-exposure drop the frame rate well below the rated FPS in
-    dim light (e.g. 30 → ~18). No-op off Linux or when `v4l2-ctl` is absent.
+    Used to fix two camera quirks before opening the stream:
+      * ``exposure_dynamic_framerate=0`` — stop UVC auto-exposure from dropping
+        the frame rate in dim light.
+      * a short ``exposure_time_absolute`` (with ``auto_exposure=1`` manual) —
+        the exposure integration time must be < 1/fps or the sensor cannot
+        sustain the rated frame rate.
+    No-op off Linux or when `v4l2-ctl` is absent.
     """
     if not controls or sys.platform != "linux":
         return
-    import shutil
-    import subprocess
     if shutil.which("v4l2-ctl") is None:
         print("[VISION] v4l2-ctl not found — skipping camera control tuning "
               "(install v4l-utils for full FPS).")
         return
-    dev = f"/dev/video{device_index}"
     for name, value in controls.items():
         try:
             subprocess.run(
-                ["v4l2-ctl", "--device", dev, f"--set-ctrl={name}={value}"],
+                ["v4l2-ctl", "--device", device, f"--set-ctrl={name}={value}"],
                 check=False, capture_output=True, timeout=2.0,
             )
         except Exception as exc:
-            print(f"[VISION] Could not set {name}={value} on {dev}: {exc}")
+            print(f"[VISION] Could not set {name}={value} on {device}: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# Detection record (shared with the scheduler)
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ObjectDetection:
@@ -116,10 +150,14 @@ class ObjectDetection:
         }
 
 
+# ---------------------------------------------------------------------------
+# Simulated stream (unchanged behaviour — used by offline scheduler scenarios)
+# ---------------------------------------------------------------------------
+
 class SimulatedImageProcessing:
     """Deterministic fake object stream for scheduler development.
 
-    Phase 1: emits detections at C-frame `(u, v)` coordinates.
+    Emits detections at C-frame `(u, v)` coordinates.
     - `throughput_spawn_y` is reused as the upstream `u_spawn`.
     - `throughput_lanes` is reused as the per-object `v_lane` values.
     - `accuracy_spawn_uv`: list of [u, v] points inside workspace_window_uv used
@@ -181,254 +219,535 @@ class SimulatedImageProcessing:
         )
 
 
+# ===========================================================================
+# Core vision logic — inlined, self-contained (was YOLO_OBB/src/*)
+# ===========================================================================
+
+# An OBB detection tuple: (cx, cy, w, h, theta_rad, cls_id, conf)
+Obb = tuple[float, float, float, float, float, int, float]
+
+
+def normalize_angle_deg(theta_rad: float) -> float:
+    """Map an OBB angle (radians) to degrees in [-90, 90).
+
+    A rectangular board is symmetric under 180° rotation, so we fold the angle
+    into a half-open 180° window centred on 0 — the smallest rotation a gripper
+    must apply.
+    """
+    deg = math.degrees(theta_rad)
+    return (deg + 90.0) % 180.0 - 90.0
+
+
+def extract_obb(result, np_mod) -> list[Obb]:
+    """Return (cx, cy, w, h, theta_rad, cls_id, conf) for each OBB detection."""
+    obb = getattr(result, "obb", None)
+    if obb is None or obb.xywhr is None:
+        return []
+    xywhr = obb.xywhr.cpu().numpy()       # (N, 5): cx, cy, w, h, theta
+    cls = obb.cls.cpu().numpy().astype(int)
+    conf = obb.conf.cpu().numpy()
+    out: list[Obb] = []
+    for i in range(len(xywhr)):
+        cx, cy, w, h, theta = xywhr[i]
+        out.append((float(cx), float(cy), float(w), float(h), float(theta), int(cls[i]), float(conf[i])))
+    return out
+
+
+@dataclass
+class Track:
+    """A tracked centroid. Carries trigger state and per-frame velocity."""
+    id: int
+    cx: float
+    cy: float
+    t: float
+    missing: int = 0
+    prev_side: int = 0           # set by TriggerLine: -1 upstream, +1 downstream
+    triggered: bool = False
+    frames: int = 1              # consecutive frames matched
+    vx: float = 0.0              # px/s, last instantaneous velocity
+    vy: float = 0.0
+
+
+class CentroidTracker:
+    """Lightweight nearest-neighbour centroid tracker.
+
+    The belt is slow, single-lane, unidirectional and non-occluding, so heavy
+    trackers (ByteTrack/BoT-SORT) are unnecessary — we just need a stable id per
+    board so the trigger fires exactly once, plus a per-track velocity for the
+    belt-speed estimator.
+    """
+
+    def __init__(self, max_match_dist: float = 80.0, max_missing: int = 15) -> None:
+        self.max_match_dist = float(max_match_dist)
+        self.max_missing = int(max_missing)
+        self._next_id = 1
+        self.tracks: dict[int, Track] = {}
+
+    def update(self, detections: list[tuple[float, float]], now: float) -> dict[int, Track]:
+        """Match (cx, cy) centroids to nearest unclaimed track within
+        max_match_dist, else start a new track. Returns id -> Track for tracks
+        seen this frame, and updates per-track instantaneous velocity (px/s)."""
+        unmatched_ids = set(self.tracks.keys())
+        matched_ids: set[int] = set()
+
+        for cx, cy in detections:
+            best_id, best_d = None, self.max_match_dist
+            for tid in unmatched_ids:
+                t = self.tracks[tid]
+                d = math.hypot(t.cx - cx, t.cy - cy)
+                if d < best_d:
+                    best_id, best_d = tid, d
+            if best_id is None:
+                tid = self._next_id
+                self.tracks[tid] = Track(id=tid, cx=cx, cy=cy, t=now)
+                matched_ids.add(tid)
+                self._next_id += 1
+            else:
+                t = self.tracks[best_id]
+                dt = now - t.t
+                if dt > 0.0:
+                    t.vx = (cx - t.cx) / dt
+                    t.vy = (cy - t.cy) / dt
+                t.cx, t.cy, t.t, t.missing = cx, cy, now, 0
+                t.frames += 1
+                unmatched_ids.discard(best_id)
+                matched_ids.add(best_id)
+
+        # Age / retire tracks not matched this frame.
+        for tid in list(unmatched_ids):
+            t = self.tracks[tid]
+            t.missing += 1
+            if t.missing > self.max_missing:
+                del self.tracks[tid]
+
+        return {tid: self.tracks[tid] for tid in matched_ids}
+
+
+class TriggerLine:
+    """One-shot trigger-line crossing detector.
+
+    A board fires exactly once: when its tracked centroid transitions from the
+    UPSTREAM side of the fixed line to the DOWNSTREAM side.
+    """
+
+    def __init__(self, y_px: int, direction: str = "down") -> None:
+        self.y_px = int(y_px)
+        # +1 means downstream is the side with LARGER py (belt moves top->bottom)
+        self.sign = 1 if direction == "down" else -1
+
+    def _side(self, cy: float) -> int:
+        return 1 if (cy - self.y_px) * self.sign > 0 else -1
+
+    def crossed(self, track: Track) -> bool:
+        side = self._side(track.cy)
+        crossed = (not track.triggered) and track.prev_side == -1 and side == 1
+        track.prev_side = side
+        if crossed:
+            track.triggered = True
+        return crossed
+
+
+class RoiFrame:
+    """ROI polygon + precomputed coordinate basis.
+
+    Origin O = polygon[3] (bottom-left); X axis = O→polygon[2] (bottom-right);
+    Y axis = O→polygon[0] (top-left). `to_mm` projects a pixel onto that frame
+    and scales by pixels_per_mm. The basis is computed once (the old code
+    recomputed it for every detection).
+    """
+
+    def __init__(self, polygon, pixels_per_mm: float, np_mod, cv2_mod) -> None:
+        self._np = np_mod
+        self._cv2 = cv2_mod
+        self.pixels_per_mm = float(pixels_per_mm)
+        self.poly = np_mod.array(polygon, dtype=np_mod.int32) if polygon else None
+        self._ok = False
+        if self.poly is not None and len(self.poly) >= 4 and self.pixels_per_mm > 0:
+            O = self.poly[3].astype(float)
+            Xp = self.poly[2].astype(float)
+            Yp = self.poly[0].astype(float)
+            xlen = float(np_mod.linalg.norm(Xp - O))
+            ylen = float(np_mod.linalg.norm(Yp - O))
+            if xlen > 0 and ylen > 0:
+                self._O = O
+                self._Xu = (Xp - O) / xlen
+                self._Yu = (Yp - O) / ylen
+                self._ok = True
+
+    def contains(self, cx: float, cy: float) -> bool:
+        if self.poly is None:
+            return True
+        return self._cv2.pointPolygonTest(self.poly, (float(cx), float(cy)), False) >= 0
+
+    def to_mm(self, cx: float, cy: float) -> tuple[float, float]:
+        """Project (cx, cy) px onto the ROI frame and return (x_mm, y_mm)."""
+        if not self._ok:
+            return cx / self.pixels_per_mm, cy / self.pixels_per_mm
+        v = self._np.array([cx, cy], dtype=float) - self._O
+        x_px = float(self._np.dot(v, self._Xu))
+        y_px = float(self._np.dot(v, self._Yu))
+        return x_px / self.pixels_per_mm, y_px / self.pixels_per_mm
+
+
+def _obb_corners(board: Obb, cv2_mod, np_mod):
+    cx, cy, w, h, theta = board[0], board[1], board[2], board[3], board[4]
+    return cv2_mod.boxPoints(((cx, cy), (w, h), math.degrees(theta))).astype(np_mod.float32)
+
+
+def pick_marker(board: Obb, markers: list[Obb], names: dict, marker_map: dict,
+                cv2_mod, np_mod, max_dist_px: float | None = None):
+    """Pick the marker belonging to `board` and the PCB type it implies.
+
+    A marker whose centre lies INSIDE the board OBB is a definitive association,
+    so the closest such marker is returned unconditionally (no distance gate) —
+    this is what makes a larger board like TQFP work, whose own marker sits ~22 mm
+    from the centre, beyond any fixed `max_dist_px`. Only when no marker lies
+    inside the OBB do we fall back to the globally closest marker, gated by
+    `max_dist_px` (prevents cross-board association when boards sit close together).
+    Returns (marker_tuple_or_None, inferred_type_or_None).
+    """
+    if not markers:
+        return None, None
+    bx, by = board[0], board[1]
+    corners = _obb_corners(board, cv2_mod, np_mod)
+    inside = [m for m in markers
+              if cv2_mod.pointPolygonTest(corners, (float(m[0]), float(m[1])), False) >= 0]
+    if inside:
+        m = min(inside, key=lambda mk: (mk[0] - bx) ** 2 + (mk[1] - by) ** 2)
+        return m, marker_map.get(names[m[5]])
+
+    # Fallback: no marker inside the board — take the globally closest, but only
+    # if it is near enough to plausibly belong to this board.
+    m = min(markers, key=lambda mk: (mk[0] - bx) ** 2 + (mk[1] - by) ** 2)
+    if max_dist_px is not None and math.hypot(m[0] - bx, m[1] - by) > max_dist_px:
+        return None, None
+    return m, marker_map.get(names[m[5]])
+
+
+def heading_from_marker_vector(board: Obb, marker, offset_deg: float = 0.0) -> float | None:
+    """Heading in [0, 360) — angle of the board→marker vector vs downward (0,1),
+    clockwise (0°=marker below, 90°=right, 180°=above, 270°=left). None if no marker."""
+    if marker is None:
+        return None
+    dx = marker[0] - board[0]
+    dy = marker[1] - board[1]
+    return (math.degrees(math.atan2(dx, dy)) + offset_deg) % 360.0
+
+
+def resolve_heading_360(board: Obb, marker, offset_deg: float, symmetry_deg: float) -> float:
+    """Board heading in [0, 360) using the marker to break shape symmetry.
+    Falls back to the OBB angle folded into [0, symmetry_deg) when no marker."""
+    theta = math.degrees(board[4])
+    if marker is None:
+        return (theta % symmetry_deg + offset_deg) % 360.0
+    to_marker = math.degrees(math.atan2(marker[1] - board[1], marker[0] - board[0]))
+    n = max(1, round(360.0 / symmetry_deg))
+    best, best_d = theta, 1e9
+    for k in range(n):
+        cand = theta + k * symmetry_deg
+        d = abs(((cand - to_marker + 180.0) % 360.0) - 180.0)
+        if d < best_d:
+            best_d, best = d, cand
+    return (best + offset_deg) % 360.0
+
+
 # ---------------------------------------------------------------------------
-# Real vision pipeline backed by the YOLO_OBB repo
+# Belt-speed estimator from object tracking (informational only)
+# ---------------------------------------------------------------------------
+
+class BeltVelocityEstimator:
+    """Estimate belt speed (mm/s) from tracked-object displacement.
+
+    For every track seen for at least `min_track_frames`, the centroid velocity
+    (px/s) is known. We take the median of the belt-axis component across tracks
+    (robust to a single mis-tracked box) and EMA-smooth it, then convert px/s →
+    mm/s with `pixels_per_mm`.
+
+    NOTE: this is NOT used for operation. The scheduler's belt position/velocity
+    still comes from the Siemens `conveyor_position` field. This estimate is for
+    cross-checking / future calibration only.
+    """
+
+    def __init__(self, pixels_per_mm: float, axis: str = "y",
+                 ema_alpha: float = 0.3, min_track_frames: int = 3) -> None:
+        self.pixels_per_mm = float(pixels_per_mm)
+        self.axis = axis  # 'y' = vertical belt motion, 'x' = horizontal, 'mag' = magnitude
+        self.ema_alpha = float(ema_alpha)
+        self.min_track_frames = int(min_track_frames)
+        self._velocity_mm_per_s = 0.0
+        self._n_tracks = 0
+        self._initialised = False
+
+    def _component(self, trk: Track) -> float:
+        if self.axis == "x":
+            return trk.vx
+        if self.axis == "mag":
+            return math.hypot(trk.vx, trk.vy)
+        return trk.vy
+
+    def update(self, active_tracks: dict[int, Track]) -> float:
+        comps = [self._component(t) for t in active_tracks.values()
+                 if t.frames >= self.min_track_frames]
+        self._n_tracks = len(comps)
+        if comps:
+            inst_px = statistics.median(comps)
+            inst_mm = inst_px / self.pixels_per_mm if self.pixels_per_mm > 0 else 0.0
+            if not self._initialised:
+                self._velocity_mm_per_s = inst_mm
+                self._initialised = True
+            else:
+                self._velocity_mm_per_s = (
+                    self.ema_alpha * inst_mm + (1.0 - self.ema_alpha) * self._velocity_mm_per_s
+                )
+        return self._velocity_mm_per_s
+
+    @property
+    def velocity_mm_per_s(self) -> float:
+        return self._velocity_mm_per_s
+
+    @property
+    def n_tracks(self) -> int:
+        return self._n_tracks
+
+
+# ---------------------------------------------------------------------------
+# Real vision pipeline (PyAV capture + YOLO-OBB inference)
 # ---------------------------------------------------------------------------
 
 class VisionImageProcessing:
-    """Real-time YOLO26-OBB detection running in a background thread.
+    """Real-time YOLO-OBB detection with a PyAV capture backend.
 
-    Drop-in replacement for SimulatedImageProcessing with the same `poll(now)`
-    interface. Imports ultralytics/cv2/numpy lazily so simulated scenarios
-    never need those packages.
+    Drop-in replacement for SimulatedImageProcessing: same `poll(now)`,
+    `stop()`, `render_window()`, `close_window()` interface. All heavy imports
+    (av, cv2, numpy, ultralytics) happen in __init__ so simulated scenarios
+    never load them.
 
-    Detection coordinates are transformed from the vision ROI frame to C-frame
-    (u, v) using `modules.conveyor.M_VISION_TO_CONVEYOR`. Calibrate that
-    matrix after the physical rig is assembled.
+    Threads:
+      * capture  — PyAV decodes frames at the camera's true rate; publishes the
+        latest frame. (This replaces the cv2.VideoCapture path that capped fps.)
+      * inference — consumes the most recent frame, runs YOLO, tracks, triggers,
+        emits ObjectDetection, updates the belt-speed estimate.
+      * main (render_window) — owns cv2.imshow/waitKey (Qt requires GUI on main).
     """
 
     def __init__(self, vision_config: dict[str, Any], start_time: float) -> None:
-        # Heavy imports inside __init__ — not loaded by simulated scenarios.
-        import yaml
         import cv2
         import numpy as np
-        from ultralytics import YOLO
 
-        # Locate the YOLO_OBB repo directory.
-        yolo_dir = vision_config.get("yolo_dir", "YOLO_OBB")
-        if not os.path.isabs(yolo_dir):
-            # Resolve relative to the project root (one level above modules/).
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            yolo_dir = os.path.join(project_root, yolo_dir)
+        self._cfg = vision_config
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        sys_cfg_path = vision_config.get("system_config", os.path.join(yolo_dir, "config", "system_config.yaml"))
-        if not os.path.isabs(sys_cfg_path):
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            sys_cfg_path = os.path.join(project_root, sys_cfg_path)
-
-        with open(sys_cfg_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-
-        # Allow config.json overrides.
-        camera_source_override = vision_config.get("camera_source")
-        min_conf_override = vision_config.get("min_conf")
-
-        model_cfg = cfg["model"]
-        weights = model_cfg["weights"]
+        # --- Model -----------------------------------------------------------
+        # The model is loaded + warmed up in the inference thread (not here): the
+        # 6 s weight load and the ~7 s one-time CUDA warmup would otherwise block
+        # the constructor, delaying the live window by ~13 s. Deferring lets the
+        # camera window show live video within ~1-2 s while the model loads.
+        weights = vision_config.get("model_weights", "models/nano@1280/weights/best.pt")
         if not os.path.isabs(weights):
-            weights = os.path.join(yolo_dir, weights)
+            weights = os.path.join(project_root, weights)
+        self._weights = weights
+        self._model = None
+        self._names: dict = {}
+        self._model_ready = threading.Event()
 
-        self._model = YOLO(weights)
-        self._names = self._model.names
-        conf_th = float(min_conf_override or model_cfg.get("conf", 0.6))
-        conf_marker = float(model_cfg.get("conf_marker", conf_th))
-        self._conf_th = conf_th
-        self._conf_marker = conf_marker
-        self._iou_th = float(model_cfg.get("iou", 0.7))
-        self._imgsz = int(model_cfg.get("imgsz", 640))
-        self._device = model_cfg.get("device", "") or None
+        self._imgsz = int(vision_config.get("imgsz", 1280))
+        self._conf_th = float(vision_config.get("conf", 0.6))
+        self._conf_marker = float(vision_config.get("conf_marker", self._conf_th))
+        self._iou_th = float(vision_config.get("iou", 0.7))
+        self._half = bool(vision_config.get("half", True))
+        device = vision_config.get("device", "0")
+        if isinstance(device, str) and device.isdigit():
+            device = int(device)
+        self._device = device if device != "" else None
 
-        # Undistort
-        u_cfg = cfg.get("undistort", {})
-        if u_cfg.get("enabled", False):
-            self._K = np.array(u_cfg["camera_matrix"], dtype=np.float64)
-            self._D = np.array(u_cfg["dist_coeffs"], dtype=np.float64)
-        else:
-            self._K = self._D = None
+        # --- ROI / coordinates ----------------------------------------------
+        roi_cfg = vision_config.get("roi", {}) or {}
+        polygon = roi_cfg.get("polygon") if roi_cfg.get("enabled", False) else None
+        self._pixels_per_mm = float(vision_config.get("pixels_per_mm", 4.0))
+        self._roi = RoiFrame(polygon, self._pixels_per_mm, np, cv2)
 
-        # ROI polygon
-        roi = cfg.get("roi", {})
-        if roi.get("enabled", False) and roi.get("polygon"):
-            self._roi_poly = np.array(roi["polygon"], dtype=np.int32)
-        else:
-            self._roi_poly = None
+        # --- Trigger line ----------------------------------------------------
+        tl = vision_config.get("trigger_line", {}) or {}
+        self._trigger = TriggerLine(int(tl.get("y_px", 540)), tl.get("direction", "down"))
+        self._tl_min_conf = float(tl.get("min_conf", self._conf_th))
 
-        self._pixels_per_mm = float(cfg["coordinate"].get("pixels_per_mm", 4.0))
-
-        # Trigger line
-        tl = cfg["trigger_line"]
-        self._tl_y_px = int(tl["y_px"])
-        self._tl_direction = tl.get("direction", "down")
-        self._tl_min_conf = float(min_conf_override or tl.get("min_conf", conf_th))
-
-        # Orientation config
-        ori = cfg.get("orientation", {})
+        # --- Orientation -----------------------------------------------------
+        ori = vision_config.get("orientation", {}) or {}
         self._ori_enabled = bool(ori.get("enabled", False))
         self._marker_map = ori.get("marker_map", {})
         self._marker_classes = set(self._marker_map.keys())
-        self._cross_check = bool(ori.get("cross_check", True))
-        self._pcb_classes: set = set(ori.get("pcb_classes", list(self._names.values())))
+        self._cross_check = bool(ori.get("cross_check", False))
+        # Default PCB classes from the class_map keys (model names aren't loaded
+        # yet — the model loads in the inference thread).
+        self._pcb_classes = set(ori.get("pcb_classes") or vision_config.get("class_map", {}).keys())
         self._heading_offset = float(ori.get("offset_deg", 0.0))
         self._symmetry_default = float(ori.get("symmetry_deg", 180.0))
-        self._symmetry_by_class: dict = ori.get("symmetry_by_class", {})
+        self._symmetry_by_class = ori.get("symmetry_by_class", {})
+        # Distance gate for the fallback (no marker inside the board OBB) case.
+        self._pixels_per_mm_for_marker = float(vision_config.get("pixels_per_mm", 4.0))
+        self._marker_max_dist_px = float(ori.get("marker_max_dist_mm", 30.0)) * self._pixels_per_mm_for_marker
 
-        # Tracker
-        tk = cfg.get("tracker", {})
+        # --- Tracker + belt estimator ---------------------------------------
+        tk = vision_config.get("tracker", {}) or {}
+        self._tracker = CentroidTracker(
+            max_match_dist=tk.get("max_match_dist_px", 80),
+            max_missing=tk.get("max_missing_frames", 15),
+        )
+        be = vision_config.get("belt_estimator", {}) or {}
+        self._belt_estimator_enabled = bool(be.get("enabled", True))
+        self._belt_estimator = BeltVelocityEstimator(
+            pixels_per_mm=self._pixels_per_mm,
+            axis=be.get("axis", "y"),
+            ema_alpha=float(be.get("ema_alpha", 0.3)),
+            min_track_frames=int(be.get("min_track_frames", 3)),
+        )
 
-        # Camera open — prefer USB-ID auto-detect, then explicit override, then yaml default.
-        cam = cfg["camera"]
-        usb_id = vision_config.get("camera_usb_id")
-        if camera_source_override is not None:
-            src = camera_source_override
-        elif usb_id:
-            src = _find_camera_by_usb_id(usb_id)
-            if src is None:
-                print(f"[VISION] Camera USB ID {usb_id!r} not found — falling back to config source")
-                src = cam["source"]
-            else:
-                print(f"[VISION] Auto-detected camera USB {usb_id!r} at /dev/video{src}")
-        else:
-            src = cam["source"]
-        self._cap = cv2.VideoCapture(src)
-        if isinstance(src, int):
-            # MJPG first — USB UVC webcams only reach 30 fps in MJPG; the default
-            # uncompressed (YUYV) mode is bandwidth-limited to ~10 fps at 720p.
-            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.get("width", 1280))
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.get("height", 720))
-            self._cap.set(cv2.CAP_PROP_FPS, cam.get("fps", 30))
-            # Small grab buffer keeps the latest frame fresh (low display latency).
-            try:
-                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-        if not self._cap.isOpened():
-            raise RuntimeError(f"VisionImageProcessing: cannot open camera source {src!r}")
-        if isinstance(src, int):
-            # Tune driver controls (default: stop auto-exposure from throttling FPS).
-            controls = vision_config.get("camera_controls")
-            if controls is None:
-                controls = {"exposure_dynamic_framerate": 0}
-            _apply_v4l2_controls(src, controls)
-            actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
-            w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"[VISION] Camera opened {w}x{h} @ {actual_fps:.0f} fps (MJPG)")
+        # --- Class map (vision class name → scheduler object_type) ----------
+        self._class_map = vision_config.get("class_map", {})
 
-        # Class map: vision class name → scheduler object_type
-        self._class_map: dict[str, str] = vision_config.get("class_map", {})
+        # --- Conveyor transform (pure-Python, no numpy) ----------------------
+        from modules.conveyor import M_VISION_TO_CONVEYOR, _mat_apply
+        self._vision_to_conveyor = M_VISION_TO_CONVEYOR
+        self._mat_apply = _mat_apply
+
+        # --- Camera capture (PyAV) ------------------------------------------
+        cap = vision_config.get("capture", {}) or {}
+        usb_id = cap.get("camera_usb_id") or vision_config.get("camera_usb_id")
+        device_path = cap.get("device")
+        if device_path is None and usb_id:
+            idx = _find_camera_by_usb_id(usb_id)
+            if idx is not None:
+                device_path = f"/dev/video{idx}"
+                print(f"[VISION] Auto-detected camera USB {usb_id!r} at {device_path}")
+        if device_path is None:
+            device_path = "/dev/video0"
+        self._device_path = device_path
+        self._cap_w = int(cap.get("width", 1920))
+        self._cap_h = int(cap.get("height", 1080))
+        self._cap_fmt = cap.get("pixelformat", "mjpeg")
+        self._cap_fps = int(cap.get("fps", 30))
+
+        # Tune v4l2 controls (short exposure so the sensor can sustain the rated
+        # fps; stop auto-exposure dynamic framerate) before opening the stream.
+        controls = vision_config.get("v4l2_controls")
+        if controls is None:
+            controls = {"exposure_dynamic_framerate": 0,
+                        "auto_exposure": 1, "exposure_time_absolute": 150}
+        _apply_v4l2_controls(device_path, controls)
+
+        self._cv2 = cv2
+        self._np = np
+        self._counter = 0
+        self._show_window = bool(vision_config.get("show_window", True))
+
+        # FPS readouts.
+        self._cam_fps = 0.0
+        self._proc_fps = 0.0
 
         # Thread-safe detection queue.
         self._deque: collections.deque[ObjectDetection] = collections.deque()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Conveyor transform (no numpy required — pure-Python _mat_apply).
-        from modules.conveyor import M_VISION_TO_CONVEYOR, _mat_apply
-        self._vision_to_conveyor = M_VISION_TO_CONVEYOR
-        self._mat_apply = _mat_apply
-
-        # Import teammate helpers (safe — detect_realtime.main is __name__-guarded).
-        if yolo_dir not in sys.path:
-            sys.path.insert(0, yolo_dir)
-        from src.tracker import CentroidTracker
-        from src.trigger import TriggerLine
-        from src.geometry import normalize_angle_deg
-        from src.detect_realtime import extract_obb, in_roi, roi_coords_cm, draw as _draw_overlay
-
-        self._tracker = CentroidTracker(
-            max_match_dist=tk.get("max_match_dist_px", 80),
-            max_missing=tk.get("max_missing_frames", 15),
-        )
-        self._trigger = TriggerLine(self._tl_y_px, self._tl_direction)
-        self._normalize_angle_deg = normalize_angle_deg
-        self._extract_obb = extract_obb
-        self._in_roi = in_roi
-        self._roi_coords_cm = roi_coords_cm
-        self._draw_overlay = _draw_overlay
-
-        if self._ori_enabled:
-            from src.orientation import (
-                pick_marker,
-                heading_from_marker_vector,
-                resolve_heading_360,
-            )
-            self._pick_marker = pick_marker
-            self._heading_from_marker_vector = heading_from_marker_vector
-            self._resolve_heading_360 = resolve_heading_360
-        else:
-            self._pick_marker = self._heading_from_marker_vector = self._resolve_heading_360 = None
-
-        self._cv2 = cv2
-        self._np = np
-        self._counter = 0
-
-        # Live overlay window (boxes + id/pos/angle + FPS). Default on for any
-        # scenario that opens the real camera; set vision.show_window=false to run headless.
-        self._show_window = bool(vision_config.get("show_window", True))
-        self._ori_ctx = {
-            "enabled": self._ori_enabled,
-            "marker_map": self._marker_map,
-            "offset": self._heading_offset,
-        }
-        # FPS readouts: camera capture rate and inference/processing rate (GPU max).
-        self._cam_fps = 0.0
-        self._proc_fps = 0.0
-        self._last_frame_t: float | None = None
-        # The vision thread renders the annotated frame here; the MAIN thread
-        # (render_window) owns cv2.imshow/waitKey — Qt requires GUI on the main thread.
-        self._display_frame = None
-        self._display_lock = threading.Lock()
-        # Latest captured frame, published by a dedicated capture thread so the
-        # measured camera FPS reflects the camera's true rate, independent of how
-        # slow inference is. The inference loop consumes the most recent frame.
+        # Latest captured frame, published by the capture thread.
         self._latest_frame = None
         self._latest_frame_id = 0
         self._frame_lock = threading.Lock()
+
+        # Annotated frame for the main-thread GUI.
+        self._display_frame = None
+        self._display_lock = threading.Lock()
+
+        # Open the PyAV container before starting threads so open errors surface
+        # in the constructor (consistent with the old behaviour).
+        self._container = self._open_container()
 
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True, name="VisionCapture")
         self._capture_thread.start()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="VisionThread")
         self._thread.start()
-        print(f"[VISION] Pipeline started (src={src!r}, weights={os.path.basename(weights)})")
+        print(f"[VISION] Pipeline started (dev={device_path}, {self._cap_w}x{self._cap_h}@{self._cap_fps} "
+              f"{self._cap_fmt}, weights={os.path.basename(weights)}, imgsz={self._imgsz}); "
+              "model loading in background…")
+
+    def _open_container(self):
+        import av
+        options = {
+            "input_format": self._cap_fmt,
+            "video_size": f"{self._cap_w}x{self._cap_h}",
+            "framerate": str(self._cap_fps),
+        }
+        try:
+            container = av.open(self._device_path, format="v4l2", options=options)
+        except Exception as exc:
+            raise RuntimeError(
+                f"VisionImageProcessing: cannot open camera {self._device_path!r} via PyAV: {exc}"
+            )
+        container.streams.video[0].thread_type = "AUTO"
+        return container
 
     def _capture_loop(self) -> None:
-        """Read frames at the camera's native rate in a dedicated thread.
-
-        Decoupling capture from inference means `cam_fps` measures the real
-        camera throughput (e.g. 30) instead of being throttled by YOLO latency.
-        """
-        cv2 = self._cv2
+        """Decode frames at the camera's native rate and publish the latest."""
+        np = self._np
         alpha = 0.3
+        last_t: float | None = None
         try:
-            while not self._stop_event.is_set():
-                ret, frame = self._cap.read()
-                t = time.monotonic()
-                if not ret:
-                    print("[VISION] Camera read failed — stopping vision threads.")
-                    self._stop_event.set()
+            stream = self._container.streams.video[0]
+            for frame in self._container.decode(stream):
+                if self._stop_event.is_set():
                     break
-                if self._last_frame_t is not None:
-                    dt = t - self._last_frame_t
+                img = frame.to_ndarray(format="bgr24")
+                t = time.monotonic()
+                if last_t is not None:
+                    dt = t - last_t
                     if dt > 0.0:
                         self._cam_fps = alpha * (1.0 / dt) + (1.0 - alpha) * self._cam_fps
-                self._last_frame_t = t
+                last_t = t
                 with self._frame_lock:
-                    self._latest_frame = frame
+                    self._latest_frame = img
                     self._latest_frame_id += 1
+        except Exception as exc:
+            print(f"[VISION] Capture error: {exc}")
         finally:
-            self._cap.release()
+            self._stop_event.set()
+            try:
+                self._container.close()
+            except Exception:
+                pass
+            print("[VISION] Capture thread stopped.")
 
     def _loop(self) -> None:
-        """Inference loop — consumes the most recent captured frame and runs YOLO.
-
-        Runs as fast as the model allows; `proc_fps` therefore reflects the GPU's
-        max sustained throughput. Skips re-processing a frame it has already seen.
-        """
+        """Inference loop — loads the model (off the constructor's critical path),
+        warms it up, then consumes the most recent frame and runs YOLO."""
         cv2 = self._cv2
+        np = self._np
+        alpha = 0.3
+        last_id = -1
+
+        # Load + fuse + warm up here so the constructor returns immediately and
+        # the live camera window can appear while this happens.
         try:
-            alpha = 0.3  # EMA smoothing for the processing-FPS readout
-            last_id = -1
+            from ultralytics import YOLO
+            t_load = time.monotonic()
+            self._model = YOLO(self._weights)
+            try:
+                self._model.fuse()
+            except Exception:
+                pass
+            self._names = self._model.names
+            # One-time CUDA warmup (the first predict is ~7 s at imgsz 1920);
+            # doing it on a dummy frame keeps the first live frame responsive.
+            dummy = np.zeros((self._cap_h, self._cap_w, 3), dtype=np.uint8)
+            self._model.predict(dummy, imgsz=self._imgsz, device=self._device,
+                                half=self._half, verbose=False)
+            self._model_ready.set()
+            print(f"[VISION] Model ready ({time.monotonic() - t_load:.1f}s load+warmup).")
+        except Exception as exc:
+            print(f"[VISION] Model load failed: {exc}")
+            self._stop_event.set()
+            return
+
+        try:
             while not self._stop_event.is_set():
                 with self._frame_lock:
                     frame = self._latest_frame
@@ -437,115 +756,166 @@ class VisionImageProcessing:
                     time.sleep(0.001)
                     continue
                 last_id = fid
-                frame = frame.copy()  # private copy — safe to annotate without racing capture
+                frame = frame.copy()
 
-                t_proc0 = time.monotonic()
-                if self._K is not None:
-                    frame = cv2.undistort(frame, self._K, self._D)
-
+                t0 = time.monotonic()
                 result = self._model.predict(
-                    frame,
-                    conf=self._conf_marker,
-                    iou=self._iou_th,
-                    imgsz=self._imgsz,
-                    device=self._device,
+                    frame, conf=self._conf_marker, iou=self._iou_th,
+                    imgsz=self._imgsz, device=self._device, half=self._half,
                     verbose=False,
                 )[0]
 
-                dets = list(self._extract_obb(result))
-                dets = [d for d in dets if self._in_roi(self._roi_poly, d[0], d[1])]
+                dets = [d for d in extract_obb(result, np) if self._roi.contains(d[0], d[1])]
+                pcb_dets = [d for d in dets
+                            if self._names[d[5]] in self._pcb_classes and d[6] >= self._conf_th]
+                marker_dets = ([d for d in dets if self._names[d[5]] in self._marker_classes]
+                               if self._ori_enabled else [])
 
-                pcb_dets = [d for d in dets if self._names[d[5]] in self._pcb_classes and d[6] >= self._conf_th]
-                marker_dets = [d for d in dets if self._names[d[5]] in self._marker_classes] if self._ori_enabled else []
-
+                now = time.monotonic()
                 centroids = [(d[0], d[1]) for d in pcb_dets]
-                active = self._tracker.update(centroids)
+                active = self._tracker.update(centroids, now)
 
-                for tid, trk in active.items():
-                    if not pcb_dets:
-                        continue
-                    di = min(
-                        range(len(pcb_dets)),
-                        key=lambda i: (pcb_dets[i][0] - trk.cx) ** 2 + (pcb_dets[i][1] - trk.cy) ** 2,
-                    )
-                    board = pcb_dets[di]
-                    cx, cy, w, h, theta, cls_id, conf = board
+                if self._belt_estimator_enabled:
+                    self._belt_estimator.update(active)
 
-                    if conf < self._tl_min_conf:
-                        continue
-                    if not self._trigger.crossed(trk):
-                        continue
+                self._emit_for_crossings(active, pcb_dets, marker_dets)
 
-                    # Pixel → mm in ROI frame.
-                    rc = self._roi_coords_cm(cx, cy, self._roi_poly, self._pixels_per_mm)
-                    if rc is not None:
-                        _, _, x_cm, y_cm = rc
-                        x_mm, y_mm = x_cm * 10.0, y_cm * 10.0
-                    else:
-                        x_mm = cx / self._pixels_per_mm
-                        y_mm = cy / self._pixels_per_mm
-
-                    # Orientation.
-                    if self._ori_enabled:
-                        marker, inferred = self._pick_marker(
-                            board, marker_dets, self._names, self._marker_map,
-                            max_dist_px=self._pixels_per_mm * 20.0,
-                        )
-                        type_name = inferred if (self._cross_check and inferred) else self._names[cls_id]
-                        angle = self._heading_from_marker_vector(board, marker, self._heading_offset)
-                        if angle is None:
-                            sym = float(self._symmetry_by_class.get(type_name, self._symmetry_default))
-                            angle = self._resolve_heading_360(board, None, self._heading_offset, sym)
-                    else:
-                        type_name = self._names[cls_id]
-                        angle = self._normalize_angle_deg(theta)
-
-                    # Map class name → scheduler object_type.
-                    mapped = self._class_map.get(type_name)
-                    if mapped is None:
-                        print(f"[VISION] Unknown class '{type_name}' — skipping (not in class_map)")
-                        continue
-
-                    # Vision ROI frame → C-frame (u, v).
-                    u, v = self._mat_apply(self._vision_to_conveyor, x_mm, y_mm)
-
-                    self._counter += 1
-                    det = ObjectDetection(
-                        object_id=f"yolo-{tid:06d}",
-                        x=u,
-                        y=v,
-                        object_type=mapped,
-                        timestamp=time.monotonic(),
-                        confidence=float(conf),
-                        angle_deg=float(angle),
-                    )
-                    with self._lock:
-                        self._deque.append(det)
-
-                # Processing FPS = inverse of one capture→postprocess cycle (GPU max throughput).
-                dt_proc = time.monotonic() - t_proc0
+                dt_proc = time.monotonic() - t0
                 if dt_proc > 0.0:
                     self._proc_fps = alpha * (1.0 / dt_proc) + (1.0 - alpha) * self._proc_fps
 
                 if self._show_window:
-                    self._draw_overlay(
-                        frame, self._trigger, pcb_dets, marker_dets, self._names,
-                        self._roi_poly, self._ori_ctx, self._pixels_per_mm,
-                        active_tracks=active,
-                    )
-                    cv2.putText(frame, f"CAM {self._cam_fps:.1f} FPS", (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(frame, f"PROC {self._proc_fps:.1f} FPS (GPU max)", (10, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    # Hand the annotated frame to the main thread for display.
+                    self._draw_overlay(frame, pcb_dets, marker_dets, active)
                     with self._display_lock:
                         self._display_frame = frame
-
         except Exception as exc:
-            print(f"[VISION] Thread error: {exc}")
+            print(f"[VISION] Inference error: {exc}")
         finally:
-            self._stop_event.set()  # signal the capture thread to stop too
-            print("[VISION] Thread stopped.")
+            self._stop_event.set()
+            print("[VISION] Inference thread stopped.")
+
+    def _compute_angle(self, board, marker_dets):
+        """Return (angle_deg, type_name, marker_or_None) for a board.
+
+        Orientation logic shared by the emit path and the live overlay. With
+        orientation enabled the angle is the board→marker heading in [0,360);
+        otherwise the OBB angle folded into [-90,90).
+        """
+        cls_id = board[5]
+        if self._ori_enabled:
+            marker, inferred = pick_marker(
+                board, marker_dets, self._names, self._marker_map,
+                self._cv2, self._np, max_dist_px=self._marker_max_dist_px,
+            )
+            type_name = inferred if (self._cross_check and inferred) else self._names[cls_id]
+            angle = heading_from_marker_vector(board, marker, self._heading_offset)
+            if angle is None:
+                sym = float(self._symmetry_by_class.get(type_name, self._symmetry_default))
+                angle = resolve_heading_360(board, None, self._heading_offset, sym)
+            return angle, type_name, marker
+        return normalize_angle_deg(board[4]), self._names[cls_id], None
+
+    def _emit_for_crossings(self, active, pcb_dets, marker_dets) -> None:
+        """Emit one ObjectDetection per board the instant it crosses the trigger."""
+        for trk in active.values():
+            if not pcb_dets:
+                continue
+            board = min(pcb_dets, key=lambda d: (d[0] - trk.cx) ** 2 + (d[1] - trk.cy) ** 2)
+            cx, cy, w, h, theta, cls_id, conf = board
+            if conf < self._tl_min_conf:
+                continue
+            if not self._trigger.crossed(trk):
+                continue
+
+            x_mm, y_mm = self._roi.to_mm(cx, cy)
+            angle, type_name, _marker = self._compute_angle(board, marker_dets)
+
+            mapped = self._class_map.get(type_name)
+            if mapped is None:
+                print(f"[VISION] Unknown class '{type_name}' — skipping (not in class_map)")
+                continue
+
+            u, v = self._mat_apply(self._vision_to_conveyor, x_mm, y_mm)
+            print(f"[VISION] CROSS id={trk.id} type={mapped} "
+                  f"x_mm={x_mm:.1f} y_mm={y_mm:.1f} u={u:.1f} v={v:.1f}", flush=True)
+            self._counter += 1
+            det = ObjectDetection(
+                object_id=f"yolo-{trk.id:06d}",
+                x=u, y=v, object_type=mapped,
+                timestamp=time.monotonic(),
+                confidence=float(conf), angle_deg=float(angle),
+            )
+            with self._lock:
+                self._deque.append(det)
+            if self._belt_estimator_enabled:
+                print(f"[BELT_EST] v={self._belt_estimator.velocity_mm_per_s:7.1f} mm/s "
+                      f"(n_tracks={self._belt_estimator.n_tracks})")
+
+    def _draw_overlay(self, frame, pcb_dets, marker_dets, active) -> None:
+        """Slim overlay: ROI axes, trigger line, boxes + id/type/angle/coords, FPS, belt est."""
+        cv2 = self._cv2
+        np = self._np
+        h, w = frame.shape[:2]
+
+        if self._roi.poly is not None:
+            cv2.polylines(frame, [self._roi.poly], True, (0, 0, 255), 2)
+            # Draw coordinate axes: O=poly[3] (BL), X+=poly[2] (BR), Y+=poly[0] (TL).
+            pts = self._roi.poly
+            O  = tuple(pts[3].tolist())
+            Xp = tuple(pts[2].tolist())
+            Yp = tuple(pts[0].tolist())
+            cv2.arrowedLine(frame, O, Xp, (255, 80, 0), 2, tipLength=0.04)
+            mx = ((O[0] + Xp[0]) // 2, (O[1] + Xp[1]) // 2 + 20)
+            cv2.putText(frame, "X", mx, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 80, 0), 2)
+            cv2.arrowedLine(frame, O, Yp, (0, 200, 0), 2, tipLength=0.04)
+            my = (O[0] - 28, (O[1] + Yp[1]) // 2)
+            cv2.putText(frame, "Y", my, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+            cv2.circle(frame, O, 6, (0, 255, 255), -1)
+            cv2.putText(frame, "O", (O[0] + 8, O[1] + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.line(frame, (0, self._trigger.y_px), (w, self._trigger.y_px), (0, 0, 255), 2)
+
+        for m in marker_dets:
+            box = cv2.boxPoints(((m[0], m[1]), (m[2], m[3]), math.degrees(m[4]))).astype(int)
+            cv2.polylines(frame, [box], True, (0, 255, 255), 1)
+
+        for board in pcb_dets:
+            cx, cy, bw, bh, theta, cls_id, conf = board
+            box = cv2.boxPoints(((cx, cy), (bw, bh), math.degrees(theta))).astype(int)
+            cv2.polylines(frame, [box], True, (0, 255, 0), 2)
+            cv2.circle(frame, (int(cx), int(cy)), 4, (255, 0, 0), -1)
+            tid = min(active, key=lambda i: (active[i].cx - cx) ** 2 + (active[i].cy - cy) ** 2,
+                      default=None) if active else None
+
+            # Live angle + type (same logic as emit). If a marker is matched, draw
+            # the board→marker vector that defines the 360° heading.
+            angle, type_name, marker = self._compute_angle(board, marker_dets)
+            label = f"{type_name} {conf:.2f} {angle:.0f}deg"
+            if tid is not None:
+                label = f"#{tid} " + label
+            cv2.putText(frame, label, (int(cx) - 40, int(cy) - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            if marker is not None:
+                cv2.arrowedLine(frame, (int(cx), int(cy)), (int(marker[0]), int(marker[1])),
+                                (255, 0, 255), 2, tipLength=0.2)
+
+            # Position in camera frame coordinates.
+            if self._roi._ok:
+                x_mm, y_mm = self._roi.to_mm(cx, cy)
+                coord_label = f"X:{x_mm:.1f} Y:{y_mm:.1f} mm"
+            else:
+                coord_label = f"px:{int(cx)} py:{int(cy)}"
+            cv2.putText(frame, coord_label, (int(cx) - 40, int(cy) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 2)
+
+        cv2.putText(frame, f"CAM {self._cam_fps:.1f} FPS", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"PROC {self._proc_fps:.1f} FPS", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if self._belt_estimator_enabled:
+            cv2.putText(frame, f"BELT~ {self._belt_estimator.velocity_mm_per_s:.0f} mm/s "
+                               f"(est, n={self._belt_estimator.n_tracks})",
+                        (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
     def poll(self, now: float) -> list[ObjectDetection]:  # noqa: ARG002
         with self._lock:
@@ -553,28 +923,55 @@ class VisionImageProcessing:
             self._deque.clear()
         return detections
 
+    @property
+    def belt_velocity_mm_per_s(self) -> float:
+        """Belt-speed estimate from tracking (informational; not for operation)."""
+        return self._belt_estimator.velocity_mm_per_s
+
     def stop(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=5.0)
         self._capture_thread.join(timeout=5.0)
 
     def render_window(self) -> bool:
-        """Pump the GUI from the MAIN thread (Qt requires this). Displays the
-        latest annotated frame and processes key events. Returns False once the
-        window should close (user pressed 'q' or the thread stopped)."""
+        """Pump the GUI from the MAIN thread (Qt requires this). Returns False
+        once the window should close (user pressed 'q' or a thread stopped).
+
+        Shows the annotated frame when available; otherwise falls back to the
+        latest raw captured frame so the window appears as soon as frames flow
+        (no need to wait for the model to load + the first inference)."""
         if not self._show_window:
             return not self._stop_event.is_set()
         cv2 = self._cv2
         with self._display_lock:
             frame = self._display_frame
+        if frame is None and not self._model_ready.is_set():
+            # Model still loading — show live video with a hint.
+            with self._frame_lock:
+                raw = self._latest_frame
+            if raw is not None:
+                frame = raw.copy()
+                cv2.putText(frame, "loading model...", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
         if frame is not None:
             cv2.imshow("Delta Vision", frame)
+            # Raise the window to front on first frame so it's not hidden behind
+            # the terminal. Only once (flag cleared after first raise attempt).
+            if getattr(self, "_need_raise", True):
+                self._need_raise = False
+                def _raise_vision():
+                    time.sleep(0.4)
+                    try:
+                        subprocess.run(["wmctrl", "-a", "Delta Vision"],
+                                       check=False, capture_output=True, timeout=2.0)
+                    except Exception:
+                        pass
+                threading.Thread(target=_raise_vision, daemon=True).start()
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 self._stop_event.set()
         return not self._stop_event.is_set()
 
     def close_window(self) -> None:
-        """Destroy the OpenCV window. Call from the MAIN thread."""
         if self._show_window:
             try:
                 self._cv2.destroyAllWindows()
@@ -612,14 +1009,12 @@ if __name__ == "__main__":
         while not vip._stop_event.is_set():
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            dets = vip.poll(time.monotonic())
-            for d in dets:
+            for d in vip.poll(time.monotonic()):
                 print(f"[DETECTION] {d.to_dict()}")
-            # render_window() pumps the GUI on the MAIN thread (Qt requirement).
             if not vip.render_window():
                 break
             if args.no_window:
-                time.sleep(0.1)  # waitKey already paces the windowed path
+                time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:

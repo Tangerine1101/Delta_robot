@@ -1,6 +1,6 @@
 # AI Context Summary: Delta Robot
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
-> **Status**: Phase 3 image processing integrated. `VisionImageProcessing` (YOLO26-OBB + centroid tracker) runs in-process via background thread and opens a live overlay window (boxes + id/pos/angle + CAM/PROC FPS). Belt position now arrives pre-decoded from Siemens as a single `conveyor_position` field (cm); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_conveyor`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
+> **Status**: Phase 3 image processing **rebuilt** (self-contained). `VisionImageProcessing` (YOLO-OBB + centroid tracker) runs in-process via background threads and opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt-speed estimate). Camera frames are captured with **PyAV** (FFmpeg-backed) — sustains **~30 fps at 1080p MJPG**; the old `cv2.VideoCapture` V4L2 backend was the real <20 fps bottleneck (not the model/GPU). The module no longer imports `YOLO_OBB/src/*` and no longer reads `system_config.yaml`: every vision parameter lives in the `vision` section of `config.json`. Default model `models/nano@1280/weights/best.pt` (mAP50-95≈0.986, ~120 fps inference). Also computes a belt-speed estimate from object tracking (`BeltVelocityEstimator`) — **informational only**, logged/drawn but NOT fed to the scheduler. Belt position for operation still arrives pre-decoded from Siemens as a single `conveyor_position` field (cm); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_conveyor`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
 
 ---
 
@@ -17,7 +17,7 @@
   * [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py): Conveyor frame F, camera frame M, `BeltPositionTracker` (PLC `conveyor_position` cm → mm + velocity), `BeltTracker` for on-belt object tracking.
   * [EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication gateway (PLCGateway) using `pylogix` for Omron.
   * [cli.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): Command parser.
-  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO26-OBB pipeline in background thread). Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`. Opens a live overlay window (boxes + id/pos/angle + CAM/PROC FPS) by default for camera scenarios; disable with `vision.show_window=false`.
+  * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): **self-contained, single file** — `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO-OBB pipeline; PyAV capture thread + inference thread + main-thread GUI). All core logic (centroid tracker, trigger line, ROI/orientation/angle helpers, OBB extraction) is inlined — no runtime dependency on `YOLO_OBB/`. Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`. Opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt estimate) by default for camera scenarios; disable with `vision.show_window=false`. Reads all parameters from `config.json` `vision`.
   * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits `conveyor_position` (cm) integrated from `speed_current`.
   * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (`conveyor_position_scale_mm`, length_mm, camera_window_uv, workspace_window_uv), `vision.show_window`, and per-PCB `w`/`h` dimensions.
 * **`doc/`**:
@@ -101,13 +101,20 @@ All scenarios are selected with `--scenario <name>`. `main.py` runs all six;
 | `test_throughput` | simulated | sim/real | synthetic | no | main.py, run_test.py |
 | `test_accuracy` | simulated | sim/real | none (static) | no | main.py, run_test.py |
 | `evaluate` | simulated | sim/real | synthetic | no | main.py, run_test.py |
-| `test_vision_only` | **real camera** | none (`NullExecutor`) | sim / `conveyor_position` | **yes** | main.py (`--simulate-executor`), run_test.py |
+| `test_vision_only` | **real camera** | none (`NullExecutor`, idle) | `conveyor_position` (Siemens) | **yes** | main.py, run_test.py |
 | `test_conveyor` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py, run_test.py |
 | `production` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py only |
 
-* `--simulate-executor` swaps the real PLC for `SimulatedExecutor`/`NullExecutor` and the belt
-  feed for `SimulatedSpeedSource` (fixed `test_conveyor_belt_speed_mm_s`). Without it, the
-  scheduler uses `RealRobotExecutor` + `ConveyorSpeedSource` (reads `conveyor_position`).
+* **Real-camera scenarios (`test_vision_only`, `test_conveyor`, `production`) must use live PLC
+  feedback** — they always read `conveyor_position` via `ConveyorSpeedSource`. Using
+  `--simulate-executor` with them now raises a `RuntimeError` (no fabricated belt speed allowed).
+  `test_vision_only` connects to the full PLC (Omron + Siemens) but keeps the robot idle via
+  `NullExecutor`, which still reads belt position and sends the belt speed command.
+* `--simulate-executor` is for the offline-sim scenarios only (`test_throughput`,
+  `test_accuracy`, `evaluate`): it swaps in `SimulatedExecutor`/`SimulatedSpeedSource`.
+* The scheduler prints `[DETECT]` (live R-frame positions of every tracked object) each loop and
+  `[PREDICT]` (predicted pick) for real-camera scenarios; `run_test.py` plots both. `run_test.py`
+  defaults to a ~unlimited run (`--duration 99999`); stop with Ctrl-C.
 * Camera-window scenarios also run standalone: `python3 -m modules.image_processing --duration N`
   runs YOLO and shows the same overlay window (`--no-window` for headless).
 
@@ -131,7 +138,7 @@ All scenarios are selected with `--scenario <name>`. `main.py` runs all six;
 
 ## 3. Current Limitations & Key Development Constraints
 1. **Conveyor Speed Vector**: Speed has been updated to a 2D velocity vector `[vx, vy]`. Simulated components support this, but physical S7-1200 integration is pending.
-2. **Vision Integration**: `VisionImageProcessing` runs YOLO26-OBB in-process (background thread). **Calibration pending**: `M_VISION_TO_CONVEYOR` in `conveyor.py` is a placeholder — calibrate once physical rig is assembled. Vision deps: `ultralytics>=8.3.0`, `opencv-python>=4.9.0` in `.venv`. `YOLO_OBB/` is the teammate's repo (external, gitignored).
+2. **Vision Integration**: `VisionImageProcessing` runs YOLO-OBB in-process (rebuilt, self-contained, PyAV capture). **Calibration pending**: (a) `M_VISION_TO_CONVEYOR` in `conveyor.py` is a placeholder; (b) `vision.roi.polygon`, `vision.trigger_line.y_px`, and `vision.pixels_per_mm` in `config.json` were carried over from the teammate's 1280×720 config and need re-tuning for the live 1920×1080 frame — `roi.enabled` defaults to `false` (whole-frame) until recalibrated. Vision deps: `ultralytics>=8.3.0`, `opencv-python>=4.9.0`, **`av` (PyAV)** in `.venv`. Default weights `models/nano@1280/weights/best.pt` (classes `QFP/TQFP/marker_QFP/marker_TQFP`); override via `vision.model_weights`. `YOLO_OBB/` is the teammate's repo (external, gitignored) — read-only reference, no longer imported at runtime. **Camera note**: the Rapoo cam (`0c45:636b`, `/dev/video2`) reaches 30 fps only via the PyAV/FFmpeg path; OpenCV's `cv2.VideoCapture` V4L2 backend caps it at ~15 fps. Set a short v4l2 exposure (`exposure_time_absolute` < 1/fps) — `vision.v4l2_controls` handles this.
 3. **Object types**: renamed to match vision classes — `QFP` and `TQFP`. Config keys and destinations updated throughout.
 4. **4-DOF rotation**: `plan.rotate_deg` (from `angle_deg` + `rotate_offset_deg` config) is sent to the Siemens S7-1200 via `rotate_absolute` command at pick dispatch time.
 5. **Git clean state**: Ensure log files (`data.log`, `test_module.log`) and cache files (`__pycache__`) are ignored by git in local development. `YOLO_OBB/` is gitignored (nested repo).

@@ -66,6 +66,7 @@ COMMAND_ID = {
     "rotate_absolute": 7,
     "change_speed": 8,
     "plan_siemen": 9,
+    "enable": 10,
 }
 
 COMMAND_NAME = {value: key for key, value in COMMAND_ID.items()}

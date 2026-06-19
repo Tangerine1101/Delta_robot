@@ -575,10 +575,20 @@ class SimulatedExecutor:
 
 
 class NullExecutor:
-    """For test_vision_only: marks plans completed immediately without sending any robot commands."""
+    """For test_vision_only: marks plans completed immediately without sending any
+    robot trajectory commands.
 
-    def __init__(self) -> None:
-        pass
+    It still carries optional `dispatch` / `request_status` callables wired to a
+    live PLC worker so the scheduler can (a) read the real Siemens
+    `conveyor_position` via ConveyorSpeedSource and (b) send the belt speed
+    command — all without moving the Omron robot. The presence of a
+    `request_status` attribute is what makes `run_scheduler_scenario` pick
+    ConveyorSpeedSource (real feedback) instead of SimulatedSpeedSource.
+    """
+
+    def __init__(self, dispatch=None, request_status=None) -> None:
+        self.dispatch = dispatch
+        self.request_status = request_status
 
     def execute(self, plan: PickPlan, *, log_samples=False, real_time=False, scenario_name="") -> None:
         plan.status = "completed"
@@ -1783,6 +1793,15 @@ def run_scheduler_scenario(
     start_time = time.monotonic()
     vision_config = dict(getattr(config, "vision", {}) or {})
     _vision_scenarios = ("production", "test_conveyor", "test_vision_only")
+
+    # Fail fast (before opening the camera) if a real-camera scenario was started
+    # without a live PLC executor — these scenarios must use real belt feedback.
+    if scenario_name in _vision_scenarios and executor is None:
+        raise RuntimeError(
+            f"Scenario '{scenario_name}' requires live PLC conveyor_position feedback; "
+            "do not use --simulate-executor for real scenarios."
+        )
+
     if scenario_name in _vision_scenarios:
         image_processing: SimulatedImageProcessing | VisionImageProcessing = VisionImageProcessing(
             vision_config, start_time
@@ -1832,6 +1851,15 @@ def run_scheduler_scenario(
             executor.speed_source = speed_source
             executor.frame = frame
             executor.settings = settings
+
+    # Real-camera scenarios must use live PLC conveyor_position feedback — never a
+    # fabricated belt speed. Fail loudly if the wiring fell back to SimulatedSpeedSource.
+    if scenario_name in _vision_scenarios and isinstance(speed_source, SimulatedSpeedSource):
+        raise RuntimeError(
+            f"Scenario '{scenario_name}' requires live PLC conveyor_position feedback; "
+            "do not use --simulate-executor for real scenarios."
+        )
+
     scheduler = PickScheduler(settings, interpolar_points, frame, tracker)
 
     print(f"[INFO] Running scheduler scenario: {scenario_name}")
@@ -1849,8 +1877,8 @@ def run_scheduler_scenario(
             if deadline is not None and now >= deadline:
                 break
 
-            # Send conveyor speed command once at the start of test_conveyor.
-            if scenario_name == "test_conveyor" and not _conveyor_speed_sent:
+            # Send conveyor speed command once at the start of the belt scenarios.
+            if scenario_name in ("test_conveyor", "test_vision_only") and not _conveyor_speed_sent:
                 _conveyor_speed_sent = True
                 if hasattr(executor, "dispatch"):
                     try:
@@ -1870,12 +1898,34 @@ def run_scheduler_scenario(
             scheduler.update_speed(sample)
             detections = image_processing.poll(now)
             scheduler.ingest_detections(detections, sample.position_mm)
+
+            # Emit a snapshot of every tracked object's real R-frame position so
+            # run_test.py can plot detected objects moving live on the belt.
+            # Snapshot BEFORE prune so a freshly ingested object is reported at
+            # least once even if prune is about to drop it this loop (e.g. it
+            # already sits past workspace u_max).
+            tracked_objs = []
+            for obj in scheduler.tracker.objects():
+                x_r, y_r = scheduler.tracker.current_position_R(obj, sample.position_mm)
+                tracked_objs.append({
+                    "id": obj.object_id,
+                    "type": obj.object_type,
+                    "x": round(x_r, 2),
+                    "y": round(y_r, 2),
+                })
+            if tracked_objs:
+                print("[DETECT]", json.dumps({
+                    "t": round(now - start_time, 3),
+                    "z": round(settings.pickup_height, 2),
+                    "objects": tracked_objs,
+                }, ensure_ascii=True), flush=True)
+
             scheduler.prune_stale(now)
 
             plan = scheduler.plan_next(now)
             if plan is not None:
                 print("[PLAN]", json.dumps(plan.to_summary(), ensure_ascii=True))
-                if scenario_name == "test_vision_only":
+                if scenario_name in _vision_scenarios:
                     print("[PREDICT]", json.dumps({
                         "t": round(now - start_time, 3),
                         "x": round(plan.predicted_pick_position_2d[0], 2),
