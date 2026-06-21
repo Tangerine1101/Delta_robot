@@ -8,6 +8,7 @@ from typing import Any
 
 from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
+from modules.interface import DashboardServer
 from modules.scheduler import NullExecutor, RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
 
 # How often (seconds) the worker probes the PLC connection when idle, to prevent
@@ -248,13 +249,58 @@ def _run_cli(args: argparse.Namespace) -> None:
         _stop_worker(worker, command_queue, response_queue, req_counter)
 
 
+def _start_interface(args: argparse.Namespace) -> "tuple[DashboardServer | None, dict[str, Any]]":
+    """Start the web dashboard if --interface was passed.
+
+    Returns (server, kwargs) where kwargs are forwarded to run_scheduler_scenario
+    to wire structured events + the camera MJPEG source and suppress the native
+    cv2 window. When --interface is off, returns (None, {}).
+    """
+    if not getattr(args, "interface", False):
+        return None, {}
+    config = load_config()
+    iface_cfg = getattr(config, "interface", {}) or {}
+    port = args.interface_port if args.interface_port is not None else int(iface_cfg.get("port", 8000))
+    mjpeg_fps = float(iface_cfg.get("mjpeg_fps", 15))
+    server = DashboardServer(port=port, mjpeg_fps=mjpeg_fps)
+    server.start()
+    return server, {
+        "event_sink": server.emit,
+        "frame_register": server.attach_camera,
+        "disable_native_window": True,
+    }
+
+
 def _run_scheduler(args: argparse.Namespace) -> None:
     if args.simulate_executor:
-        run_scheduler_scenario(
-            args.scenario,
-            duration_s=args.duration,
-            interpolar_points=args.interpolar_points,
-        )
+        server, iface_kwargs = _start_interface(args)
+        try:
+            run_scheduler_scenario(
+                args.scenario,
+                duration_s=args.duration,
+                interpolar_points=args.interpolar_points,
+                **iface_kwargs,
+            )
+        finally:
+            if server is not None:
+                server.stop()
+        return
+
+    if args.scenario == "test_vision_only":
+        # Camera-only: no PLC, static belt. Read the board's live R-frame position
+        # on the dashboard to calibrate the conveyor->robot transform. No PLC worker
+        # is started, so the scheduler builds a NullExecutor + static speed source.
+        server, iface_kwargs = _start_interface(args)
+        try:
+            run_scheduler_scenario(
+                args.scenario,
+                duration_s=args.duration,
+                interpolar_points=args.interpolar_points,
+                **iface_kwargs,
+            )
+        finally:
+            if server is not None:
+                server.stop()
         return
 
     ctx = mp.get_context("spawn")
@@ -304,14 +350,18 @@ def _run_scheduler(args: argparse.Namespace) -> None:
             status_poll_interval_s=status_poll_interval_s,
         )
 
+    server, iface_kwargs = _start_interface(args)
     try:
         run_scheduler_scenario(
             args.scenario,
             duration_s=args.duration,
             interpolar_points=args.interpolar_points,
             executor=executor,
+            **iface_kwargs,
         )
     finally:
+        if server is not None:
+            server.stop()
         _stop_worker(worker, command_queue, response_queue, req_counter)
 
 
@@ -355,6 +405,19 @@ def main() -> None:
         "--simulate-executor",
         action="store_true",
         help="Run scheduler without sending PickPlan trajectories to the PLC",
+    )
+    parser.add_argument(
+        "--interface",
+        action="store_true",
+        help="Serve a live web dashboard (events + annotated camera MJPEG) instead "
+             "of the native cv2 window. Open http://localhost:<port>. For real-camera "
+             "scenarios this suppresses the native cv2 window to avoid GUI conflicts.",
+    )
+    parser.add_argument(
+        "--interface-port",
+        type=int,
+        default=None,
+        help="Web dashboard port (default: config.interface.port or 8000).",
     )
     args = parser.parse_args()
 

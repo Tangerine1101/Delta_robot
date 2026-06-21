@@ -32,48 +32,77 @@ from modules.image_processing import ObjectDetection
 # Override these constants after running the calibration routine.
 # ---------------------------------------------------------------------------
 
-# Belt placed in the (-X, +Y) quadrant of the robot at ~30 degrees off the
-# robot X-axis. Origin O_C at (-50, -100) in robot frame. Replace after calib.
+# The robot frame is rotated by theta from the conveyor frame: the belt's
+# downstream axis (+u, where the pick workspace lives) expressed in the robot
+# frame is (-sin theta, cos theta), and the cross-belt axis (+v) is
+# (cos theta, sin theta).
+# With u along the belt flow and v cross-belt, the homogeneous map (u, v) ->
+# (x_R, y_R) is:
+#     x_R = -sin(theta)*u + cos(theta)*v + T_X
+#     y_R =  cos(theta)*u + sin(theta)*v + T_Y
+#
+# TRANSLATION (T_X, T_Y): the belt-frame origin expressed directly in ROBOT
+# coordinates. This is a PURE translation measured along the robot axes — it is
+# NOT the rotation applied to a page-frame offset. The 2x2 block below already
+# handles the orientation of (u, v); T_X/T_Y only shift the origin.
+#
+# PLACEHOLDER values — calibrate them empirically: run `test_vision_only` without
+# a PLC (camera-only), read the board's R-frame position on the web dashboard, and
+# nudge these two constants until it matches the hand-measured position.
 _THETA_RAD = math.radians(28.0)
 _COS_T = math.cos(_THETA_RAD)
 _SIN_T = math.sin(_THETA_RAD)
-_T_X = 393.0
-_T_Y = 138.0
+
+# Belt-frame origin (u=0, v=0) expressed in robot coordinates (mm, pure
+# translation). T is what a board at the C-frame origin reads in the robot frame;
+# a board elsewhere reads R = (2x2 rotation)·(u, v) + (T_X, T_Y).
+#
+# CALIBRATED (2026-06-21) against the live test_vision_only board: it detects at
+# C-frame (u, v) = (112.5, 20.2) and was hand-measured at robot (0, -285). The
+# rotation part rot·(112.5, 20.2) = (-35.0, 108.8), so to land (0, -285) the
+# translation must be (T_X, T_Y) = (0, -285) - (-35.0, 108.8) = (35.0, -393.8).
+# Cross-check: frames.png places the conveyor origin at page (+360, -130) from
+# the robot base, mapping to robot ~(54, -379) — within the 20-30 mm measurement
+# tolerance, which confirms the 28 deg rotation block.
+#
+# The previous (-285, 0) was wrong on two counts: it assumed the board sat at the
+# C-frame origin (it actually sits 112 mm down-belt) and it swapped the X/Y of
+# the measurement (board is at (0, -285), not (-285, 0)). Result: robot (-320, 108).
+_T_X = 34.9    # robot-X of the C-frame origin (was -285.0)
+_T_Y = -393.8  # robot-Y of the C-frame origin (was 0.0)
 
 F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (_SIN_T, -_COS_T, _T_X),
-    (_COS_T, _SIN_T, _T_Y),
+    (-_SIN_T, _COS_T, _T_X),
+    (_COS_T,  _SIN_T, _T_Y),
     (0.0,     0.0,    1.0),
 )
 
 # Composite camera-pixel -> robot homogeneous transform.
-# Placeholder: identity in u,v with a pixel-to-mm scale of 0.5 mm/pixel.
-# Replace with H homography times F once camera is calibrated.
+# NOTE: `CameraFrame` / this matrix is NOT used at runtime — the vision pipeline
+# maps camera ROI mm -> C-frame (u, v) via M_VISION_TO_CONVEYOR and then to the
+# robot frame via F_CONVEYOR_TO_ROBOT. Kept as a placeholder for a future direct
+# pixel->robot path; replace with H homography times F once camera is calibrated.
 M_CAMERA_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (-_COS_T, _SIN_T, 133.0),
-    (_SIN_T,  _COS_T, 393.0),
+    (-_COS_T, _SIN_T, _T_Y),
+    (_SIN_T,  _COS_T, _T_X),
     (0.0,     0.0,    1.0),
 )
 
 # Vision ROI frame → C-frame (u, v) transform.
-# Vision ROI origin = bottom-left of ROI polygon; X = cross-belt; Y = along belt (upstream→downstream).
-# Placeholder: u = y_mm + u_trigger_offset, v = x_mm + v_offset.
-# Replace matrix values after physical calibration of trigger-line position and belt alignment.
+# FACTS: (1) the camera origin and the conveyor origin are the SAME point, so this
+# map has ZERO translation; (2) the belt-flow direction (+u = +x_conveyor) is the
+# camera +y axis, so this is a pure axis swap: u = y_mm, v = x_mm.
 #
-# INTERIM (not a real calibration): the trigger line lives in the camera's view,
-# which corresponds to camera_window_uv = [50, 250] (upstream). A board crossing
-# the trigger projects to y_mm ≈ 124, so an offset of ~25 puts it at u ≈ 150 —
-# near the camera-window centre and well below workspace u_max (620), so it
-# survives BeltTracker.prune. The old value of 500 dropped fresh detections at
-# u ≈ 624 (past u_max), making prune delete every detection before it was
-# reported. The ROI is ~135 mm wide with x_mm ∈ [0, 135]; shifting by ~-67
-# centres the belt at v ≈ 0 to match the windows' v ∈ [-65, 65].
+# A previous version added offsets (u+=25, v+=-67) which made camera (0,0) land at
+# conveyor (25, -67) — that contradicted fact (1) and pushed every R-frame position
+# off (mostly the y/flow direction). Removed.
+#
 # NOTE on the U sign: BeltTracker.current_uv always ADDS delta_p as the belt
-# advances, so along-belt travel must INCREASE u. ROI y_mm decreases as a board
-# moves downstream, so on a moving-belt run the `+y_mm` term below likely needs
-# to become `-y_mm`; verify and flip once the belt is running.
-_U_TRIGGER_OFFSET_MM = 25.0    # u (mm) in C-frame where the trigger line sits
-_V_BELT_CENTER_MM = -67.0      # v shift from ROI X-zero to belt centre
+# advances, so along-belt travel must INCREASE u. If ROI y_mm DECREASES as a board
+# moves downstream, the `+y_mm` term below must become `-y_mm`; verify and flip
+# once the belt is actually running (irrelevant for the static test_vision_only).
+_U_TRIGGER_OFFSET_MM = 0.0    # origins coincide → no u offset
+_V_BELT_CENTER_MM = 0.0       # origins coincide → no v offset
 M_VISION_TO_CONVEYOR: tuple[tuple[float, float, float], ...] = (
     # row 0 → u = 0*x_mm + 1*y_mm + _U_TRIGGER_OFFSET_MM
     (0.0, 1.0, _U_TRIGGER_OFFSET_MM),
@@ -294,7 +323,14 @@ class BeltTracker:
             dims = object_dimensions.get(detection.object_type, (0.0, 0.0))
 
         if detection.object_id in self._objects:
+            # Re-anchor from the camera: while the object is visible the camera
+            # position is authoritative. We move the C-frame anchor to the fresh
+            # detection and reset belt_pos_anchor to p_now, so dead reckoning
+            # (current_uv adds p_now - belt_pos_anchor) resumes from this latest
+            # camera fix once the object leaves the camera zone and stops emitting.
             obj = self._objects[detection.object_id]
+            obj.conveyor_uv = (detection.x, detection.y)
+            obj.belt_pos_anchor = p_now
             obj.last_seen_at = detection.timestamp
             obj.confidence = detection.confidence
             obj.rotation_rad = math.radians(detection.angle_deg)

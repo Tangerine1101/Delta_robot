@@ -36,7 +36,7 @@ It contains the current status, command mapping, PLC data contract, and verifica
 - **Never change** the default `interpolar_points` value in `config.json` without updating every downstream array that pads to that size.
 - After any change to `EthernetCom.py`, `scheduler.py`, or `cli.py`, run the compile check:
   ```bash
-  python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py
+  python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py modules/interface.py
   ```
 
 ---
@@ -142,7 +142,7 @@ COMMAND_ID = {
 
 ```bash
 # Compile check
-python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py
+python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py modules/interface.py
 
 # Throughput simulation
 python3 main.py --scheduler --scenario test_throughput --duration 12.0 --simulate-executor

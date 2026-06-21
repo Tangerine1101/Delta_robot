@@ -286,7 +286,13 @@ class CentroidTracker:
     def update(self, detections: list[tuple[float, float]], now: float) -> dict[int, Track]:
         """Match (cx, cy) centroids to nearest unclaimed track within
         max_match_dist, else start a new track. Returns id -> Track for tracks
-        seen this frame, and updates per-track instantaneous velocity (px/s)."""
+        seen this frame, and updates per-track instantaneous velocity (px/s).
+
+        The match distance is measured against each track's *velocity-predicted*
+        position `(cx + vx*dt, cy + vy*dt)`, not its last position. On a fast
+        belt at low inference fps a board can jump far between processed frames;
+        matching on the last position would exceed `max_match_dist` and spawn a
+        new id every frame. Predicting forward keeps the same id while moving."""
         unmatched_ids = set(self.tracks.keys())
         matched_ids: set[int] = set()
 
@@ -294,7 +300,10 @@ class CentroidTracker:
             best_id, best_d = None, self.max_match_dist
             for tid in unmatched_ids:
                 t = self.tracks[tid]
-                d = math.hypot(t.cx - cx, t.cy - cy)
+                dt = max(0.0, now - t.t)
+                pred_cx = t.cx + t.vx * dt
+                pred_cy = t.cy + t.vy * dt
+                d = math.hypot(pred_cx - cx, pred_cy - cy)
                 if d < best_d:
                     best_id, best_d = tid, d
             if best_id is None:
@@ -639,10 +648,20 @@ class VisionImageProcessing:
         self._np = np
         self._counter = 0
         self._show_window = bool(vision_config.get("show_window", True))
+        # The web dashboard streams the annotated frame over MJPEG. When attached
+        # it flips this on so the inference thread draws the overlay even if the
+        # native cv2 window is disabled (`show_window=false`). JPEG quality for
+        # the MJPEG encode is read from the vision config.
+        self._web_overlay = False
+        self._jpeg_quality = int(vision_config.get("mjpeg_jpeg_quality", 80))
 
         # FPS readouts.
         self._cam_fps = 0.0
         self._proc_fps = 0.0
+
+        # Track ids already emitted at least once, so we log "NEW" only on first
+        # sighting (emission is now continuous, every frame, not one-shot).
+        self._emitted_ids: set[int] = set()
 
         # Thread-safe detection queue.
         self._deque: collections.deque[ObjectDetection] = collections.deque()
@@ -778,13 +797,13 @@ class VisionImageProcessing:
                 if self._belt_estimator_enabled:
                     self._belt_estimator.update(active)
 
-                self._emit_for_crossings(active, pcb_dets, marker_dets)
+                self._emit_detections(active, pcb_dets, marker_dets)
 
                 dt_proc = time.monotonic() - t0
                 if dt_proc > 0.0:
                     self._proc_fps = alpha * (1.0 / dt_proc) + (1.0 - alpha) * self._proc_fps
 
-                if self._show_window:
+                if self._show_window or self._web_overlay:
                     self._draw_overlay(frame, pcb_dets, marker_dets, active)
                     with self._display_lock:
                         self._display_frame = frame
@@ -815,8 +834,17 @@ class VisionImageProcessing:
             return angle, type_name, marker
         return normalize_angle_deg(board[4]), self._names[cls_id], None
 
-    def _emit_for_crossings(self, active, pcb_dets, marker_dets) -> None:
-        """Emit one ObjectDetection per board the instant it crosses the trigger."""
+    def _emit_detections(self, active, pcb_dets, marker_dets) -> None:
+        """Emit an ObjectDetection for every tracked board, every frame it is seen.
+
+        Replaces the old one-shot trigger-line crossing. A board is created/updated
+        as soon as it is detected — but only when it has a full OBB *and* a matched
+        marker (orientation enabled): the marker is what resolves the 360° heading,
+        so without it we neither create the object nor update its angle. The id
+        (`yolo-{trk.id}`) is stable across frames (see CentroidTracker), so the
+        scheduler re-anchors the same object from the camera while it is visible
+        and dead-reckons from belt position once it leaves the camera zone.
+        """
         for trk in active.values():
             if not pcb_dets:
                 continue
@@ -824,21 +852,20 @@ class VisionImageProcessing:
             cx, cy, w, h, theta, cls_id, conf = board
             if conf < self._tl_min_conf:
                 continue
-            if not self._trigger.crossed(trk):
-                continue
 
-            x_mm, y_mm = self._roi.to_mm(cx, cy)
-            angle, type_name, _marker = self._compute_angle(board, marker_dets)
+            angle, type_name, marker = self._compute_angle(board, marker_dets)
+            # Full OBB + marker gate: only create/update when the marker is present.
+            if self._ori_enabled and marker is None:
+                continue
 
             mapped = self._class_map.get(type_name)
             if mapped is None:
-                print(f"[VISION] Unknown class '{type_name}' — skipping (not in class_map)")
+                if trk.id not in self._emitted_ids:
+                    print(f"[VISION] Unknown class '{type_name}' — skipping (not in class_map)")
                 continue
 
+            x_mm, y_mm = self._roi.to_mm(cx, cy)
             u, v = self._mat_apply(self._vision_to_conveyor, x_mm, y_mm)
-            print(f"[VISION] CROSS id={trk.id} type={mapped} "
-                  f"x_mm={x_mm:.1f} y_mm={y_mm:.1f} u={u:.1f} v={v:.1f}", flush=True)
-            self._counter += 1
             det = ObjectDetection(
                 object_id=f"yolo-{trk.id:06d}",
                 x=u, y=v, object_type=mapped,
@@ -847,9 +874,16 @@ class VisionImageProcessing:
             )
             with self._lock:
                 self._deque.append(det)
-            if self._belt_estimator_enabled:
-                print(f"[BELT_EST] v={self._belt_estimator.velocity_mm_per_s:7.1f} mm/s "
-                      f"(n_tracks={self._belt_estimator.n_tracks})")
+
+            # Log only on first sighting of an id to avoid per-frame spam.
+            if trk.id not in self._emitted_ids:
+                self._emitted_ids.add(trk.id)
+                self._counter += 1
+                belt = (f" belt~{self._belt_estimator.velocity_mm_per_s:.1f}mm/s"
+                        if self._belt_estimator_enabled else "")
+                print(f"[VISION] NEW id={trk.id} type={mapped} angle={angle:.0f} "
+                      f"x_mm={x_mm:.1f} y_mm={y_mm:.1f} u={u:.1f} v={v:.1f}{belt}",
+                      flush=True)
 
     def _draw_overlay(self, frame, pcb_dets, marker_dets, active) -> None:
         """Slim overlay: ROI axes, trigger line, boxes + id/type/angle/coords, FPS, belt est."""
@@ -873,7 +907,8 @@ class VisionImageProcessing:
             cv2.circle(frame, O, 6, (0, 255, 255), -1)
             cv2.putText(frame, "O", (O[0] + 8, O[1] + 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.line(frame, (0, self._trigger.y_px), (w, self._trigger.y_px), (0, 0, 255), 2)
+        # Trigger line removed: detections are now created on first full OBB+marker
+        # sighting (see _emit_detections), not on a line crossing.
 
         for m in marker_dets:
             box = cv2.boxPoints(((m[0], m[1]), (m[2], m[3]), math.degrees(m[4]))).astype(int)
@@ -927,6 +962,36 @@ class VisionImageProcessing:
     def belt_velocity_mm_per_s(self) -> float:
         """Belt-speed estimate from tracking (informational; not for operation)."""
         return self._belt_estimator.velocity_mm_per_s
+
+    def enable_web_overlay(self) -> None:
+        """Ask the inference thread to keep producing an annotated frame for the
+        web MJPEG stream, independent of the native cv2 window."""
+        self._web_overlay = True
+
+    def jpeg_frame(self) -> bytes | None:
+        """Return the latest annotated frame JPEG-encoded for MJPEG streaming.
+
+        Falls back to the raw captured frame (with a 'loading model...' hint)
+        while the model is still warming up, so the browser shows live video
+        immediately. Returns None if no frame is available yet.
+        """
+        cv2 = self._cv2
+        with self._display_lock:
+            frame = self._display_frame
+        if frame is None:
+            with self._frame_lock:
+                raw = self._latest_frame
+            if raw is None:
+                return None
+            frame = raw.copy()
+            if not self._model_ready.is_set():
+                cv2.putText(frame, "loading model...", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+        ok, buf = cv2.imencode(".jpg", frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
+        if not ok:
+            return None
+        return buf.tobytes()
 
     def stop(self) -> None:
         self._stop_event.set()

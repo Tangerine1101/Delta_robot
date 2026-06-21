@@ -18,6 +18,7 @@
   * [EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py): PLC communication gateway (PLCGateway) using `pylogix` for Omron.
   * [cli.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/cli.py): Command parser.
   * [image_processing.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/image_processing.py): **self-contained, single file** — `SimulatedImageProcessing` (fake, no deps) + `VisionImageProcessing` (real YOLO-OBB pipeline; PyAV capture thread + inference thread + main-thread GUI). All core logic (centroid tracker, trigger line, ROI/orientation/angle helpers, OBB extraction) is inlined — no runtime dependency on `YOLO_OBB/`. Emits `ObjectDetection` with C-frame `(u, v)` and `angle_deg`. Opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt estimate) by default for camera scenarios; disable with `vision.show_window=false`. Reads all parameters from `config.json` `vision`.
+  * [interface.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/interface.py): **zero-dependency** (stdlib `http.server`) in-process web dashboard — `DashboardServer` with `emit(type, payload)` (SSE `/events`) and `attach_camera(source)` (MJPEG `/stream.mjpg` of the annotated frame). Started by `main.py` when `--interface` is passed; replaces the deleted `run_test.py`. Run standalone with synthetic events via `python3 -m modules.interface`.
   * [test_module.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/test_module.py): TCP fake PLC simulator. Fake-emits `conveyor_position` (cm) integrated from `speed_current`.
   * [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json): Active configuration file. Includes `conveyor` section (`conveyor_position_scale_mm`, length_mm, camera_window_uv, workspace_window_uv), `vision.show_window`, and per-PCB `w`/`h` dimensions.
 * **`doc/`**:
@@ -93,17 +94,23 @@ Siemens S7-1200 status structure (PLC → PC, **20 bytes**):
 
 ### 1.4. Scenario Reference
 
-All scenarios are selected with `--scenario <name>`. `main.py` runs all six;
-`run_test.py` (subprocess + matplotlib plot) runs every scenario except `production`.
+All scenarios are selected with `--scenario <name>`. `main.py` runs all six. Live
+visualization is provided by the in-process **web dashboard** (`modules/interface.py`,
+opt-in via `--interface`) — the old `run_test.py` (subprocess + matplotlib) was
+**removed** because its TkAgg window conflicted with the cv2 vision window on real
+hardware (crash right after model load). The dashboard streams the annotated camera
+frame over MJPEG + a live table (detected objects, predicted picks, belt speed/position)
+at `http://localhost:<config.interface.port|8000>`; `--interface` also suppresses the
+native cv2 window for real-camera scenarios.
 
-| Scenario | Vision | Robot | Belt source | Camera window | Entry points |
-|----------|--------|-------|-------------|---------------|--------------|
-| `test_throughput` | simulated | sim/real | synthetic | no | main.py, run_test.py |
-| `test_accuracy` | simulated | sim/real | none (static) | no | main.py, run_test.py |
-| `evaluate` | simulated | sim/real | synthetic | no | main.py, run_test.py |
-| `test_vision_only` | **real camera** | none (`NullExecutor`, idle) | `conveyor_position` (Siemens) | **yes** | main.py, run_test.py |
-| `test_conveyor` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py, run_test.py |
-| `production` | **real camera** | real | `conveyor_position` (Siemens) | **yes** | main.py only |
+| Scenario | Vision | Robot | Belt source | Display | Entry points |
+|----------|--------|-------|-------------|---------|--------------|
+| `test_throughput` | simulated | sim/real | synthetic | web (`--interface`) | main.py |
+| `test_accuracy` | simulated | sim/real | none (static) | web (`--interface`) | main.py |
+| `evaluate` | simulated | sim/real | synthetic | console | main.py |
+| `test_vision_only` | **real camera** | none (`NullExecutor`, idle) | `conveyor_position` (Siemens) | web or native cv2 | main.py |
+| `test_conveyor` | **real camera** | real | `conveyor_position` (Siemens) | web or native cv2 | main.py |
+| `production` | **real camera** | real | `conveyor_position` (Siemens) | web or native cv2 | main.py only |
 
 * **Real-camera scenarios (`test_vision_only`, `test_conveyor`, `production`) must use live PLC
   feedback** — they always read `conveyor_position` via `ConveyorSpeedSource`. Using
@@ -113,8 +120,10 @@ All scenarios are selected with `--scenario <name>`. `main.py` runs all six;
 * `--simulate-executor` is for the offline-sim scenarios only (`test_throughput`,
   `test_accuracy`, `evaluate`): it swaps in `SimulatedExecutor`/`SimulatedSpeedSource`.
 * The scheduler prints `[DETECT]` (live R-frame positions of every tracked object) each loop and
-  `[PREDICT]` (predicted pick) for real-camera scenarios; `run_test.py` plots both. `run_test.py`
-  defaults to a ~unlimited run (`--duration 99999`); stop with Ctrl-C.
+  `[PREDICT]` (predicted pick) for real-camera scenarios. With `--interface` the same data is
+  also pushed as structured events (`status`/`detect`/`predict`/`plan`) to the web dashboard via
+  `run_scheduler_scenario(event_sink=..., frame_register=...)` — no stdout parsing. Omit
+  `--duration` for a continuous run; stop with Ctrl-C.
 * Camera-window scenarios also run standalone: `python3 -m modules.image_processing --duration N`
   runs YOLO and shows the same overlay window (`--no-window` for headless).
 
@@ -172,9 +181,12 @@ python3 -m modules.image_processing                        # runs until q / Ctrl
 # 7. Production dry-run (real vision, simulated robot)
 python3 main.py --scheduler --scenario production --simulate-executor --duration 20
 
-# 8. Vision-only (real camera, no robot) — shows predicted picks on run_test.py plot
-python3 run_test.py --scenario test_vision_only --duration 20
+# 8. Web dashboard smoke test (no hardware — synthetic events at http://localhost:8000)
+python3 -m modules.interface
 
-# 9. Conveyor test (real camera + robot + Siemens conveyor_position feedback)
-python3 run_test.py --scenario test_conveyor --duration 30
+# 9. Vision-only (real camera, no robot) + live web dashboard (annotated MJPEG + data)
+python3 main.py --scheduler --scenario test_vision_only --interface --duration 20
+
+# 10. Conveyor test (real camera + robot + Siemens conveyor_position feedback) + dashboard
+python3 main.py --scheduler --scenario test_conveyor --interface --duration 30
 ```

@@ -43,12 +43,22 @@ python3 main.py --scheduler --scenario test_throughput
 Scenarios that use the real camera open a window showing each tracked board/marker
 (object id, position, rotation angle) plus camera-capture and inference (GPU-max) FPS.
 Set `vision.show_window=false` in `config.json` to run headless.
+
+Add `--interface` to any scenario to serve a **live web dashboard** instead of the
+native cv2 window: it streams the annotated camera frame over MJPEG plus a live
+table of detected objects, predicted picks, and belt speed/position. Open
+`http://localhost:8000` (port configurable via `config.interface.port` or
+`--interface-port`). For real-camera scenarios `--interface` suppresses the native
+cv2 window so the two GUIs don't conflict.
 ```bash
-# Vision only — real camera, no robot; predicted picks shown on the run_test.py plot
-python3 run_test.py --scenario test_vision_only --duration 20
+# Vision only — real camera, no robot; live web dashboard (annotated MJPEG + data)
+python3 main.py --scheduler --scenario test_vision_only --interface --duration 20
 
 # Conveyor test — real camera + robot + Siemens conveyor_position belt feedback
-python3 run_test.py --scenario test_conveyor --duration 30
+python3 main.py --scheduler --scenario test_conveyor --interface --duration 30
+
+# Web dashboard smoke test (no hardware — serves synthetic events)
+python3 -m modules.interface                         # open http://localhost:8000
 
 # Standalone vision (runs YOLO + shows the same window; q or Ctrl-C to quit)
 python3 -m modules.image_processing                 # runs until q / Ctrl-C
@@ -69,12 +79,17 @@ python3 -m modules.image_processing --no-window      # headless (no window)
 ### 1.6. Scenarios
 | Scenario | Vision | Robot | Belt source | Camera window | Entry points |
 |----------|--------|-------|-------------|---------------|--------------|
-| `test_throughput` | simulated | sim/real | synthetic | no | main.py, run_test.py |
-| `test_accuracy` | simulated | sim/real | none (static) | no | main.py, run_test.py |
-| `evaluate` | simulated | sim/real | synthetic | no | main.py, run_test.py |
-| `test_vision_only` | real camera | none | sim / `conveyor_position` | yes | main.py (`--simulate-executor`), run_test.py |
-| `test_conveyor` | real camera | real | `conveyor_position` (Siemens) | yes | main.py, run_test.py |
-| `production` | real camera | real | `conveyor_position` (Siemens) | yes | main.py only |
+| `test_throughput` | simulated | sim/real | synthetic | no | main.py (`--interface` opt.) |
+| `test_accuracy` | simulated | sim/real | none (static) | no | main.py (`--interface` opt.) |
+| `evaluate` | simulated | sim/real | synthetic | no | main.py |
+| `test_vision_only` | real camera | none | `conveyor_position` | web/native | main.py (`--interface` opt.) |
+| `test_conveyor` | real camera | real | `conveyor_position` (Siemens) | web/native | main.py (`--interface` opt.) |
+| `production` | real camera | real | `conveyor_position` (Siemens) | web/native | main.py only |
+
+> **Live visualization** is provided by the in-process web dashboard
+> (`modules/interface.py`, `--interface`). The old `run_test.py` subprocess +
+> matplotlib launcher has been removed — it conflicted with the cv2 window on
+> real hardware. Simulation is built into the scheduler via `--simulate-executor`.
 
 ---
 
@@ -155,6 +170,54 @@ All system settings are stored in [config.json](file:///home/tangerine/Share/Glo
 * `accuracy_points` (array): List of static target coordinates used for tracking error profiling.
 * `log_path` (string): File path for trajectory tracking data logs.
 
+### 3.3. Coordinate Frames & Position/Trajectory Settings
+
+> **Note:** `modules/conveyor.py` was written *after* the original config, so several
+> position keys changed the frame they are interpreted in. Some descriptions in §3.1–3.2
+> predate that migration; the table below is authoritative for which frame each
+> position/trajectory value lives in.
+
+**Frames in use:**
+* **R-frame** — Robot Cartesian `(x, y, z)` in mm. Z is **negative-down** (closer to `0` = physically higher). Every trajectory packet sent to the Omron PLC is in this frame.
+* **C-frame `(u, v)`** — Conveyor belt. `+u` points downstream (belt flow), `+v` is cross-belt; origin at a fixed marker on the belt. Belt dead-reckoning advances `u`.
+* **ROI-mm** — millimetres inside the camera ROI (origin = `vision.roi.polygon[3]`, the bottom-left corner). Produced by the vision pipeline.
+* **Pixel** — raw image pixels in the 1920×1080 camera frame.
+
+**Transform chain (defined in [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py)):**
+```
+Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,v) --(F_CONVEYOR_TO_ROBOT)--> R-frame (x,y)
+```
+* `F_CONVEYOR_TO_ROBOT` — C→R; built from rotation `_THETA_RAD` (28°) and translation `(_T_X, _T_Y)`. This is the master pick transform: an error here offsets every pick.
+* `M_VISION_TO_CONVEYOR` — ROI-mm→C; currently a pure axis swap (`u = y_mm`, `v = x_mm`, zero offset). The `+u` sign is **unverified on a running belt** — flip `+y_mm → -y_mm` if `y_mm` decreases as a board moves downstream.
+* `M_CAMERA_TO_ROBOT` / `CameraFrame` — **not used at runtime** (placeholder for a future direct pixel→robot path).
+
+**Per-setting frame map:**
+
+| Setting (config key) | Block | Frame | Notes |
+|----------------------|-------|-------|-------|
+| `QFP`, `TQFP` `[x,y,z]` | top-level | **R-frame** | Sorting-bin destination. X,Y used for every place; Z used **only** by `evaluate` (in production the place Z is overridden by `place_height`). |
+| `object_types.*.w` / `.h` | top-level | physical mm | Board dimensions; frame-independent. |
+| `home_position` `[x,y,z]` | scheduler | **R-frame** | Robot rest pose / cycle start. |
+| `clearance_height`, `slope_transition_height`, `pre_pick_height`, `pickup_height`, `place_height` | scheduler | **R-frame Z** | Must satisfy `clearance > slope_transition > pre_pick > pickup` and `clearance ≥ place` (validated at load). |
+| `corner_blend_xy` | scheduler | **R-frame XY** (mm) | Blend radius for the 3D-slope waypoints. |
+| `accuracy_points` `[x,y,z]` | scheduler | **R-frame** | **Legacy** — superseded by `accuracy_points_uv`; only used if the latter is absent. |
+| `accuracy_points_uv` `[u,v,z]` | conveyor | **C-frame (u,v)** + R-frame Z | `evaluate` targets (preferred). Mapped C→R via `F_CONVEYOR_TO_ROBOT`. |
+| `workspace_window_uv` `[u_min,u_max,v_min,v_max]` | conveyor | **C-frame** | Pickable region. Coordinates outside are **discarded, not clamped**. |
+| `camera_window_uv` | conveyor | **C-frame** | Camera coverage region (upstream of `workspace_window_uv`). |
+| `default_speed` `[vx,vy]` | scheduler | **frame-migration leftover** | Only its **magnitude** is used, as a scalar belt speed along `+u` (C-frame). The direction (vy) is ignored. |
+| `throughput_spawn_y` | scheduler | **C-frame `u`** (sim) | Reused as the upstream spawn `u` for `test_throughput`. |
+| `throughput_lanes` | scheduler | **C-frame `v`** (sim) | Cross-belt lane positions for simulated objects. |
+| `throughput_spawn_x` | scheduler | **unused (dead key)** | Loaded into settings but never consumed by `SimulatedImageProcessing`. |
+| `rotate_offset_deg` | scheduler | angle (deg) | Added to the vision `angle_deg` before the Siemens `rotate_absolute` command. |
+| `pixels_per_mm` | vision | **Pixel→ROI-mm** scale | Re-verify against the live 1920×1080 frame. |
+| `roi.polygon` | vision | **Pixel** | Defines the ROI-mm origin/axes. Re-verify @1080p. |
+| `trigger_line.y_px` | vision | **Pixel** | Emit/trigger line. Re-verify @1080p. |
+
+> **Calibration-pending values** (must be set from physical measurement before production):
+> sorting-bin coordinates `QFP`/`TQFP`; `F_CONVEYOR_TO_ROBOT` rotation `_THETA_RAD`;
+> the `M_VISION_TO_CONVEYOR` `+u` sign; and the vision pixel-frame keys
+> (`pixels_per_mm`, `roi.polygon`, `trigger_line.y_px`).
+
 ---
 
 ## 4. Documentation Index
@@ -210,5 +273,7 @@ Detailed documentation files are available in the `doc/` directory:
    - Command ID 1 (`goto_relative`) has not been programmed on the physical PLC.
 5. **Calibration test failure in `calibration.py`**:
    - The mechanical delay calibration sends a `stop` command (ID = 0) and waits for `task_doing == 1`. The mock PLC sets `task_doing` to the command ID (0 for `stop`), so the calibration step always times out.
-6. **Hardcoded plot path in `run_test.py`**:
-   - `generate_plots()` writes to a hardcoded path from an old session that may not exist or may not be writable.
+6. **`run_test.py` removed (replaced by `--interface` web dashboard)**:
+   - The old subprocess + matplotlib launcher (and its hardcoded plot path) has been
+     deleted. Live visualization now runs in-process via `modules/interface.py`
+     (`main.py ... --interface`); simulation uses the scheduler's `--simulate-executor`.

@@ -7,7 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config
 from modules.conveyor import (
@@ -424,14 +424,17 @@ class SimulatedSpeedSource:
         self._integrated_position_mm: float = 0.0
 
     def sample(self, now: float) -> SpeedSample:
-        if self.scenario_name == "test_accuracy":
+        # test_vision_only runs camera-only with a STATIC belt: the camera is the
+        # authoritative position source, so report zero belt speed / position and
+        # let detections stay anchored where they are seen (no dead-reckoning drift).
+        if self.scenario_name in ("test_accuracy", "test_vision_only"):
             self._last_sample_time = now
             return SpeedSample(
                 vx=0.0, vy=0.0, timestamp=now,
                 position_mm=self._integrated_position_mm, speed_uv=0.0,
             )
 
-        if self.scenario_name in ("test_conveyor", "test_vision_only"):
+        if self.scenario_name == "test_conveyor":
             scalar = self.settings.test_conveyor_belt_speed_mm_s
             if self._last_sample_time is not None:
                 dt = max(0.0, now - self._last_sample_time)
@@ -476,6 +479,10 @@ class ConveyorSpeedSource:
         self.decoder = decoder
         self.scenario_name = scenario_name
         self.position_scale_mm = float(position_scale_mm)
+        # Latest raw PLC status dict (carries pos_EE / end_effector). Cached here
+        # so the scheduler loop can read the robot pose for the web dashboard
+        # without issuing a second PLC round-trip per loop.
+        self.last_status: dict[str, Any] | None = None
 
     def sample(self, now: float) -> SpeedSample:
         if self.scenario_name == "test_accuracy":
@@ -489,6 +496,7 @@ class ConveyorSpeedSource:
         except Exception as exc:
             print(f"[WARN] ConveyorSpeedSource failed to read status: {exc}")
             status = None
+        self.last_status = status
 
         if status is not None:
             conveyor_position = status.get("conveyor_position")
@@ -723,13 +731,16 @@ class RealRobotExecutor:
         new_pick_position: Position3D = (pick_xy[0], pick_xy[1], pick_z)
 
         # Rebuild pick phase geometry from last goto waypoint as starting point.
+        # _build_pick_geometry / _build_pick_timing expect Position3D tuples for
+        # goto_points (they index goto_points[-1][0]); plan.trajectory_goto holds
+        # TrajectoryPoint objects, so pass the converted last waypoint tuple.
         last_goto_pt = plan.trajectory_goto[-1]
         last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
         new_pick_points = _build_pick_geometry(
-            new_pick_position, plan.sorting_position, self.settings, plan.trajectory_goto
+            new_pick_position, plan.sorting_position, self.settings, [last_goto_pos]
         )
         new_pick_times = _build_pick_timing(
-            new_pick_position, new_pick_points, self.settings, plan.trajectory_goto
+            new_pick_position, new_pick_points, self.settings, [last_goto_pos]
         )
         new_trajectory_pick = [
             TrajectoryPoint(pt[0], pt[1], pt[2], e_val, dur)
@@ -1101,6 +1112,10 @@ class PickScheduler:
         self.frame = frame
         self.tracker = tracker
         self.seen_object_ids: dict[str, float] = {}
+        # Object ids already committed to a pick plan. Vision now re-emits the
+        # same id every frame while the object is visible, so without this guard a
+        # still-visible (already-planned) object would be re-created and re-picked.
+        self.planned_object_ids: dict[str, float] = {}
         self.metrics = SchedulerMetrics()
         self.current_position: Position3D = settings.home_position
         self.latest_speed: SpeedSample | None = None
@@ -1108,6 +1123,10 @@ class PickScheduler:
 
     def ingest_detections(self, detections: list[ObjectDetection], p_now: float) -> None:
         for detection in detections:
+            # Skip detections for objects already committed to a pick plan — the
+            # vision pipeline re-emits the same id every frame while it is visible.
+            if detection.object_id in self.planned_object_ids:
+                continue
             self.metrics.total_detections += 1
             self.tracker.ingest_detection(
                 detection, p_now, object_dimensions=self.settings.object_dimensions
@@ -1135,6 +1154,11 @@ class PickScheduler:
         limit = now - self.settings.stale_timeout_s
         self.seen_object_ids = {
             obj_id: ts for obj_id, ts in self.seen_object_ids.items() if ts >= limit
+        }
+        # Prune the planned-pick guard the same way. Vision track ids are
+        # monotonic, so an id will not be reused within the timeout window.
+        self.planned_object_ids = {
+            obj_id: ts for obj_id, ts in self.planned_object_ids.items() if ts >= limit
         }
 
     def plan_next(self, now: float) -> PickPlan | None:
@@ -1169,6 +1193,7 @@ class PickScheduler:
         _, obj, sorting_position = candidates[0]
         plan = self._build_pick_plan(obj, sorting_position, now)
         self.tracker.remove(obj.object_id)
+        self.planned_object_ids[obj.object_id] = now
         return plan
 
     def mark_completed(self, plan: PickPlan) -> None:
@@ -1588,7 +1613,7 @@ def _dispatch_evaluate_plan(
     executor: EvaluateExecutor | None,
     metrics: EvaluateMetrics,
 ) -> "Position3D | None":
-    # Print planned waypoints before dispatch — parsed by run_test.py for trajectory viz.
+    # Print planned waypoints before dispatch (evaluate trajectory viz / debugging).
     for phase_name, trajectory in (("goto", plan.trajectory_goto), ("pick", plan.trajectory_pick)):
         print(
             "[TRAJ]",
@@ -1778,7 +1803,19 @@ def run_scheduler_scenario(
     duration_s: float | None,
     interpolar_points: int,
     executor: SimulatedExecutor | RealRobotExecutor | NullExecutor | None = None,
+    event_sink: "Callable[[str, dict[str, Any]], None] | None" = None,
+    frame_register: "Callable[[Any], None] | None" = None,
+    disable_native_window: bool = False,
 ) -> None:
+    """Run a scheduler scenario.
+
+    ``event_sink`` (optional): called as ``event_sink(type, payload)`` for each
+    structured event ('status' / 'detect' / 'predict' / 'plan') so an in-process
+    consumer (e.g. ``modules.interface.DashboardServer``) can render it live. The
+    existing ``print(...)`` debug lines are always kept.
+    ``frame_register`` (optional): called once with the live vision pipeline so
+    the consumer can pull annotated frames for an MJPEG stream.
+    """
     if scenario_name not in SCENARIO_NAMES:
         known = ", ".join(sorted(SCENARIO_NAMES))
         raise ValueError(f"Unknown scenario '{scenario_name}'. Available: {known}")
@@ -1792,11 +1829,21 @@ def run_scheduler_scenario(
 
     start_time = time.monotonic()
     vision_config = dict(getattr(config, "vision", {}) or {})
+    # When the web dashboard owns the display, suppress the native cv2 window so
+    # the two GUIs don't compete (the annotated frame still streams over MJPEG
+    # because frame_register enables the web overlay).
+    if disable_native_window:
+        vision_config["show_window"] = False
     _vision_scenarios = ("production", "test_conveyor", "test_vision_only")
 
-    # Fail fast (before opening the camera) if a real-camera scenario was started
-    # without a live PLC executor — these scenarios must use real belt feedback.
-    if scenario_name in _vision_scenarios and executor is None:
+    # Scenarios that drive the real robot/belt and therefore require live PLC
+    # feedback. test_vision_only is camera-only (robot idle, belt static) and may
+    # run without a PLC, so it is intentionally excluded here.
+    _plc_required_scenarios = ("production", "test_conveyor")
+
+    # Fail fast (before opening the camera) if a belt scenario was started without
+    # a live PLC executor — these scenarios must use real belt feedback.
+    if scenario_name in _plc_required_scenarios and executor is None:
         raise RuntimeError(
             f"Scenario '{scenario_name}' requires live PLC conveyor_position feedback; "
             "do not use --simulate-executor for real scenarios."
@@ -1821,6 +1868,10 @@ def run_scheduler_scenario(
             },
             start_time,
         )
+    # Let an in-process consumer (web dashboard) pull annotated frames for MJPEG.
+    if frame_register is not None:
+        frame_register(image_processing)
+
     frame = ConveyorFrame()
     tracker = BeltTracker(
         frame,
@@ -1852,9 +1903,10 @@ def run_scheduler_scenario(
             executor.frame = frame
             executor.settings = settings
 
-    # Real-camera scenarios must use live PLC conveyor_position feedback — never a
+    # Belt scenarios must use live PLC conveyor_position feedback — never a
     # fabricated belt speed. Fail loudly if the wiring fell back to SimulatedSpeedSource.
-    if scenario_name in _vision_scenarios and isinstance(speed_source, SimulatedSpeedSource):
+    # test_vision_only is camera-only (static belt) so it is allowed to use it.
+    if scenario_name in _plc_required_scenarios and isinstance(speed_source, SimulatedSpeedSource):
         raise RuntimeError(
             f"Scenario '{scenario_name}' requires live PLC conveyor_position feedback; "
             "do not use --simulate-executor for real scenarios."
@@ -1877,8 +1929,10 @@ def run_scheduler_scenario(
             if deadline is not None and now >= deadline:
                 break
 
-            # Send conveyor speed command once at the start of the belt scenarios.
-            if scenario_name in ("test_conveyor", "test_vision_only") and not _conveyor_speed_sent:
+            # Send conveyor speed command once at the start of the belt scenario.
+            # test_vision_only keeps the robot idle and must NOT command the belt
+            # to run — it only reads conveyor_position passively from the PLC.
+            if scenario_name == "test_conveyor" and not _conveyor_speed_sent:
                 _conveyor_speed_sent = True
                 if hasattr(executor, "dispatch"):
                     try:
@@ -1896,11 +1950,31 @@ def run_scheduler_scenario(
             # to the latest encoder reading.
             sample = speed_source.sample(now)
             scheduler.update_speed(sample)
+            if event_sink is not None:
+                status_payload = {
+                    "scenario": scenario_name,
+                    "vx": round(sample.vx, 3),
+                    "vy": round(sample.vy, 3),
+                    "speed_mm_s": round(math.hypot(sample.vx, sample.vy), 3),
+                    "position_mm": round(sample.position_mm, 2),
+                }
+                # Robot end-effector pose for the dashboard charts. Available from
+                # the live PLC status (real / test_vision_only / test_conveyor);
+                # absent in --simulate-executor runs (no real pos_EE).
+                last_status = getattr(speed_source, "last_status", None)
+                pose = last_status.get("pos_EE") if isinstance(last_status, dict) else None
+                if isinstance(pose, (list, tuple)) and len(pose) >= 3:
+                    status_payload["x"] = round(float(pose[0]), 2)
+                    status_payload["y"] = round(float(pose[1]), 2)
+                    status_payload["z"] = round(float(pose[2]), 2)
+                    if isinstance(last_status, dict) and "end_effector" in last_status:
+                        status_payload["e"] = int(last_status.get("end_effector") or 0)
+                event_sink("status", status_payload)
             detections = image_processing.poll(now)
             scheduler.ingest_detections(detections, sample.position_mm)
 
             # Emit a snapshot of every tracked object's real R-frame position so
-            # run_test.py can plot detected objects moving live on the belt.
+            # the web dashboard (--interface) can show objects moving live on the belt.
             # Snapshot BEFORE prune so a freshly ingested object is reported at
             # least once even if prune is about to drop it this loop (e.g. it
             # already sits past workspace u_max).
@@ -1914,24 +1988,33 @@ def run_scheduler_scenario(
                     "y": round(y_r, 2),
                 })
             if tracked_objs:
-                print("[DETECT]", json.dumps({
+                detect_payload = {
                     "t": round(now - start_time, 3),
                     "z": round(settings.pickup_height, 2),
                     "objects": tracked_objs,
-                }, ensure_ascii=True), flush=True)
+                }
+                print("[DETECT]", json.dumps(detect_payload, ensure_ascii=True), flush=True)
+                if event_sink is not None:
+                    event_sink("detect", detect_payload)
 
             scheduler.prune_stale(now)
 
             plan = scheduler.plan_next(now)
             if plan is not None:
-                print("[PLAN]", json.dumps(plan.to_summary(), ensure_ascii=True))
+                plan_summary = plan.to_summary()
+                print("[PLAN]", json.dumps(plan_summary, ensure_ascii=True))
+                if event_sink is not None:
+                    event_sink("plan", plan_summary)
+                predict_payload = {
+                    "t": round(now - start_time, 3),
+                    "x": round(plan.predicted_pick_position_2d[0], 2),
+                    "y": round(plan.predicted_pick_position_2d[1], 2),
+                    "z": round(plan.predicted_pick_position_2d[2], 2),
+                }
                 if scenario_name in _vision_scenarios:
-                    print("[PREDICT]", json.dumps({
-                        "t": round(now - start_time, 3),
-                        "x": round(plan.predicted_pick_position_2d[0], 2),
-                        "y": round(plan.predicted_pick_position_2d[1], 2),
-                        "z": round(plan.predicted_pick_position_2d[2], 2),
-                    }, ensure_ascii=True))
+                    print("[PREDICT]", json.dumps(predict_payload, ensure_ascii=True))
+                if event_sink is not None:
+                    event_sink("predict", predict_payload)
                 try:
                     executor.execute(
                         plan,
