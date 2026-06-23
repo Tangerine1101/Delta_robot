@@ -397,6 +397,13 @@ class RoiFrame:
         y_px = float(self._np.dot(v, self._Yu))
         return x_px / self.pixels_per_mm, y_px / self.pixels_per_mm
 
+    def mm_to_pixel(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        """Inverse of to_mm: project (x_mm, y_mm) in the ROI frame back to pixels."""
+        if not self._ok:
+            return x_mm * self.pixels_per_mm, y_mm * self.pixels_per_mm
+        px = self._O + x_mm * self.pixels_per_mm * self._Xu + y_mm * self.pixels_per_mm * self._Yu
+        return float(px[0]), float(px[1])
+
 
 def _obb_corners(board: Obb, cv2_mod, np_mod):
     cx, cy, w, h, theta = board[0], board[1], board[2], board[3], board[4]

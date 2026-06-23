@@ -1,0 +1,122 @@
+// đây là 1 đoạn code ST trên plc dùng để check giới hạn vật lý trên plc.
+
+// =======================================================================
+// FUNCTION: Calc_Forward_Kinematics (Tính toán động học thuận Robot Delta 3D)
+// Trả về FALSE nếu tính toán thành công, TRUE nếu điểm nằm ngoài vùng làm việc
+// =======================================================================
+// LẤY GIÁ TRỊ GÓC THỰC TẾ (ACTUAL POSITION) TỪ ENCODER CỦA TRỤC
+// =======================================================================
+// Chuyển đổi các góc hiện tại từ Độ sang Radian
+t1 := Theta1 * Pi / 180.0;
+t2 := Theta2 * Pi / 180.0;
+t3 := Theta3 * Pi / -180.0;
+
+// Tính toán độ lệch tâm tương đối giữa Base và EndEffector
+// (w chính là dịch tâm ngang từ gốc tọa độ đến khớp khuỷu tay nếu chiếu lên mặt phẳng XY)
+w := 0.5 * Tan30 * (Base - EndEffector);
+
+// =======================================================================
+// BƯỚC 1: Tìm tọa độ không gian (x, y, z) của 3 khớp khuỷu tay (Elbow Joints)
+// Hệ tọa độ tiêu chuẩn: Trục 1 nằm dọc theo phần âm của trục Y
+// =======================================================================
+
+// Trục 1 (Góc lệch 0 độ so với trục tính toán, xoay về -Y)
+x_j1 := 0.0;
+y_j1 := -(w + Bicep * COS(t1));
+z_j1 := -Bicep * SIN(t1);
+
+// Trục 2 (Xoay +120 độ)
+x_j2 := (w + Bicep * COS(t2)) * Cos30;
+y_j2 := (w + Bicep * COS(t2)) * Sin30;
+z_j2 := -Bicep * SIN(t2);
+
+// Trục 3 (Xoay -120 độ hoặc 240 độ)
+x_j3 := -(w + Bicep * COS(t3)) * Cos30;
+y_j3 := (w + Bicep * COS(t3)) * Sin30;
+z_j3 := -Bicep * SIN(t3);
+
+// =======================================================================
+// BƯỚC 2: Giải hệ 3 phương trình mặt cầu có tâm tại các Elbow, bán kính Forearm
+// =======================================================================
+
+// =======================================================================
+// BƯỚC 2: Giải hệ 3 phương trình mặt cầu (Dạng tổng quát, KHÔNG RÚT GỌN SAI)
+// =======================================================================
+// BƯỚC 2: Giải hệ 3 phương trình mặt cầu có tâm tại các Elbow (Phiên bản Tổng quát)
+// =======================================================================
+
+// Tính tổng bình phương tọa độ của các Elbow
+r1 := y_j1 * y_j1 + z_j1 * z_j1;  // x_j1 = 0
+r2 := x_j2 * x_j2 + y_j2 * y_j2 + z_j2 * z_j2;
+r3 := x_j3 * x_j3 + y_j3 * y_j3 + z_j3 * z_j3;
+
+// Thiết lập các hệ số cho hệ phương trình tuyến tính 2 ẩn (X, Y) theo tham số Z
+// Dạng: 
+// A1*X + B1*Y = D1 - C1*Z
+// A2*X + B2*Y = D2 - C2*Z
+
+A1_coeff := x_j2;                   // Thực chất là (x_j2 - x_j1) nhưng x_j1 = 0
+B1_coeff := y_j2 - y_j1;
+C1_coeff := z_j2 - z_j1;
+D1_coeff := 0.5 * (r2 - r1);
+
+A2_coeff := x_j3;                   // Thực chất là (x_j3 - x_j1) nhưng x_j1 = 0
+B2_coeff := y_j3 - y_j1;
+C2_coeff := z_j3 - z_j1;
+D2_coeff := 0.5 * (r3 - r1);
+
+// Tính định thức (Determinant) của hệ phương trình
+det := (A1_coeff * B2_coeff) - (A2_coeff * B1_coeff);
+
+// Bẫy lỗi: Hệ vô nghiệm (Chỉ xảy ra khi 3 khuỷu tay cùng nằm trên 1 đường thẳng)
+IF det = 0.0 THEN
+    Calc_Forward_Kinematics := TRUE; 
+    RETURN;
+END_IF;
+
+// Sử dụng quy tắc Cramer để tìm a1, b1 (Cho X) và a2, b2 (Cho Y)
+// Để biểu diễn: X0 = a1 + b1*Z0
+a1 := (D1_coeff * B2_coeff - D2_coeff * B1_coeff) / det;
+b1 := -(C1_coeff * B2_coeff - C2_coeff * B1_coeff) / det;
+
+// Để biểu diễn: Y0 = a2 + b2*Z0
+a2 := (A1_coeff * D2_coeff - A2_coeff * D1_coeff) / det;
+b2 := -(A1_coeff * C2_coeff - A2_coeff * C1_coeff) / det;
+
+// =======================================================================
+// BƯỚC 3: Thay X0, Y0 vào phương trình mặt cầu 1 để tìm Z0
+// Tạo thành phương trình bậc 2: A_quad * Z0^2 + B_quad * Z0 + C_quad = 0
+// =======================================================================
+
+A_quad := b1 * b1 + b2 * b2 + 1.0;
+B_quad := 2.0 * (a1 * b1 + a2 * b2 - b2 * y_j1 - z_j1);
+C_quad := a1 * a1 + a2 * a2 - 2.0 * a2 * y_j1 + r1 - (Forearm * Forearm);
+
+// Tính Delta (Discriminant)
+d := (B_quad * B_quad) - (4.0 * A_quad * C_quad);
+
+// Kiểm tra xem vị trí các góc hiện tại có tạo ra tọa độ hợp lệ không
+IF d < 0.0 THEN
+    Calc_Forward_Kinematics := TRUE; // Trả về lỗi: Các khớp không thể kết nối
+    RETURN;
+END_IF;
+
+// Tính tọa độ trung tâm End-Effector (Z lấy nghiệm có dấu trừ phía trước SQRT 
+// vì đặc thù cơ cấu Delta robot làm việc ở nửa dưới trục Z)
+OutZ := (-B_quad - SQRT(d)) / (2.0 * A_quad);
+
+// Đẩy ngược Z0 vào hệ số tuyến tính để tìm X0 và Y0
+OutX := a1 + b1 * OutZ;
+OutY := a2 + b2 * OutZ;
+
+Calc_OutZ := LREAL_TO_REAL(OutZ);
+Calc_OutX := LREAL_TO_REAL(a1 + b1 * OutZ);
+Calc_OutY := LREAL_TO_REAL(a2 + b2 * OutZ);
+
+// Tính toán thành công
+Calc_Forward_Kinematics := FALSE;
+RETURN;
+
+// giới hạn được set trên động cơ:
+// upper limit (positive software limit): 75 degree
+// lower limit (negative software limit): -25 degree

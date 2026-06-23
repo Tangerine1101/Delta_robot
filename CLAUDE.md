@@ -75,7 +75,7 @@ It contains the current status, command mapping, PLC data contract, and verifica
 | 12 | `task_state` | DINT | 4 B |
 | 16 | `conveyor_position` | REAL | 4 B |
 
-- `conveyor_position` is the belt position in **cm** (the PLC accumulates and reports it pre-decoded). The PC multiplies by `conveyor.conveyor_position_scale_mm` (default 10.0) to get mm. This replaced the former raw `encoderA`/`encoderB` quadrature counts (DB2 shrank from 24 → 20 bytes).
+- `conveyor_position` is the belt position the PLC accumulates and reports pre-decoded. **As of June 2026 the PLC reports it in ≈mm**, so `conveyor.conveyor_position_scale_mm` is **1.0** (NOT the old `10.0` / cm assumption). The old ×10 inflated the scheduler's belt speed ~10× and broke all `test_conveyor` picks — confirmed against physical belt travel + PLC `speed_current`. Do not restore 10.0 without re-measuring belt travel vs `conveyor_position` delta. This field replaced the former raw `encoderA`/`encoderB` quadrature counts (DB2 shrank from 24 → 20 bytes).
 - TIA Portal DB must have **"Optimized block access" disabled** for snap7 raw byte access to work.
 - CPU must have **"Permit access with PUT/GET"** enabled under Protection & Security.
 

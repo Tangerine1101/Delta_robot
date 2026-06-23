@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,15 @@ COMMAND_ID = {
 
 COMMAND_NAME = {value: key for key, value in COMMAND_ID.items()}
 ARRAY_FIELDS = ("argument_x", "argument_y", "argument_z", "argument_e", "argument_time")
+
+# Commands whose argument_x/argument_y carry ABSOLUTE robot-frame coordinates and
+# must therefore be checked against the physical reach limit. goto_relative (1)
+# holds relative/joint deltas, not an absolute position, so it is excluded.
+_ABSOLUTE_POSITION_COMMANDS = (COMMAND_ID["goto_absolute"], COMMAND_ID["go_trajectory"])
+
+
+class WorkspaceLimitError(ValueError):
+    """Raised when a command would move the robot outside its physical reach."""
 
 
 def load_config() -> SimpleNamespace:
@@ -414,6 +424,9 @@ class PLCGateway:
         self.tag_write = tag_write
         self.tag_read = tag_read
         self.connected = False
+        # Physical reach: points outside a circle of this radius (mm) around the
+        # robot origin (0, 0) are rejected, never clamped (CLAUDE.md §4.4).
+        self.limit_radius_xy = float(getattr(self.config, "limit_radius_xy", 180.0))
 
         if PLC is not None and self.ip not in ("127.0.0.1", "localhost"):
             self.plc = PLC()
@@ -519,6 +532,32 @@ class PLCGateway:
 
         return package
 
+    def _check_xy_limit(self, package: dict[str, Any]) -> None:
+        """Reject any absolute-position command that reaches outside the physical
+        circle of radius self.limit_radius_xy around the robot origin (0, 0).
+
+        Only goto_absolute / go_trajectory carry absolute robot XY; for those we
+        check the first `argument_number` points (the meaningful ones — padding is
+        0.0 and trivially inside). Raises WorkspaceLimitError on the first
+        violation so no out-of-reach point is ever written to the PLC.
+        """
+        if package.get("commandID") not in _ABSOLUTE_POSITION_COMMANDS:
+            return
+
+        from modules.conveyor import is_within_xy_limit
+
+        xs = package.get("argument_x", [])
+        ys = package.get("argument_y", [])
+        n_points = max(int(package.get("argument_number", 0) or 0), 1)
+        for i in range(min(n_points, len(xs), len(ys))):
+            x, y = float(xs[i]), float(ys[i])
+            if not is_within_xy_limit(x, y, self.limit_radius_xy):
+                radius = math.hypot(x, y)
+                raise WorkspaceLimitError(
+                    f"point ({x:.1f}, {y:.1f}) is outside physical reach "
+                    f"(radius {radius:.1f} mm > limit {self.limit_radius_xy:.1f} mm)"
+                )
+
     @staticmethod
     def _write_result_ok(result: Any) -> bool:
         if result is None:
@@ -595,6 +634,7 @@ class PLCGateway:
             self.connect()
 
         normalized = self._normalize_package(package)
+        self._check_xy_limit(normalized)
         normalized["bit_doing"] = 1
 
         tags_and_values: list[tuple[str, Any]] = []

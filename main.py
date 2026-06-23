@@ -336,6 +336,7 @@ def _run_scheduler(args: argparse.Namespace) -> None:
     scheduler_config = getattr(config, "scheduler", {}) or {}
     wait_margin_s = float(scheduler_config.get("execution_margin_s", 0.3))
     status_poll_interval_s = float(scheduler_config.get("poll_interval_s", 0.05))
+    pick_arrival_tolerance_mm = float(scheduler_config.get("pick_arrival_tolerance_mm", 5.0))
     if args.scenario == "test_vision_only":
         # Connect the full PLC (Omron + Siemens) for live belt feedback, but keep
         # the robot idle: NullExecutor reads conveyor_position and sends the belt
@@ -348,6 +349,7 @@ def _run_scheduler(args: argparse.Namespace) -> None:
             interpolar_points=args.interpolar_points,
             wait_margin_s=wait_margin_s,
             status_poll_interval_s=status_poll_interval_s,
+            position_tolerance_mm=pick_arrival_tolerance_mm,
         )
 
     server, iface_kwargs = _start_interface(args)

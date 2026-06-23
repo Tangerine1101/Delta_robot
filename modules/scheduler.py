@@ -613,12 +613,17 @@ class RealRobotExecutor:
         interpolar_points: int,
         wait_margin_s: float,
         status_poll_interval_s: float,
+        position_tolerance_mm: float = 5.0,
     ) -> None:
         self.dispatch = dispatch
         self.request_status = request_status
         self.interpolar_points = interpolar_points
         self.wait_margin_s = wait_margin_s
         self.status_poll_interval_s = max(status_poll_interval_s, 0.02)
+        # pos_EE arrival tolerance for phase-completion gating (mm). Loose enough
+        # to absorb encoder/pos_EE quantization noise; tight enough to confirm the
+        # arm actually reached the commanded waypoint before the next phase.
+        self.position_tolerance_mm = max(float(position_tolerance_mm), 0.0)
         # Optional: set by run_scheduler_scenario for late-dispatch re-prediction (B2).
         self.speed_source: Any = None
         self.frame: Any = None
@@ -764,39 +769,155 @@ class RealRobotExecutor:
         return _trajectory_packet(new_trajectory_pick, self.interpolar_points)
 
     def _wait_until_pick_dispatch(self, plan: PickPlan) -> None:
-        remaining_s = plan.pick_dispatch_time - time.monotonic()
-        if remaining_s <= 0.0:
-            print(
-                "[WARN]",
-                json.dumps(
-                    {
-                        "plan_id": plan.plan_id,
-                        "event": "late_pick_dispatch",
-                        "late_by_s": round(abs(remaining_s), 4),
-                    },
-                    ensure_ascii=True,
-                ),
-            )
+        """Hold until the object actually reaches the workspace, then return.
+
+        The precomputed `pick_dispatch_time` assumes the belt holds the speed
+        seen at planning. Over the multi-second intercept wait the belt drifts
+        (noisy encoder + imprecise speed command), so a fixed sleep dispatches
+        early/late and the B2 re-prediction aborts as `outside_workspace`.
+        Instead, poll the live belt position and return as soon as the object's
+        contact point enters the window (or a safety deadline elapses) — the
+        caller's re-prediction then builds the pick from the true position.
+
+        Falls back to the legacy timed sleep when the live-feedback hooks
+        (speed_source / settings) are not wired (e.g. simulated executors).
+        """
+        if self.speed_source is None or self.settings is None:
+            remaining_s = plan.pick_dispatch_time - time.monotonic()
+            if remaining_s <= 0.0:
+                print(
+                    "[WARN]",
+                    json.dumps(
+                        {
+                            "plan_id": plan.plan_id,
+                            "event": "late_pick_dispatch",
+                            "late_by_s": round(abs(remaining_s), 4),
+                        },
+                        ensure_ascii=True,
+                    ),
+                )
+                return
+            time.sleep(remaining_s)
             return
-        time.sleep(remaining_s)
+
+        u_min, u_max, _v_min, _v_max = self.settings.workspace_window_uv
+        command_delay_s = (
+            self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
+        )
+        descent_time_s = _segment_duration(
+            (0.0, 0.0, self.settings.pre_pick_height),
+            (0.0, 0.0, self.settings.pickup_height),
+            self.settings,
+        )
+        u_anchor, _v_anchor = plan.object_uv_anchor
+        # Dispatch threshold = the planner's predicted pick u, so the object
+        # arrives where the goto already parked the arm (minimal re-prediction
+        # correction). Fall back to the window entry if the frame isn't wired.
+        u_target = u_min
+        if self.frame is not None:
+            try:
+                u_target, _ = self.frame.to_conveyor(
+                    plan.predicted_pick_position_2d[0],
+                    plan.predicted_pick_position_2d[1],
+                )
+            except Exception:
+                u_target = u_min
+        u_target = min(max(u_target, u_min), u_max)
+        # Safety ceiling so a stalled/under-speed belt can never hang the loop.
+        deadline = max(plan.pick_dispatch_time, time.monotonic()) + self.wait_margin_s
+        while True:
+            now = time.monotonic()
+            try:
+                sample = self.speed_source.sample(now)
+            except Exception as exc:
+                print(f"[WARN] pick-dispatch belt poll failed: {exc}")
+                return
+            u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
+            u_contact = u_now + sample.speed_uv * (command_delay_s + descent_time_s)
+            if u_contact >= u_target:
+                # Object has reached the planned pick point — dispatch now; the
+                # re-prediction enforces the downstream bound and aborts on
+                # genuine overshoot.
+                return
+            if now >= deadline:
+                print(
+                    "[WARN]",
+                    json.dumps(
+                        {
+                            "plan_id": plan.plan_id,
+                            "event": "pick_dispatch_timeout",
+                            "u_contact_mm": round(u_contact, 2),
+                            "u_min_mm": round(u_min, 2),
+                        },
+                        ensure_ascii=True,
+                    ),
+                )
+                return
+            time.sleep(self.status_poll_interval_s)
+
+    def _phase_target(self, packet: dict[str, Any]) -> "Position3D | None":
+        """Final commanded waypoint (R-frame XYZ) of a trajectory packet."""
+        n = int(packet.get("argument_number", 0))
+        xs = packet.get("argument_x") or []
+        ys = packet.get("argument_y") or []
+        zs = packet.get("argument_z") or []
+        if n >= 1 and len(xs) >= n and len(ys) >= n and len(zs) >= n:
+            try:
+                return (float(xs[n - 1]), float(ys[n - 1]), float(zs[n - 1]))
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _wait_for_phase_completion(self, packet: dict[str, Any]) -> None:
+        """Block until the commanded motion of `packet` actually finishes.
+
+        Primary signal: pos_EE convergence on the final commanded waypoint. The
+        Omron firmware ignores argument_time (fixed-max-speed) and reports a
+        stale task_state, so the old fixed timer burned the whole margin every
+        phase and pushed the pick past its window. Polling pos_EE ends the phase
+        the moment the arm arrives. A timer ceiling (expected_duration +
+        wait_margin_s) caps the wait so a locked arm or missing pos_EE can never
+        hang.
+        """
         argument_number = int(packet.get("argument_number", 0))
         durations = list(packet.get("argument_time", []))[:argument_number]
         expected_duration_s = max(sum(float(value) for value in durations), 0.0)
-        minimum_deadline = time.monotonic() + expected_duration_s
-        hard_deadline = minimum_deadline + self.wait_margin_s
-        last_status: dict[str, Any] | None = None
+        hard_deadline = time.monotonic() + expected_duration_s + self.wait_margin_s
+        target = self._phase_target(packet)
+        # Guard against a stale pos_EE (arm still at the previous waypoint, which
+        # for back-to-back picks can sit within tolerance of the new target):
+        # only accept "arrived" once the arm has first departed past tolerance.
+        departed = False
 
         while True:
             now = time.monotonic()
-            if now >= minimum_deadline:
-                last_status = self.request_status()
-                task_state = None if last_status is None else last_status.get("task_state")
-                if task_state is not None and int(task_state) == 0:
-                    return
-                if now >= hard_deadline:
-                    return
+            status = self.request_status()
+            # Primary: arm has reached the final waypoint (after departing).
+            if target is not None and isinstance(status, dict):
+                pos = status.get("pos_EE")
+                if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                    try:
+                        dx = float(pos[0]) - target[0]
+                        dy = float(pos[1]) - target[1]
+                        dz = float(pos[2]) - target[2]
+                        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    except (TypeError, ValueError):
+                        distance = None
+                    if distance is not None:
+                        if distance > self.position_tolerance_mm:
+                            departed = True
+                        elif departed:
+                            return
+            # Secondary (kept per CLAUDE.md §4.3): PLC reports idle.
+            task_state = status.get("task_state") if isinstance(status, dict) else None
+            if task_state is not None:
+                try:
+                    if int(task_state) == 0:
+                        return
+                except (TypeError, ValueError):
+                    pass
+            if now >= hard_deadline:
+                return
             time.sleep(self.status_poll_interval_s)
 
 

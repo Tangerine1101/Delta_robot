@@ -188,7 +188,7 @@ All system settings are stored in [config.json](file:///home/tangerine/Share/Glo
 Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,v) --(F_CONVEYOR_TO_ROBOT)--> R-frame (x,y)
 ```
 * `F_CONVEYOR_TO_ROBOT` — C→R; built from rotation `_THETA_RAD` (28°) and translation `(_T_X, _T_Y)`. This is the master pick transform: an error here offsets every pick.
-* `M_VISION_TO_CONVEYOR` — ROI-mm→C; currently a pure axis swap (`u = y_mm`, `v = x_mm`, zero offset). The `+u` sign is **unverified on a running belt** — flip `+y_mm → -y_mm` if `y_mm` decreases as a board moves downstream.
+* `M_VISION_TO_CONVEYOR` — ROI-mm→C; a pure axis swap (`u = y_mm`, `v = x_mm`, zero offset). The `+u` sign is **confirmed correct** on the live running belt (ROI `y_mm` increases downstream, matching `BeltTracker.current_uv`'s `+delta_p` convention).
 * `M_CAMERA_TO_ROBOT` / `CameraFrame` — **not used at runtime** (placeholder for a future direct pixel→robot path).
 
 **Per-setting frame map:**
@@ -209,14 +209,15 @@ Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,
 | `throughput_lanes` | scheduler | **C-frame `v`** (sim) | Cross-belt lane positions for simulated objects. |
 | `throughput_spawn_x` | scheduler | **unused (dead key)** | Loaded into settings but never consumed by `SimulatedImageProcessing`. |
 | `rotate_offset_deg` | scheduler | angle (deg) | Added to the vision `angle_deg` before the Siemens `rotate_absolute` command. |
-| `pixels_per_mm` | vision | **Pixel→ROI-mm** scale | Re-verify against the live 1920×1080 frame. |
-| `roi.polygon` | vision | **Pixel** | Defines the ROI-mm origin/axes. Re-verify @1080p. |
-| `trigger_line.y_px` | vision | **Pixel** | Emit/trigger line. Re-verify @1080p. |
+| `pixels_per_mm` | vision | **Pixel→ROI-mm** scale | Calibrated against the live 1920×1080 frame via [camera_calibrate.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/camera_calibrate.py) (`--scale` stage). |
+| `roi.polygon` | vision | **Pixel** | Defines the ROI-mm origin/axes. Calibrated via `camera_calibrate.py` (`--roi` stage). |
+| `trigger_line.y_px` | vision | **Pixel** | Emit/trigger line. Calibrated via `camera_calibrate.py` (`--trigger` stage). |
 
 > **Calibration-pending values** (must be set from physical measurement before production):
-> sorting-bin coordinates `QFP`/`TQFP`; `F_CONVEYOR_TO_ROBOT` rotation `_THETA_RAD`;
-> the `M_VISION_TO_CONVEYOR` `+u` sign; and the vision pixel-frame keys
-> (`pixels_per_mm`, `roi.polygon`, `trigger_line.y_px`).
+> sorting-bin coordinates `QFP`/`TQFP`, and `F_CONVEYOR_TO_ROBOT` rotation `_THETA_RAD`.
+> The vision pixel-frame keys (`pixels_per_mm`, `roi.polygon`, `trigger_line.y_px`) are
+> calibrated via `camera_calibrate.py`; re-run it if the camera is repositioned. The
+> `M_VISION_TO_CONVEYOR` `+u` sign has been confirmed correct on the live belt.
 
 ---
 
