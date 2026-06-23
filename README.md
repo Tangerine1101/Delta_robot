@@ -224,8 +224,8 @@ Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,
 ## 4. Documentation Index
 
 Detailed documentation files are available in the `doc/` directory:
-* [system_reference.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/system_reference.md): Detailed specifications, coordinate constraints, trajectory math formulas, and code logic descriptions.
-* [human_ideas.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/human_ideas.md): Human research notes, academic thesis topics, database schemas, and future ideas (AI should avoid editing this file).
+* [theory_basis.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/theory_basis.md): Human-oriented software architecture, coordinate transforms, and high-level concepts; maintained by the human team.
+* [academic_report.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/academic_report.md): Formal academic archive of the mathematical model, kinematics, and trajectory generation derivations.
 * [ai_context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/ai_context.md): Compact summary of codebase facts, command maps, and verification scripts for quick AI context updates.
 
 ---

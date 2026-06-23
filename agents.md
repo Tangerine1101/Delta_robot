@@ -1,4 +1,4 @@
-# CLAUDE.md — Delta Robot Project (Claude Guidelines)
+# agents.md — Delta Robot Project (General AI Guidelines)
 
 ## 0. Language
 Except the final report messages must be Vietnamese, you can freely use English for thinking and document writing for saving compute sake.
@@ -7,7 +7,7 @@ Except the final report messages must be Vietnamese, you can freely use English 
 
 **Always read `doc/ai_context.md` first** before reading any other file in this project.
 It contains the active status, directory tree guidelines, PLC memory contracts, manual camera exposure details, and verification commands.
-Since you are using Claude, you must follow this file (`CLAUDE.md`) and ignore `agents.md`.
+Since you are a general AI coding agent, you must follow this file (`agents.md`) and ignore `CLAUDE.md`.
 
 ---
 
