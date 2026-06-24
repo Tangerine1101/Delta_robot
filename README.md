@@ -151,16 +151,20 @@ All system settings are stored in [config.json](file:///home/tangerine/Share/Glo
 * `corner_blend_xy` (float): XY corner blend radius at trajectory waypoints for smoother motion.
 * `intercept_lead_time_s` (float): Minimum initial time estimate used to seed the interception convergence loop (seconds).
 * `release_descent_time_s` (float): Dwell time at the release point while the suction cup deactivates (seconds).
-* `nominal_xy_speed` (float): Nominal horizontal XY travel speed of the robot (mm/s).
-* `nominal_z_speed` (float): Nominal vertical Z travel speed of the robot (mm/s).
+* `nominal_xy_speed` (float): Nominal horizontal XY travel speed of the robot (mm/s). **No longer used for pick-time prediction** (the `interpolator` model below replaces it); now only fills the cosmetic per-segment `argument_time` array (which the Omron ignores).
+* `nominal_z_speed` (float): Nominal vertical Z travel speed of the robot (mm/s). Same status as `nominal_xy_speed`.
+* `interpolator` (object): Parameters of the PLC `MC_Inter_Curve_Vel` velocity model, ported to Python to compute **exact** goto/pick times (see §5 *Major Update 24/6*). Defaults mirror the real PLC function-block constants.
+  * `v_max` (float, mm/s): max linear velocity along the path (cruise cap). Used by every profile.
+  * `a_max` / `d_max` (float, mm/s²): max linear acceleration / deceleration. Used by every profile.
+  * `soft_start_s` (float, s): State-10 soft-start — a one-time linear ramp (20 PLC cycles ≈ 80 ms) from the actual servo position to the first waypoint, applied once per motion command (which always starts from rest). Added once to the total time.
+  * `scurve_shape_factor` (float): S-curve accel-shape compensation, `t_acc = factor·V/A`. `1.5` for the PLC's 4th-order polynomial (bell-shaped accel needs 50 % more time than a constant-accel ramp to hit `A_max`). **Only affects the S-curve (rest-to-rest) branch**; trapezoidal segments ignore it.
 * `stale_timeout_s` (float): Maximum time to track an object before dropping it from the queue (seconds).
 * `speed_timeout_s` (float): Expiry time for conveyor speed data if no new sample is received (seconds).
 * `poll_interval_s` (float): Scheduler loop repeat period (seconds).
 * `default_speed` (array): Default conveyor velocity vector `[vx, vy]` (mm/s) used in simulation or when PLC is disconnected.
 * `robot_movement_delay_s` (float): Mechanical response and acceleration lag of the physical robot (seconds).
 * `ethernet_delay_s` (float): One-way Ethernet communication latency (seconds).
-* `pickup_window_x` (array): X-axis bounding limit `[xmin, xmax]` of the valid pickup zone.
-* `pickup_window_y` (array): Y-axis bounding limit `[ymin, ymax]` of the valid pickup zone.
+* `pickup_window_x` / `pickup_window_y` — **removed.** The pickable region is now defined in the C-frame by `conveyor.workspace_window_uv` (see §3.3).
 * `throughput_object_types` (array): Object types spawned in the throughput simulation scenario.
 * `throughput_lanes` (array): X coordinates of the conveyor lanes where simulated objects are spawned.
 * `throughput_spawn_x` & `throughput_spawn_y` (float): Upstream spawn origin of simulated objects on the conveyor.
@@ -187,7 +191,7 @@ All system settings are stored in [config.json](file:///home/tangerine/Share/Glo
 ```
 Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,v) --(F_CONVEYOR_TO_ROBOT)--> R-frame (x,y)
 ```
-* `F_CONVEYOR_TO_ROBOT` — C→R; built from rotation `_THETA_RAD` (28°) and translation `(_T_X, _T_Y)`. This is the master pick transform: an error here offsets every pick.
+* `F_CONVEYOR_TO_ROBOT` — C→R; now **built from config** `conveyor.frame = { theta_deg, robot_origin_uv }`. `robot_origin_uv (u,v)` is the robot base expressed in conveyor axes (read off `doc/frames.png`); the translation column is derived as `T = -Rot(theta)·(u,v)`, so `(_T_X, _T_Y)` no longer need to be hand-computed. This is the master pick transform: an error here offsets every pick. Re-calibrate by editing `robot_origin_uv` (default `[360, 130]` → `T ≈ (54.2, -378.9)`).
 * `M_VISION_TO_CONVEYOR` — ROI-mm→C; a pure axis swap (`u = y_mm`, `v = x_mm`, zero offset). The `+u` sign is **confirmed correct** on the live running belt (ROI `y_mm` increases downstream, matching `BeltTracker.current_uv`'s `+delta_p` convention).
 * `M_CAMERA_TO_ROBOT` / `CameraFrame` — **not used at runtime** (placeholder for a future direct pixel→robot path).
 
@@ -232,6 +236,49 @@ Detailed documentation files are available in the `doc/` directory:
 
 ## 5. Updates & Roadmap
 
+### Major Update (24/6) — Exact PLC timing model, config-driven belt frame, calibration CLI
+
+This update consumes the new `doc/PLC_Program_description/` (the real Omron PLC code),
+turning several previously-guessed values into derivations from the PLC's own logic.
+
+1. **Exact trajectory timing — `MC_Inter_Curve_Vel` ported to Python.**
+   The PLC interpolator's velocity model (jerk-bounded **S-curve**, **trapezoidal**, and
+   **blend look-ahead** corner velocities) is reproduced in `modules/scheduler.py`
+   (`_segment_profile_time`, `_corner_v_end`, `_trajectory_total_time`). Pick-time
+   prediction (`_predict_pick_position`) and the dispatch lead now use the **exact**
+   trajectory time computed from the PLC's own constants instead of the crude
+   `distance / nominal_speed` estimate (the Omron ignores `argument_time` and runs the
+   interpolator at fixed limits, so this matches real motion far better).
+   - **Which profile runs when** (PLC `MC_Inter_Curve_Vel` §3.5): the S-curve is used
+     **only when both ends of a segment are at rest**. In a blended 7-point
+     `go_trajectory` the pipeline (Rungs 13–18) blends segments 0–4 and stops on segment
+     5, so **every segment runs trapezoidal** — including the final one, which enters at
+     the previous corner velocity (`V_start > 0`) and decelerates to a stop. A single
+     **point-to-point** rest-to-rest move is the S-curve case. (So: trajectory ⇒
+     trapezoidal throughout; lone P2P move ⇒ S-curve — matching the documented FB logic.)
+   - New `scheduler.interpolator` config block: `v_max`, `a_max`, `d_max`, `soft_start_s`,
+     `scurve_shape_factor` (see §3.2).
+
+2. **Config-driven conveyor→robot frame.** `conveyor.frame = { theta_deg, robot_origin_uv }`.
+   Type the belt offset `(u, v)` straight off `doc/frames.png` (default `[360, 130]`); the
+   homogeneous translation is derived as `T = -Rot(theta)·(u, v)`. No more hand-computing
+   `_T_X/_T_Y` in `conveyor.py` (see §3.3).
+
+3. **Calibration CLI commands** (`modules/cli.py`, available in `python3 main.py --cli`):
+   - `validate` — whole-config consistency + forbidden-circle check (wraps
+     `calibrate_everything --check`).
+   - `camera_tuning [args]` — delegates to `camera_calibrate.py` (ROI / trigger / scale).
+   - `speed_tuning` — runs a tilted heptagon (radius `limit_radius_xy/2`, Z tilted between
+     `clearance_height` and `slope_transition_height`) and **validates the interpolator
+     timing model** against the real arm: it compares the measured execution time with
+     `_trajectory_total_time` and reports the ratio plus a first-order `v_max` suggestion.
+     **Report-only** — never writes config.
+
+4. **Multi-object pick-lag bug (`doc/bug_report_final.md`).** With the PLC model the
+   dispatch contact-lead is `command_delay + soft_start` (PLC-faithful), so the report's
+   "Layer 2" was largely already correct. The real serialization cause — **Layer 1**, the
+   blocking single-threaded scheduler — is a **deferred** follow-up (see Roadmap).
+
 ### Recent Updates (23/5)
 * **4 DOF and Siemens PLC Integration**: Added support for 4th degree of freedom (end-effector suction rotation via stepper) and conveyor speed adjustments handled by a secondary Siemens S7-1200 PLC. Defined new command IDs: `rotate_absolute` (7), `change_speed` (8), and `plan_siemen` (9).
 * **2D Speed Vectors**: Updated conveyor speed calculations from a scalar speed to a 2D velocity vector `[vx, vy]` in `modules/scheduler.py` and `modules/config.json`.
@@ -239,6 +286,12 @@ Detailed documentation files are available in the `doc/` directory:
   $$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
 
 ### Future Roadmap
+0. **Concurrent executor (bug `bug_report_final.md` Layer 1 — highest priority)**:
+   - Decouple `executor.execute` onto a background thread/process so the main loop keeps
+     sampling the belt, polling vision, re-anchoring, and pre-planning the next object
+     *while* the arm handles the current pick. This removes the strict pick serialization
+     (loop frozen 4–7 s per pick) that causes every second-and-later pick in a burst to
+     land behind the part. Deferred from the 24/6 update.
 1. **Endianness Fix & 4th-Axis Rotation (Upcoming)**:
    - Change Siemens communication structs from `ctypes.Structure` to `ctypes.BigEndianStructure` in [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) for automatic S7-1200 big-endian compatibility. *(Done)*
    - Remove the hardcoded 90.0° rotation value in `RealRobotExecutor` in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py#L386-391) and replace with a dynamic $\theta$ angle supplied by the vision system.

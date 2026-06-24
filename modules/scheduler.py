@@ -237,6 +237,20 @@ class SchedulerSettings:
     rotate_offset_deg: float = 0.0
     # Fixed belt speed (mm/s) for test_conveyor scenario.
     test_conveyor_belt_speed_mm_s: float = 50.0
+    # PLC MC_Inter_Curve_Vel interpolator limits (mm/s, mm/s^2) and the State-10
+    # soft-start duration (s). Used to compute EXACT trajectory times that mirror
+    # the PLC, instead of the crude distance/nominal_speed estimate. Defaults from
+    # doc/PLC_Program_description/MC_inter_curve_vel.md (V_max=300, A=D=1000) and
+    # main_logic.md (20-cycle / 80 ms soft start).
+    interp_v_max: float = 300.0
+    interp_a_max: float = 1000.0
+    interp_d_max: float = 1000.0
+    interp_soft_start_s: float = 0.08
+    # S-curve shape-compensation factor (MC §3.2.2): t_acc = factor * V/A. 1.5 for
+    # the PLC's 4th-order polynomial (bell-shaped accel needs 50% more time than a
+    # constant-accel ramp to hit A_max). Exposed so the model can be matched to the
+    # real mechanism via the speed_tuning validation.
+    interp_scurve_shape_factor: float = 1.5
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -268,6 +282,7 @@ class SchedulerSettings:
     def from_config(cls, config: Any) -> "SchedulerSettings":
         scheduler_raw = getattr(config, "scheduler", {}) or {}
         conveyor_raw = getattr(config, "conveyor", {}) or {}
+        interpolator_raw = scheduler_raw.get("interpolator", {}) or {}
         raw_object_types = dict(getattr(config, "object_types", {}) or {})
         object_type_map: dict[str, str] = {}
         object_thickness_mm: dict[str, float] = {}
@@ -393,6 +408,13 @@ class SchedulerSettings:
             rotate_offset_deg=float(scheduler_raw.get("rotate_offset_deg", 0.0)),
             test_conveyor_belt_speed_mm_s=float(
                 scheduler_raw.get("test_conveyor_belt_speed_mm_s", 50.0)
+            ),
+            interp_v_max=float(interpolator_raw.get("v_max", 300.0)),
+            interp_a_max=float(interpolator_raw.get("a_max", 1000.0)),
+            interp_d_max=float(interpolator_raw.get("d_max", 1000.0)),
+            interp_soft_start_s=float(interpolator_raw.get("soft_start_s", 0.08)),
+            interp_scurve_shape_factor=float(
+                interpolator_raw.get("scurve_shape_factor", 1.5)
             ),
         )
         settings.validate()
@@ -722,12 +744,14 @@ class RealRobotExecutor:
         command_delay_s = (
             self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         )
-        pre_pick_z = self.settings.pre_pick_height
         pick_z = self.settings.pickup_height
-        descent_time = _segment_duration(
-            (0.0, 0.0, pre_pick_z), (0.0, 0.0, pick_z), self.settings
+        # Contact lead: after the pick command is issued, the gripper reaches
+        # Pos[0]=pickup at the end of the PLC's 80 ms soft-start (State 10), which
+        # absorbs the small pre_pick->pickup descent. Mirrors the PLC model rather
+        # than a nominal-speed estimate (the Omron ignores argument_time).
+        u_contact = u_now + sample.speed_uv * (
+            command_delay_s + self.settings.interp_soft_start_s
         )
-        u_contact = u_now + sample.speed_uv * (command_delay_s + descent_time)
 
         if not self.frame.is_in_window_uv(u_contact, v_anchor, self.settings.workspace_window_uv):
             return None
@@ -804,11 +828,8 @@ class RealRobotExecutor:
         command_delay_s = (
             self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         )
-        descent_time_s = _segment_duration(
-            (0.0, 0.0, self.settings.pre_pick_height),
-            (0.0, 0.0, self.settings.pickup_height),
-            self.settings,
-        )
+        # See _repredicted_pick_packet: contact = command_delay + PLC soft-start.
+        contact_lead_s = command_delay_s + self.settings.interp_soft_start_s
         u_anchor, _v_anchor = plan.object_uv_anchor
         # Dispatch threshold = the planner's predicted pick u, so the object
         # arrives where the goto already parked the arm (minimal re-prediction
@@ -833,7 +854,7 @@ class RealRobotExecutor:
                 print(f"[WARN] pick-dispatch belt poll failed: {exc}")
                 return
             u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
-            u_contact = u_now + sample.speed_uv * (command_delay_s + descent_time_s)
+            u_contact = u_now + sample.speed_uv * contact_lead_s
             if u_contact >= u_target:
                 # Object has reached the planned pick point — dispatch now; the
                 # re-prediction enforces the downstream bound and aborts on
@@ -1473,16 +1494,14 @@ class PickScheduler:
                 pick_position,
                 self.settings,
             )
-            goto_times = _build_goto_timing(
-                self.current_position,
-                goto_points,
-                self.settings,
+            # Exact gototime via the PLC interpolator model (the Omron ignores
+            # argument_time and runs at fixed V_max/A/D). The subsequent pick
+            # command's own 80 ms soft-start descends Pos[0]=pre_pick -> pickup to
+            # gripper contact, so add interp_soft_start_s once here.
+            goto_total = _trajectory_total_time(goto_points, self.settings)
+            new_guess = (
+                now + command_delay_s + goto_total + self.settings.interp_soft_start_s
             )
-            # B3 fix: include final descent (pre_pick → pickup) so the prediction
-            # accounts for the time the robot spends descending while the belt moves.
-            pre_pick_pos: Position3D = (pick_xy[0], pick_xy[1], self.settings.pre_pick_height)
-            descent_time = _segment_duration(pre_pick_pos, pick_position, self.settings)
-            new_guess = now + sum(goto_times) + descent_time + command_delay_s
             new_guess = max(new_guess, t_enter)
             if abs(new_guess - guess_pick_time) < 0.01:
                 guess_pick_time = new_guess
@@ -1545,6 +1564,148 @@ def _segment_duration(start: Position3D, end: Position3D, settings: SchedulerSet
         horizontal / settings.nominal_xy_speed if settings.nominal_xy_speed > 0.0 else 0.0,
         vertical / settings.nominal_z_speed if settings.nominal_z_speed > 0.0 else 0.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Exact trajectory timing — a Python port of the PLC MC_Inter_Curve_Vel
+# function block. See doc/PLC_Program_description/MC_inter_curve_vel.md (the
+# section numbers below cite that file) and main_logic.md (Rungs 13-18 chain +
+# Rung 21 t_total_estimate telemetry).
+#
+# These replace the crude distance/nominal_speed estimate as the basis for
+# pick-time prediction: the Omron ignores argument_time and runs the interpolator
+# at fixed V_max=300, A=D=1000, so this model matches the real motion far better.
+# ---------------------------------------------------------------------------
+
+
+def _segment_profile_time(
+    length: float,
+    v_start: float,
+    v_end: float,
+    v_max: float,
+    a_max: float,
+    d_max: float,
+    shape_factor: float = 1.5,
+) -> float:
+    """Execution time (s) of ONE linear segment under the PLC velocity model.
+
+    - both boundary velocities zero -> jerk-bounded S-curve (MC §3.2),
+    - otherwise -> trapezoidal with triangular fallback (MC §3.3).
+
+    `shape_factor` is the S-curve accel-shape compensation (1.5 for the PLC's
+    4th-order polynomial, MC §3.2.2); it only affects the stop-and-go branch.
+    """
+    if length <= 1e-9:
+        return 0.0
+    if v_max <= 0.0 or a_max <= 0.0 or d_max <= 0.0:
+        return 0.0
+
+    # Stop-and-go S-curve: both ends at rest.
+    if v_start <= 1e-9 and v_end <= 1e-9:
+        # min-distance coefficient = 0.5 * shape_factor (MC Eq 16: S_acc = 0.5*V*t_acc
+        # with t_acc = shape_factor*V/A).
+        coef = 0.5 * shape_factor
+        inv_sum = 1.0 / a_max + 1.0 / d_max
+        l_min = coef * v_max * v_max * inv_sum  # MC Eq 16
+        if length < l_min:
+            v_peak = math.sqrt(length / (coef * inv_sum))  # MC Eq 17
+        else:
+            v_peak = v_max
+        t_acc = shape_factor * v_peak / a_max  # MC Eq 8
+        t_dec = shape_factor * v_peak / d_max  # MC Eq 14
+        s_acc = 0.5 * v_peak * t_acc  # MC Eq 9
+        s_dec = 0.5 * v_peak * t_dec
+        s_run = length - s_acc - s_dec
+        t_run = s_run / v_peak if (s_run > 0.0 and v_peak > 0.0) else 0.0
+        return t_acc + max(0.0, t_run) + t_dec
+
+    # Trapezoidal (non-zero boundary velocity). V_peak from MC Eq 28, with a
+    # triangular fallback when the segment is too short to reach v_max.
+    s_limit = (
+        abs(v_max * v_max - v_start * v_start) / (2.0 * a_max)
+        + abs(v_max * v_max - v_end * v_end) / (2.0 * d_max)
+    )  # MC Eq 27
+    if s_limit > length:
+        v_peak = math.sqrt(
+            (2.0 * a_max * d_max * length + d_max * v_start * v_start + a_max * v_end * v_end)
+            / (a_max + d_max)
+        )  # MC Eq 28
+    else:
+        v_peak = v_max
+    # Safety clamps (MC §3.4.4): V_peak must not dip below the boundary velocities.
+    v_peak = max(v_peak, v_start, v_end)
+    t_acc = abs(v_peak - v_start) / a_max  # MC Eq 22
+    t_dec = abs(v_peak - v_end) / d_max    # MC Eq 23
+    s_acc = 0.5 * (v_start + v_peak) * t_acc  # MC Eq 24
+    s_dec = 0.5 * (v_end + v_peak) * t_dec    # MC Eq 25
+    s_run = length - s_acc - s_dec
+    t_run = s_run / v_peak if (s_run > 0.0 and v_peak > 0.0) else 0.0
+    return t_acc + max(0.0, t_run) + t_dec
+
+
+def _corner_v_end(
+    seg_start: Position3D,
+    seg_mid: Position3D,
+    seg_next: Position3D,
+    v_start: float,
+    v_max: float,
+    a_max: float,
+) -> float:
+    """Blend exit velocity at seg_mid (MC §3.4).
+
+    V_corner = V_max*cos(theta/2) via the half-angle identity, clamped by the
+    reachability limit V_reach = sqrt(v_start^2 + 2*A*L1) and V_max.
+    """
+    v1 = (seg_mid[0] - seg_start[0], seg_mid[1] - seg_start[1], seg_mid[2] - seg_start[2])
+    v2 = (seg_next[0] - seg_mid[0], seg_next[1] - seg_mid[1], seg_next[2] - seg_mid[2])
+    l1 = math.sqrt(v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2])
+    l2 = math.sqrt(v2[0] * v2[0] + v2[1] * v2[1] + v2[2] * v2[2])
+    if l1 <= 1e-9 or l2 <= 1e-9:
+        cos_theta = 1.0
+    else:
+        cos_theta = (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (l1 * l2)
+        cos_theta = max(-1.0, min(1.0, cos_theta))  # MC line 175 clamp
+    v_corner = v_max * math.sqrt(max(0.0, (cos_theta + 1.0) / 2.0))  # MC Eq 30
+    v_reach = math.sqrt(max(0.0, v_start * v_start + 2.0 * a_max * l1))  # MC Eq 33
+    return min(v_corner, v_reach, v_max)  # MC Eq 34
+
+
+def _trajectory_total_time(
+    points: list[Position3D],
+    settings: SchedulerSettings,
+) -> float:
+    """Exact execution time (s) of a go_trajectory packet under the PLC model.
+
+    `points` are the packet waypoints Pos[0..N-1] (e.g. the 7 goto/pick points).
+    The PLC daisy-chains MC_Inter_Curve_Vel instances over the N-1 segments:
+    segments 0..N-2 blend (each exits at the look-ahead corner velocity, which
+    becomes the next segment's entry velocity) and the final segment decelerates
+    to a full stop. A one-time 80 ms soft-start (State 10) is added because the
+    chain begins from rest at Pos[0]. The arm's pre-trajectory position is bridged
+    to Pos[0] by that same soft-start, so it is not a separate timed segment.
+    """
+    v_max = settings.interp_v_max
+    a_max = settings.interp_a_max
+    d_max = settings.interp_d_max
+    shape = settings.interp_scurve_shape_factor
+
+    n_seg = len(points) - 1
+    if n_seg <= 0:
+        return 0.0
+
+    total = settings.interp_soft_start_s  # State 10 soft-start, once (v_start = 0)
+    v_start = 0.0
+    for i in range(n_seg):
+        a = points[i]
+        b = points[i + 1]
+        length = math.dist(a, b)
+        if i == n_seg - 1:
+            v_end = 0.0  # final segment: stop-and-go
+        else:
+            v_end = _corner_v_end(a, b, points[i + 2], v_start, v_max, a_max)
+        total += _segment_profile_time(length, v_start, v_end, v_max, a_max, d_max, shape)
+        v_start = v_end
+    return total
 
 
 def _build_goto_geometry(

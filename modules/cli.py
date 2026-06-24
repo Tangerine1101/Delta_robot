@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import math
+import os
 import shlex
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -314,6 +319,180 @@ def _parse_plan(
     raise ValueError(f"Unknown command: {command}")
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _run_validate() -> None:
+    """Validate the whole config (delegates to calibrate_everything --check)."""
+    try:
+        import calibrate_everything  # repo-root script; no cv2/ultralytics imported
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] could not import calibrate_everything: {exc}")
+        return
+    print("[INFO] Validating config (calibrate_everything --check)...")
+    try:
+        rc = calibrate_everything.main(["--check"])
+    except SystemExit as exc:
+        rc = int(exc.code) if exc.code is not None else 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] validation crashed: {exc}")
+        return
+    print(f"[INFO] validate result: {'OK' if rc == 0 else f'FAILED ({rc})'}")
+
+
+def _run_camera_tuning(extra_args: list[str]) -> None:
+    """Run the interactive camera calibration tool (camera_calibrate.py).
+
+    Delegated as a subprocess so QT_QPA_PLATFORM/cv2 stay isolated from the CLI
+    process. Extra tokens are passed through (e.g. `camera_tuning --roi`).
+    """
+    script = os.path.join(_REPO_ROOT, "camera_calibrate.py")
+    cmd = [sys.executable, script, *extra_args]
+    print(f"[INFO] delegating to camera_calibrate.py: {' '.join(cmd)}")
+    try:
+        rc = subprocess.run(cmd, cwd=_REPO_ROOT, check=False).returncode
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] camera_tuning failed: {exc}")
+        return
+    print(f"[INFO] camera_tuning exit code: {rc}")
+
+
+def _wait_for_arrival(
+    request_status: Callable[[], dict[str, Any] | None],
+    target: tuple[float, float, float],
+    *,
+    tol_mm: float = 5.0,
+    timeout_s: float = 30.0,
+    poll_s: float = 0.05,
+    depart_from: tuple[float, float, float] | None = None,
+) -> bool:
+    """Poll pos_EE until it is within `tol_mm` of `target` (or timeout).
+
+    When `depart_from` is given, the arm must first move more than `tol_mm` away
+    from it before an arrival is accepted. This guards against a stale pos_EE
+    reading "already arrived" before the commanded motion has actually started —
+    the main cause of the flaky single-shot measurement.
+    """
+    deadline = time.monotonic() + timeout_s
+    departed = depart_from is None
+    while time.monotonic() < deadline:
+        status = request_status()
+        if isinstance(status, dict):
+            pos = status.get("pos_EE")
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                try:
+                    p = (float(pos[0]), float(pos[1]), float(pos[2]))
+                except (TypeError, ValueError):
+                    p = None
+                if p is not None:
+                    if not departed and depart_from is not None:
+                        if math.dist(p, depart_from) > tol_mm:
+                            departed = True
+                    if departed and math.dist(p, target) <= tol_mm:
+                        return True
+        time.sleep(poll_s)
+    return False
+
+
+def _run_speed_tuning(
+    dispatch: Callable[[dict[str, Any]], dict[str, Any] | None],
+    request_status: Callable[[], dict[str, Any] | None] | None,
+    interpolar_points: int,
+) -> None:
+    """Validate the MC_Inter_Curve_Vel timing model against the real mechanism.
+
+    Builds an `interpolar_points`-vertex polygon (heptagon at the default 7) on a
+    circle of radius `limit_radius_xy / 2`, tilted in Z between `clearance_height`
+    (highest) and `slope_transition_height` (lowest). The arm is parked at vertex
+    0, then the polygon is sent as one go_trajectory and the real execution time is
+    measured against pos_EE feedback and compared with `_trajectory_total_time`
+    (the PLC model used for pick prediction). Reports the measured/model ratio and
+    a first-order interpolator suggestion — it never writes config.
+    """
+    if request_status is None:
+        print("[ERROR] speed_tuning needs PLC status feedback (run with a live/fake PLC)")
+        return
+
+    from modules.EthernetCom import load_config
+    from modules.conveyor import is_within_xy_limit
+    from modules.scheduler import SchedulerSettings, _trajectory_total_time
+
+    try:
+        settings = SchedulerSettings.from_config(load_config())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] could not load scheduler settings: {exc}")
+        return
+    limit_radius_xy = float(getattr(load_config(), "limit_radius_xy", 180.0))
+
+    n = max(3, interpolar_points)
+    radius = limit_radius_xy / 2.0
+    z_mid = (settings.clearance_height + settings.slope_transition_height) / 2.0
+    amp = (settings.clearance_height - settings.slope_transition_height) / 2.0
+
+    points: list[dict[str, Any]] = []
+    waypoints: list[tuple[float, float, float]] = []
+    for i in range(n):
+        ang = 2.0 * math.pi * i / n
+        x = radius * math.cos(ang)
+        y = radius * math.sin(ang)
+        z = z_mid + amp * math.cos(ang)  # highest at clearance, lowest at slope
+        if not is_within_xy_limit(x, y, limit_radius_xy):
+            print(f"[ERROR] vertex ({x:.1f},{y:.1f}) outside reach circle; abort")
+            return
+        points.append({"x": x, "y": y, "z": z, "e": 0, "time": 0.4})
+        waypoints.append((x, y, z))
+
+    # Model prediction for the SAME packet the PLC will run (Pos[0..n-1]).
+    model_time = _trajectory_total_time(waypoints, settings)
+    path_len = sum(math.dist(waypoints[i], waypoints[i + 1]) for i in range(n - 1))
+    first, last = waypoints[0], waypoints[-1]
+
+    print(f"[INFO] speed_tuning (model validation): {n}-gon r={radius:.1f}mm, "
+          f"z {settings.slope_transition_height:.1f}..{settings.clearance_height:.1f}, "
+          f"path={path_len:.1f}mm")
+    print(f"[INFO] model predicts {model_time:.3f}s "
+          f"(v_max={settings.interp_v_max:.0f}, a={settings.interp_a_max:.0f}, "
+          f"d={settings.interp_d_max:.0f}, soft_start={settings.interp_soft_start_s:.3f}s)")
+
+    # 1) Park at vertex 0.
+    print("[INFO] moving to start vertex...")
+    dispatch(_cartesian_command("goto_absolute", first[0], first[1], first[2], interpolar_points))
+    if not _wait_for_arrival(request_status, first):
+        print("[WARN] did not confirm arrival at start vertex; aborting measurement")
+        return
+
+    # 2) Send the polygon and time it. depart_from guards against a stale pos_EE
+    #    reading "arrived" before the motion actually starts.
+    print("[INFO] running trajectory and measuring...")
+    dispatch(_trajectory_command("speed_tuning", points, interpolar_points))
+    t_start = time.monotonic()
+    reached = _wait_for_arrival(request_status, last, timeout_s=60.0, depart_from=first)
+    elapsed = time.monotonic() - t_start
+
+    if not reached:
+        print(f"[WARN] arm did not reach the final vertex within timeout "
+              f"(elapsed {elapsed:.2f}s) — measurement unreliable, retry")
+        return
+    if elapsed <= 1e-3 or model_time <= 1e-6:
+        print("[WARN] elapsed/model time too small to compare")
+        return
+
+    ratio = elapsed / model_time
+    measured_speed = path_len / elapsed
+    print(f"[RESULT] measured {elapsed:.3f}s vs model {model_time:.3f}s  "
+          f"-> ratio {ratio:.3f} (avg speed {measured_speed:.1f} mm/s)")
+    if ratio > 1.05:
+        print(f"[RESULT] real arm is SLOWER than the model. First-order fix: lower "
+              f"interpolator.v_max to ~{settings.interp_v_max / ratio:.0f} mm/s "
+              f"(also check a_max/d_max).")
+    elif ratio < 0.95:
+        print(f"[RESULT] real arm is FASTER than the model. First-order fix: raise "
+              f"interpolator.v_max to ~{settings.interp_v_max / ratio:.0f} mm/s.")
+    else:
+        print("[RESULT] model matches the mechanism within 5% — interpolator config OK.")
+    print("[RESULT] report only — config NOT modified.")
+
+
 def _print_help() -> None:
     print(
         "\nCommands:\n"
@@ -332,6 +511,9 @@ def _print_help() -> None:
         "  calib\n"
         "  pick\n"
         "  release\n"
+        "  validate                             # validate the whole config\n"
+        "  camera_tuning [args]                 # run camera calibration tool\n"
+        "  speed_tuning                         # validate PLC timing model (tilted heptagon)\n"
         "  status\n"
         "  help\n"
         "  quit / exit\n"
@@ -369,6 +551,23 @@ def run_interactive(
             return
 
         if not line:
+            continue
+
+        # Calibration meta-commands need dispatch/request_status and don't map to
+        # a single PLC package, so intercept them before _parse_plan.
+        try:
+            meta_tokens = shlex.split(line)
+        except ValueError:
+            meta_tokens = line.split()
+        meta_cmd = meta_tokens[0].lower() if meta_tokens else ""
+        if meta_cmd == "validate":
+            _run_validate()
+            continue
+        if meta_cmd == "camera_tuning":
+            _run_camera_tuning(meta_tokens[1:])
+            continue
+        if meta_cmd == "speed_tuning":
+            _run_speed_tuning(dispatch, request_status, interpolar_points)
             continue
 
         try:

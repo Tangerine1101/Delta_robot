@@ -7,6 +7,8 @@ from modules.scheduler import (
     _build_goto_geometry,
     _build_pick_geometry,
     _segment_duration,
+    _segment_profile_time,
+    _trajectory_total_time,
 )
 
 
@@ -29,13 +31,18 @@ def _settings(**overrides):
         "default_speed": (0.0, 80.0),
         "robot_movement_delay_s": 0.05,
         "ethernet_delay_s": 0.002,
-        "pickup_window_x": (-120.0, 50.0),
-        "pickup_window_y": (-60.0, 60.0),
+        "workspace_window_uv": (275.0, 400.0, 10.0, 120.0),
+        "camera_window_uv": (50.0, 250.0, -75.0, 75.0),
+        "conveyor_length_mm": 800.0,
+        "conveyor_position_scale_mm": 1.0,
+        "object_dimensions": {"object_A": (30.0, 40.0)},
         "accuracy_points": [
             (40.0, -60.0, -300.0),
             (0.0, 0.0, -290.0),
             (-40.0, 60.0, -300.0),
         ],
+        "accuracy_points_uv": [],
+        "accuracy_spawn_uv": [(300.0, 40.0)],
         "log_path": "data.log",
         "object_type_map": {"object_A": "object_A"},
         "object_thickness_mm": {"object_A": 0.0},
@@ -96,18 +103,57 @@ class TrajectoryGeometryTests(unittest.TestCase):
         )
 
 
+class InterpolatorTimingTests(unittest.TestCase):
+    """Port of the PLC MC_Inter_Curve_Vel timing model (doc/PLC_Program_description)."""
+
+    def test_scurve_with_cruise_matches_closed_form(self):
+        # 200 mm, V=300, A=D=1000: t_acc=t_dec=0.45 s, s_acc=s_dec=67.5 mm,
+        # s_run=65 mm -> t_run=0.21667 s, total=1.11667 s.
+        t = _segment_profile_time(200.0, 0.0, 0.0, 300.0, 1000.0, 1000.0)
+        self.assertAlmostEqual(t, 0.45 + 65.0 / 300.0 + 0.45, places=4)
+
+    def test_short_segment_uses_triangular_fallback(self):
+        # 50 mm < l_min(135 mm) -> v_peak < v_max, no cruise.
+        t = _segment_profile_time(50.0, 0.0, 0.0, 300.0, 1000.0, 1000.0)
+        v_peak = math.sqrt(50.0 / (0.75 * (2.0 / 1000.0)))
+        self.assertAlmostEqual(t, 2.0 * (1.5 * v_peak / 1000.0), places=4)
+
+    def test_zero_length_segment_is_zero(self):
+        self.assertEqual(_segment_profile_time(0.0, 0.0, 0.0, 300.0, 1000.0, 1000.0), 0.0)
+
+    def test_trajectory_time_includes_soft_start_and_is_positive(self):
+        settings = _settings()
+        start = (0.0, 0.0, -290.0)
+        pick = (120.0, 60.0, -310.0)
+        goto = _build_goto_geometry(start, pick, settings)
+        total = _trajectory_total_time(goto, settings)
+        # Strictly greater than the lone 80 ms soft-start, and faster than the same
+        # path run as independent stop-and-go segments (blending saves time).
+        self.assertGreater(total, settings.interp_soft_start_s)
+        stop_and_go = settings.interp_soft_start_s + sum(
+            _segment_profile_time(
+                math.dist(goto[i], goto[i + 1]), 0.0, 0.0,
+                settings.interp_v_max, settings.interp_a_max, settings.interp_d_max,
+            )
+            for i in range(len(goto) - 1)
+        )
+        self.assertLessEqual(total, stop_and_go + 1e-9)
+
+
 class SimulatedPerceptionTests(unittest.TestCase):
     def test_accuracy_points_cycle_in_order(self):
         start = 1000.0
+        # test_accuracy now spawns objects at C-frame (u, v) from accuracy_spawn_uv;
+        # detection.x = u, detection.y = v.
         sim = SimulatedImageProcessing(
             "test_accuracy",
             {
                 "throughput_object_types": ["object_A"],
                 "accuracy_emit_interval_s": 0.8,
-                "accuracy_points": [
-                    (40.0, -60.0, -300.0),
-                    (0.0, 0.0, -290.0),
-                    (-40.0, 60.0, -300.0),
+                "accuracy_spawn_uv": [
+                    (40.0, -60.0),
+                    (0.0, 0.0),
+                    (-40.0, 60.0),
                 ],
             },
             start,
@@ -122,7 +168,10 @@ class SimulatedPerceptionTests(unittest.TestCase):
             [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0), (40.0, -60.0)],
         )
 
-    def test_throughput_spawns_lanes_on_x_and_moves_along_y(self):
+    def test_throughput_spawns_at_u_spawn_across_v_lanes(self):
+        # C-frame convention: throughput_spawn_y is the upstream u_spawn (shared by
+        # every object) and throughput_lanes are the per-object v lanes, so
+        # detection.x = u_spawn and detection.y = lane.
         sim = SimulatedImageProcessing(
             "test_throughput",
             {
@@ -137,7 +186,7 @@ class SimulatedPerceptionTests(unittest.TestCase):
         detections = sim.poll(1000.7)
         self.assertEqual(
             [(d.x, d.y) for d in detections],
-            [(-50.0, -180.0), (0.0, -180.0), (50.0, -180.0)],
+            [(-180.0, -50.0), (-180.0, 0.0), (-180.0, 50.0)],
         )
 
 

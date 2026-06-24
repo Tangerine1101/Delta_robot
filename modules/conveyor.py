@@ -37,54 +37,77 @@ from modules.image_processing import ObjectDetection
 # The robot frame is rotated by theta from the conveyor frame: the belt's
 # downstream axis (+u, where the pick workspace lives) expressed in the robot
 # frame is (-sin theta, cos theta), and the cross-belt axis (+v) is
-# (cos theta, sin theta).
-# With u along the belt flow and v cross-belt, the homogeneous map (u, v) ->
-# (x_R, y_R) is:
+# (cos theta, sin theta). With u along the belt flow and v cross-belt, the
+# homogeneous map (u, v) -> (x_R, y_R) is:
 #     x_R = -sin(theta)*u + cos(theta)*v + T_X
 #     y_R =  cos(theta)*u + sin(theta)*v + T_Y
 #
-# TRANSLATION (T_X, T_Y): the belt-frame origin expressed directly in ROBOT
-# coordinates. This is a PURE translation measured along the robot axes — it is
-# NOT the rotation applied to a page-frame offset. The 2x2 block below already
-# handles the orientation of (u, v); T_X/T_Y only shift the origin.
+# Both theta and the belt offset now live in config.json under `conveyor.frame`:
+#     "frame": { "theta_deg": 28.0, "robot_origin_uv": [360.0, 130.0] }
 #
-# PLACEHOLDER values — calibrate them empirically: run `test_vision_only` without
-# a PLC (camera-only), read the board's R-frame position on the web dashboard, and
-# nudge these two constants until it matches the hand-measured position.
-_THETA_RAD = math.radians(28.0)
+# `robot_origin_uv` (u_off, v_off) is the ROBOT base position expressed in the
+# conveyor (u, v) frame — read straight off doc/frames.png (u=360 along
+# X_conveyor, v=130 along Y_conveyor). The translation column is then DERIVED so
+# the robot base maps to the R-frame origin:
+#     Rot·(u_off, v_off) + T = (0, 0)   =>   T = -Rot·(u_off, v_off)
+# This is the "multiply the offset by the rotation matrix" step that previously
+# had to be done by hand to fill in T_X/T_Y. Just edit u/v in config now.
+# Cross-check: (360, 130) -> T ≈ (54.2, -378.9), matching the old frames.png
+# estimate (~54, -379). To re-calibrate, run `test_vision_only`, read the board's
+# R-frame position on the dashboard, and nudge robot_origin_uv until it matches.
+
+
+def _build_F_from_config(
+    theta_deg: float, robot_origin_uv: tuple[float, float]
+) -> "Matrix3":
+    """Conveyor (u, v) -> robot (x, y) homogeneous transform.
+
+    The 2x2 orientation block is fixed by `theta_deg`; the translation column is
+    derived from `robot_origin_uv` (the robot base in conveyor coords) so the
+    base maps to the R-frame origin: T = -Rot·(u_off, v_off).
+    """
+    theta = math.radians(theta_deg)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    u_off, v_off = float(robot_origin_uv[0]), float(robot_origin_uv[1])
+    # Rot·(u_off, v_off) using the (-sin, cos / cos, sin) block, then negate.
+    t_x = -(-sin_t * u_off + cos_t * v_off)
+    t_y = -(cos_t * u_off + sin_t * v_off)
+    return (
+        (-sin_t, cos_t, t_x),
+        (cos_t, sin_t, t_y),
+        (0.0, 0.0, 1.0),
+    )
+
+
+def _load_frame_params() -> tuple[float, tuple[float, float]]:
+    """Read (theta_deg, robot_origin_uv) from config.json `conveyor.frame`."""
+    conveyor_cfg = getattr(load_config(), "conveyor", {}) or {}
+    frame_cfg = conveyor_cfg.get("frame", {}) or {}
+    theta_deg = float(frame_cfg.get("theta_deg", 28.0))
+    raw_uv = frame_cfg.get("robot_origin_uv", [360.0, 130.0])
+    if isinstance(raw_uv, (list, tuple)) and len(raw_uv) >= 2:
+        robot_origin_uv = (float(raw_uv[0]), float(raw_uv[1]))
+    else:
+        robot_origin_uv = (360.0, 130.0)
+    return theta_deg, robot_origin_uv
+
+
+_THETA_DEG, _ROBOT_ORIGIN_UV = _load_frame_params()
+_THETA_RAD = math.radians(_THETA_DEG)
 _COS_T = math.cos(_THETA_RAD)
 _SIN_T = math.sin(_THETA_RAD)
 
-# Belt-frame origin (u=0, v=0) expressed in robot coordinates (mm, pure
-# translation). T is what a board at the C-frame origin reads in the robot frame;
-# a board elsewhere reads R = (2x2 rotation)·(u, v) + (T_X, T_Y).
-#
-# CALIBRATED (2026-06-21) against the live test_vision_only board: it detects at
-# C-frame (u, v) = (112.5, 20.2) and was hand-measured at robot (0, -285). The
-# rotation part rot·(112.5, 20.2) = (-35.0, 108.8), so to land (0, -285) the
-# translation must be (T_X, T_Y) = (0, -285) - (-35.0, 108.8) = (35.0, -393.8).
-# Cross-check: frames.png places the conveyor origin at page (+360, -130) from
-# the robot base, mapping to robot ~(54, -379) — within the 20-30 mm measurement
-# tolerance, which confirms the 28 deg rotation block.
-#
-# The previous (-285, 0) was wrong on two counts: it assumed the board sat at the
-# C-frame origin (it actually sits 112 mm down-belt) and it swapped the X/Y of
-# the measurement (board is at (0, -285), not (-285, 0)). Result: robot (-320, 108).
-_T_X = 34.9    # robot-X of the C-frame origin (was -285.0)
-_T_Y = -393.8  # robot-Y of the C-frame origin (was 0.0)
-
-F_CONVEYOR_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
-    (-_SIN_T, _COS_T, _T_X),
-    (_COS_T,  _SIN_T, _T_Y),
-    (0.0,     0.0,    1.0),
-)
+F_CONVEYOR_TO_ROBOT: "Matrix3" = _build_F_from_config(_THETA_DEG, _ROBOT_ORIGIN_UV)
+_T_X = F_CONVEYOR_TO_ROBOT[0][2]   # robot-X of the C-frame origin (derived)
+_T_Y = F_CONVEYOR_TO_ROBOT[1][2]   # robot-Y of the C-frame origin (derived)
 
 # Composite camera-pixel -> robot homogeneous transform.
 # NOTE: `CameraFrame` / this matrix is NOT used at runtime — the vision pipeline
 # maps camera ROI mm -> C-frame (u, v) via M_VISION_TO_CONVEYOR and then to the
 # robot frame via F_CONVEYOR_TO_ROBOT. Kept as a placeholder for a future direct
 # pixel->robot path; replace with H homography times F once camera is calibrated.
-M_CAMERA_TO_ROBOT: tuple[tuple[float, float, float], ...] = (
+M_CAMERA_TO_ROBOT: "Matrix3" = (
     (-_COS_T, _SIN_T, _T_Y),
     (_SIN_T,  _COS_T, _T_X),
     (0.0,     0.0,    1.0),

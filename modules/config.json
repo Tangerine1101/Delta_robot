@@ -23,6 +23,13 @@
     "conveyor": {
         "conveyor_position_scale_mm": 1.0,
         "length_mm": 800.0,
+        "frame": {
+            "theta_deg": 28.0,
+            "robot_origin_uv": [
+                360.0,
+                130.0
+            ]
+        },
         "camera_window_uv": [
             50.0,
             250.0,
@@ -161,8 +168,15 @@
         "corner_blend_xy": 25.0,
         "intercept_lead_time_s": 0.14,
         "release_descent_time_s": 0.14,
-        "nominal_xy_speed": 120.0,
-        "nominal_z_speed": 120.0,
+        "nominal_xy_speed": 220.0,
+        "nominal_z_speed": 220.0,
+        "interpolator": {
+            "v_max": 300.0,
+            "a_max": 1000.0,
+            "d_max": 1000.0,
+            "soft_start_s": 0.08,
+            "scurve_shape_factor": 1.5
+        },
         "stale_timeout_s": 5.0,
         "speed_timeout_s": 1.0,
         "poll_interval_s": 0.05,
