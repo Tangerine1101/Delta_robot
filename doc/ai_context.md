@@ -1,6 +1,7 @@
 # AI Context Summary: Delta Robot
 
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
+> **Status (real-time pick rewrite)**: The real conveyor pick path (`production` / `test_conveyor`) was rebuilt as a **two-thread** PC-side scheduler to kill the multi-object "arrive → wait → miss" lag. A daemon **perception thread** (`_realtime_perception_loop`, ~25 ms) owns the only PLC status read and keeps shared `RealtimeState` (belt position/speed, `pos_EE`, the `BeltTracker`, claimed ids) fresh under `state_lock`; the **main decision/execution thread** selects an object (danger-zone priority), predicts a stable straight-down pick point, parks the arm with a 1.6 s lead (`intercept_lead_time_s`), then fires the pick on a **live positional gate** — when the tracked object's `u` reaches the parked pick `u` — with no post-park time math. Dispatch/status round-trips share one `ipc_lock`. New code lives in `RealtimePickExecutor` + `_run_realtime_pick_loop`; the old time-based executor/wait logic was removed. Design of record: `doc/realtime_pick_redesign.md` + `doc/rebuild_plan.md`. The simulated path (`test_throughput`/`test_accuracy`/`evaluate`) is unchanged.
 > **Status**: Phase 3 image processing **rebuilt** (self-contained). `VisionImageProcessing` (YOLO-OBB + centroid tracker) runs in-process via background threads and opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt-speed estimate). Camera frames are captured with **PyAV** (FFmpeg-backed) — sustains **~30 fps at 1080p MJPG**; the old `cv2.VideoCapture` V4L2 backend was the real <20 fps bottleneck (not the model/GPU). The module no longer imports `YOLO_OBB/src/*` and no longer reads `system_config.yaml`: every vision parameter lives in the `vision` section of `config.json`. Default model `models/nano@1920/weights/best.pt` (mAP50-95≈0.983, per `models/nano@1920/results.csv`). `models/nano@1280/weights/best.pt` (mAP50-95≈0.986) is available as a faster, slightly lower-resolution alternative but is not the active `config.json` weight. Also computes a belt-speed estimate from object tracking (`BeltVelocityEstimator`) — **informational only**, logged/drawn but NOT fed to the scheduler. Belt position for operation still arrives pre-decoded from Siemens as a single `conveyor_position` field (**≈mm as of June 2026 → `conveyor_position_scale_mm = 1.0`**, not the old cm/×10 — the ×10 inflated belt speed ~10× and broke every `test_conveyor` pick); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_conveyor`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
 
 ---
@@ -33,7 +34,7 @@ Delta_robot/
 ├── test_module.log            # Mock PLC server log (gitignored)
 │
 ├── modules/                   # System core python modules
-│   ├── scheduler.py           # Core decision loop, trajectory generation, speed estimator
+│   ├── scheduler.py           # Real-time two-thread pick loop (RealtimePickExecutor), trajectory generation, speed estimator
 │   ├── conveyor.py            # Coordinate transformations, tracker, encoder decoder
 │   ├── EthernetCom.py         # PLC socket gateway (snap7 + pylogix)
 │   ├── image_processing.py    # YOLO-OBB inference and PyAV camera capture threads
@@ -47,6 +48,9 @@ Delta_robot/
 │   ├── ai_context.md          # THIS FILE: Consolidated AI reference & coding guide
 │   ├── theory_basis.md        # Human-oriented mathematical concepts & brainstorming
 │   ├── academic_report.md     # Academic mathematical derivations & kinematics archive
+│   ├── rebuild_plan.md        # Design of record: real-time two-thread pick scheduler (detailed spec)
+│   ├── realtime_pick_redesign.md # Design of record: real-time pick flow summary (post-implementation)
+│   ├── archive/               # Superseded debugging reports (historical; NOT current reference)
 │   └── PLC_Program_description/ # PLC Structured Text & Ladder breakdowns
 │       ├── main_logic.md      # Rung-by-rung breakdown of main PLC program
 │       ├── inverse_kinematics.md # Inverse kinematics ST program derivations
@@ -204,10 +208,38 @@ Always disable auto-exposure **before** writing the manual exposure value.
 ## 6. Software Threading & Scenarios Reference
 
 ### 6.1. Threading Layout
-1. **Thread 1: Communication Process** (`multiprocessing.Process`): Gateway for snap7 & pylogix PLC reads/writes.
-2. **Thread 2: Decision/Scheduler** (Main thread): CLI command parser or pick-scheduler loop.
-3. **Thread 3: Perception Process** (`image_processing.py`): Ingests PyAV frames and runs YOLO-OBB inference.
-4. **Thread 4: User Interface Dashboard** (`interface.py`): Serves remote MJPEG video and telemetry over SSE.
+
+The communication worker, perception capture process, and dashboard are unchanged. What
+changed is that the **real** pick path (`production` / `test_conveyor`) now runs the
+scheduler itself as **two cooperating threads** sharing one guarded `RealtimeState`
+(`scheduler.py:140`), instead of one blocking single-threaded loop.
+
+1. **Communication worker** (`multiprocessing.Process`, `main.py` IPC worker): the single
+   gateway for snap7 & pylogix PLC reads/writes. Every dispatch/status round-trip goes
+   through it.
+2. **Decision/execution — main thread** (`_run_realtime_pick_loop`, `scheduler.py:2207`):
+   selects the highest-priority unclaimed object (danger-zone tier first), predicts the pick
+   point + 1.6 s lead, builds goto/pick packets, claims the object, dispatches, and runs the
+   `RealtimePickExecutor`. Its wait loops (`_wait_for_arm_arrival` `:751`,
+   `_wait_for_object_arrival` `:800`) read arm/object state **from shared memory and issue no
+   PLC I/O of their own**.
+3. **Perception/state — daemon thread** (`_realtime_perception_loop`, `scheduler.py:2362`):
+   loops at **~25 ms**, performs the **only** regular PLC status read, updates belt
+   position/speed and `pos_EE`, polls vision, refreshes the `BeltTracker` (pruning only
+   *unclaimed* stale objects), and emits dashboard/`[SPEED]`/`[DETECT]` events. Never renders
+   the OpenCV GUI.
+4. **Perception capture** (`image_processing.py` background threads): PyAV frame ingest +
+   YOLO-OBB inference, consumed by thread 3.
+5. **User Interface Dashboard** (`interface.py`): serves remote MJPEG video and telemetry
+   over SSE.
+
+**Two PC-side locks** (`scheduler.py:143-144`):
+- `ipc_lock` — wraps **every** dispatch/status round-trip so exactly one is in flight (the
+  IPC worker drains and discards mismatched responses, so concurrent callers would eat each
+  other's replies).
+- `state_lock` — guards `RealtimeState` (belt/pose snapshot, `BeltTracker` mutation, the
+  `claimed_object_ids` set) between the perception thread (ingest/prune) and the main thread
+  (read/claim).
 
 ### 6.2. Scenario Matrix
 All scenarios are executed via `main.py --scheduler --scenario <name>`.
@@ -218,8 +250,15 @@ All scenarios are executed via `main.py --scheduler --scenario <name>`.
 | `test_accuracy` | Simulated | Sim/Real | Static (None) | Web (`--interface`) |
 | `evaluate` | Simulated | Sim/Real | Synthetic | Console |
 | `test_vision_only` | **Real camera** | Idle (`NullExecutor`) | Siemens PLC | Web or native cv2 |
-| `test_conveyor` | **Real camera** | Real | Siemens PLC | Web or native cv2 |
-| `production` | **Real camera** | Real | Siemens PLC | Web or native cv2 |
+| `test_conveyor` | **Real camera** | Real (two-thread) | Siemens PLC | Web or native cv2 |
+| `production` | **Real camera** | Real (two-thread) | Siemens PLC | Web or native cv2 |
+
+> **`production` / `test_conveyor` execution model**: these run the §6.1 two-thread
+> `RealtimePickExecutor` loop — danger-zone priority selection, a 1.6 s downstream park lead,
+> and a **positional pick gate** (fire when the live tracked object reaches the parked pick
+> `u`; no post-park arrival-time computation). `test_vision_only` keeps the perception thread
+> live but uses a `NullExecutor` (no arm). The simulated scenarios above retain the original
+> single-threaded harness.
 
 ---
 

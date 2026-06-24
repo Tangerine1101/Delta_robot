@@ -105,14 +105,32 @@ $$
 
 To pick a moving component from the conveyor belt, the controller must predict where the item will be when the arm descends.
 
-### 3.1. Fixed-Point Interception Prediction
-To compute the interception time $t_{\text{pick}}$:
-1. Make an initial guess for the pick time: $t_{\text{pick}}^{(0)} = t_{\text{now}} + \text{lead time}$.
-2. Project the object's coordinate at this future time using the belt velocity $v_{\text{belt}}$:
+### 3.1. Fixed-Point Pick-Position Prediction (with a live position gate)
+The iterative solver (`_predict_pick_position`) is **kept**, but its output is used to choose
+a stable **pick position**, not to fire the pick on a converged *time*. This is the core of
+the real-time rewrite: it makes the pick immune to the ±60% belt-speed estimate noise that
+previously caused the "arrive → wait → miss" lag at object density.
+
+**Step 1 — solve for the park position.** Iterate to the earliest goto-feasible pick:
+1. Guess a pick time: $t_{\text{pick}}^{(0)} = t_{\text{now}} + \text{lead time}$.
+2. Project the object forward at belt velocity $v_{\text{belt}}$:
    $$u(t_{\text{pick}}^{(k)}) = u_{\text{now}} + v_{\text{belt}} \cdot (t_{\text{pick}}^{(k)} - t_{\text{now}})$$
-3. Map this coordinate to R-frame and calculate the robot's required travel duration ($\Delta t_{\text{goto}}$).
-4. Update the guess: $t_{\text{pick}}^{(k+1)} = t_{\text{now}} + \Delta t_{\text{goto}} + t_{\text{delay}}$.
-5. Repeat until the prediction converges (typically converges within 6 iterations, error $< 10$ ms).
+3. Map to R-frame and compute the robot travel duration $\Delta t_{\text{goto}}$.
+4. Update: $t_{\text{pick}}^{(k+1)} = t_{\text{now}} + \Delta t_{\text{goto}} + t_{\text{delay}}$.
+5. Repeat until convergence; apply the **1.6 s minimum lead** (`intercept_lead_time_s`) so the
+   arm parks downstream of the object, and clamp $u_{\text{pick}}$ to the workspace edge for
+   danger-zone objects. The result is the **parked pick position** $u_{\text{pick}}$ — a fixed
+   straight-down point. If the arm cannot arrive before the object passes $u_{\text{pick}}$,
+   the object is skipped (genuinely unreachable).
+
+**Step 2 — fire on a live positional gate (no time math).** After the arm has parked at
+$u_{\text{pick}}$, the pick is **not** scheduled by the predicted time. The main thread waits
+on the claimed object's live position (refreshed by the perception thread) and dispatches the
+pick the moment:
+$$u_{\text{now}} \ge u_{\text{pick}} - \text{offset}(v_{\text{belt}})$$
+The latency `offset` is currently `0` (`_belt_lead_offset_mm` returns `0.0`; negligible at
+50–100 mm/s) and is a future-roadmap knob. Closing the loop on the live object — rather than
+trusting a frozen, noisy speed sample — is what removed the mistimed wait.
 
 ### 3.2. Why Encoder-Based Dead-Reckoning is Superior
 Integrating velocity over time ($\Delta t$) to track position accumulates drift and fails when the conveyor speed varies or stops. 
@@ -183,30 +201,40 @@ flowchart TD
     
     Ingest & Skip1 --> Prune[Prune stale/passed items from list]
     
-    Prune --> CheckPlanned{Item not planned yet?}
-    
-    CheckPlanned -- Yes --> PlanNext[Run fixed-point iteration for P_pick]
-    PlanNext --> BuildTraj[Build 7-point Goto & Pick trajectories]
-    BuildTraj --> CommitPlan[Mark item as planned]
-    
-    CheckPlanned -- No/Wait --> LoopRobot
-    CommitPlan --> LoopRobot
-    
-    subgraph Execution [Robot Execution Coordinator]
-        LoopRobot{Is there a planned pick?} -- Yes --> WaitDispatch{Wait for item to reach pick position using encoder position}
-        WaitDispatch -- Reached pick point --> SendGoto[Send Goto trajectory to Omron]
-        SendGoto --> WaitGoto{Wait for pos_EE to reach pre-pick point}
-        
-        WaitGoto -- Reached --> SendRotate[Send suction rotation angle to Siemens]
-        SendRotate --> LateRepredict[Re-read encoder & update exact pick location]
-        LateRepredict --> SendPick[Send Pick trajectory to Omron]
-        SendPick --> WaitPick{Wait for pos_EE to reach release point}
-        WaitPick -- Released --> MarkComplete[Mark pick complete & release robot]
-    end
-    
-    MarkComplete --> ReadPLC
-    LoopRobot -- No --> ReadPLC
+    Prune --> EmitEvents[Emit SPEED/DETECT + dashboard events]
+    EmitEvents --> ReadPLC
 ```
+
+> **Note:** the boxes above run on the **perception/state thread** (`_realtime_perception_loop`,
+> ~25 ms). It owns the single PLC status read and keeps shared `RealtimeState` (belt
+> position/speed, `pos_EE`, the tracker, claimed ids) fresh. The **main decision/execution
+> thread** below runs concurrently and reads that shared state — its wait loops issue no PLC
+> I/O of their own. The two share an `ipc_lock` (one round-trip in flight) and a `state_lock`.
+
+```mermaid
+flowchart TD
+    Loop([Main loop]) --> Snapshot[Snapshot tracked objects + belt under state_lock]
+    Snapshot --> Select{Unclaimed catchable object?}
+    Select -- No --> Loop
+    Select -- Yes --> Priority[Select highest priority: danger-zone tier first, else shortest pick to-bin cycle]
+    Priority --> Predict[Solve P_pick via fixed-point iteration + 1.6s lead + edge clamp]
+    Predict --> Reach{Arm can reach P_pick in time?}
+    Reach -- No --> Loop
+    Reach -- Yes --> Build[Build 7-point Goto & Pick trajectories]
+    Build --> Claim[Mark object CLAIMED so perception thread will not prune it]
+    Claim --> SendGoto[Dispatch Goto to Omron]
+    SendGoto --> WaitGoto{Shared pos_EE reached parked pick point?}
+    WaitGoto -- Reached --> GateObject{Live object u >= parked pick u - offset?}
+    GateObject -- Reached --> SendRotate[Dispatch suction rotation to Siemens]
+    SendRotate --> SendPick[Dispatch Pick: straight-down descent then transfer to bin]
+    SendPick --> WaitPick{Shared pos_EE reached release/place point?}
+    WaitPick -- Released --> MarkComplete[Unclaim + remove object, advance arm position to bin]
+    MarkComplete --> Loop
+```
+
+> The **positional pick gate** (`GateObject`) replaces the old "re-predict object arrival
+> time" step: once the arm is parked, the pick fires purely on the live object reaching
+> $u_{\text{pick}}$ — no time recomputation, immune to belt-speed estimate noise.
 
 ---
 
@@ -276,13 +304,3 @@ CREATE TABLE pick_history (
 
 ### 7.3. Closed-Loop Conveyor Control
 Implement closed-loop speed scaling using Little's Law to dynamically adjust speed setpoints written to the S7-1200 based on incoming queue pressure, avoiding overflow at the downstream limits.
-
-# 24/6 
-tôi vừa thực hiện 1 đợt cập nhật lớn về tài liệu, tiếp theo là code. Dựa trên lượng tài liệu mới (đặt biệt là PLC_program_description), đánh tính cấp thiết và độ phức tạp của từng mục:
-- tích hợp calibrate_everything vào cli dưới dạng lệnh validate. lệnh này sẽ validate config
-- cli thêm các lệnh để calibrate: 
- - lệnh speed_tuning: chạy một hình thất giác nghiên 3d để đo vận tốc của cơ cấu. logic: trước tiên lệnh cho cơ cấu di chuyển tới điểm đầu tiên của quỹ đạo, sau đó truyền quỹ đạo và bắt đầu đo. độ nghiên phụ thuộc vào 2 thiết lập clearance_height và slope_transition_height. bán kính chạy là 1 nửa vòng cấm limit_radius_xy.
- - lệnh camera_tuning: chạy script camera_calibrate
-- rebuild test_module: với sự tham khảo từ PLC_Program_description/ , giờ đây chúng ta có thể mô phỏng hệ thống robot một cách chính xác. note: tài liệu trong PLC_program_description hiện chỉ mô tả code của plc omron, plc siemen vẫn đang để trống - nhưng có thể bỏ qua vì plc siemen chỉ đảm nhận vài chức năng phụ và có thể dùng giả thiết để thay thế.
-- thay đổi thuật toán lặp tìm vị trí và thời gian dự đoán. dựa trên mô tả code plc, có một hàm dùng để tính thời gian thực hiện quỹ đạo, có thể trực tiếp tính chính xác gototime.
-- thay đổi cách config để dễ dàng tùy chỉnh vị trí thực tế của băng tải hơn: hiện T_X và T_Y trong ma trận F buộc phải nhân vecto tịnh tiến với ma trận xoay để có kết quá chính xác. cập nhật config để có thể nhập trực tiếp vecto tịnh tiến (C-frame -> R-frame)

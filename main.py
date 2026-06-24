@@ -9,7 +9,7 @@ from typing import Any
 from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
 from modules.interface import DashboardServer
-from modules.scheduler import NullExecutor, RealRobotExecutor, SCENARIO_NAMES, run_scheduler_scenario
+from modules.scheduler import NullExecutor, RealtimePickExecutor, SCENARIO_NAMES, run_scheduler_scenario
 
 # How often (seconds) the worker probes the PLC connection when idle, to prevent
 # EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
@@ -343,7 +343,7 @@ def _run_scheduler(args: argparse.Namespace) -> None:
         # speed command without dispatching any Omron trajectory.
         executor = NullExecutor(dispatch=dispatch, request_status=request_status)
     else:
-        executor = RealRobotExecutor(
+        executor = RealtimePickExecutor(
             dispatch,
             request_status,
             interpolar_points=args.interpolar_points,

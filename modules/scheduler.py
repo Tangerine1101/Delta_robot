@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -74,7 +74,7 @@ class PickPlan:
     trajectory_pick: list[TrajectoryPoint]
     status: str = "planned"
     debug_info: dict[str, Any] = field(default_factory=dict)
-    # C-frame anchor used for late-dispatch re-prediction (set at plan build time)
+    # C-frame anchor used by the live pick-position gate.
     object_uv_anchor: tuple[float, float] = (0.0, 0.0)
     belt_pos_anchor: float = 0.0
     # Rotation angle for the 4th-DOF Siemens suction cup (degrees).
@@ -134,6 +134,34 @@ class SchedulerMetrics:
             "average_planning_latency_s": round(average_latency, 4),
             "queue_peak": self.queue_peak,
         }
+
+
+@dataclass
+class RealtimeState:
+    tracker: BeltTracker
+    frame: ConveyorFrame
+    ipc_lock: threading.Lock = field(default_factory=threading.Lock)
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    latest_speed: SpeedSample | None = None
+    belt_position_mm: float = 0.0
+    belt_speed_mm_s: float = 0.0
+    robot_pose: Position3D | None = None
+    end_effector: int | None = None
+    claimed_object_ids: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class RealtimePickCandidate:
+    obj: TrackedObject
+    sorting_position: Position3D
+    predicted_pick_time: float
+    pick_dispatch_time: float
+    pick_position: Position3D
+    u_now: float
+    u_pick: float
+    is_danger: bool
+    cycle_distance_mm: float
 
 
 @dataclass
@@ -347,7 +375,7 @@ class SchedulerSettings:
             pre_pick_height=pre_pick_height,
             place_height=float(scheduler_raw.get("place_height", -205.0)),
             corner_blend_xy=float(scheduler_raw.get("corner_blend_xy", 35.0)),
-            intercept_lead_time_s=float(scheduler_raw.get("intercept_lead_time_s", 0.14)),
+            intercept_lead_time_s=float(scheduler_raw.get("intercept_lead_time_s", 1.6)),
             release_descent_time_s=float(scheduler_raw.get("release_descent_time_s", 0.14)),
             nominal_xy_speed=float(scheduler_raw.get("nominal_xy_speed", 220.0)),
             nominal_z_speed=float(scheduler_raw.get("nominal_z_speed", 180.0)),
@@ -548,7 +576,7 @@ class SimulatedExecutor:
         real_time: bool = False,
         scenario_name: str,
     ) -> None:
-        # A3: wait until the pick dispatch window to mirror RealRobotExecutor timing.
+        # A3: wait until the pick dispatch window to mirror real robot timing.
         remaining_s = plan.pick_dispatch_time - time.monotonic()
         if remaining_s > 0.0:
             time.sleep(remaining_s)
@@ -624,8 +652,8 @@ class NullExecutor:
         plan.status = "completed"
 
 
-class RealRobotExecutor:
-    """Execute a PickPlan by sending real trajectory packages to the PLC."""
+class RealtimePickExecutor:
+    """Dispatch real pick packets while all waits consume shared realtime state."""
 
     def __init__(
         self,
@@ -636,35 +664,41 @@ class RealRobotExecutor:
         wait_margin_s: float,
         status_poll_interval_s: float,
         position_tolerance_mm: float = 5.0,
+        ipc_lock: threading.Lock | None = None,
     ) -> None:
-        self.dispatch = dispatch
-        self.request_status = request_status
+        self._dispatch_fn = dispatch
+        self._request_status_fn = request_status
         self.interpolar_points = interpolar_points
-        self.wait_margin_s = wait_margin_s
+        self.wait_margin_s = float(wait_margin_s)
         self.status_poll_interval_s = max(status_poll_interval_s, 0.02)
-        # pos_EE arrival tolerance for phase-completion gating (mm). Loose enough
-        # to absorb encoder/pos_EE quantization noise; tight enough to confirm the
-        # arm actually reached the commanded waypoint before the next phase.
         self.position_tolerance_mm = max(float(position_tolerance_mm), 0.0)
-        # Optional: set by run_scheduler_scenario for late-dispatch re-prediction (B2).
-        self.speed_source: Any = None
-        self.frame: Any = None
-        self.settings: "SchedulerSettings | None" = None
+        self.ipc_lock = ipc_lock or threading.Lock()
+
+    def dispatch(self, packet: dict[str, Any]) -> dict[str, Any] | None:
+        with self.ipc_lock:
+            return self._dispatch_fn(packet)
+
+    def request_status(self) -> dict[str, Any] | None:
+        with self.ipc_lock:
+            return self._request_status_fn()
 
     def execute(
         self,
         plan: PickPlan,
         *,
+        state: RealtimeState | None = None,
         log_samples: bool = False,
         real_time: bool = False,
         scenario_name: str,
-    ) -> None:
+    ) -> bool:
         del log_samples, real_time, scenario_name
+        if state is None:
+            raise RuntimeError("RealtimePickExecutor requires RealtimeState for execution.")
+
         packets = plan.to_robot_packets(self.interpolar_points)
+        goto_packet = packets[0]
         pick_packet = packets[1]
 
-        # --- goto phase ---
-        goto_packet = packets[0]
         print(
             "[EXEC]",
             json.dumps(
@@ -677,10 +711,14 @@ class RealRobotExecutor:
         status = self.dispatch(goto_packet)
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
-        self._wait_for_phase_completion(goto_packet)
+        if not self._wait_for_arm_arrival(plan, "goto", goto_packet, state):
+            plan.status = "failed"
+            return False
 
-        # --- pre-pick: wait for dispatch window then optionally re-predict ---
-        self._wait_until_pick_dispatch(plan)
+        if not self._wait_for_object_arrival(plan, state):
+            plan.status = "aborted"
+            return False
+
         try:
             rotate_pkg = {
                 "commandID": COMMAND_ID["rotate_absolute"],
@@ -691,19 +729,6 @@ class RealRobotExecutor:
             self.dispatch(rotate_pkg)
         except Exception as s_exc:
             print(f"[WARN] Failed to dispatch Siemens rotation: {s_exc}")
-
-        # B2: re-predict pick position using latest encoder reading at dispatch time.
-        pick_packet = self._repredicted_pick_packet(plan, pick_packet)
-        if pick_packet is None:
-            plan.status = "aborted"
-            print(
-                "[WARN]",
-                json.dumps(
-                    {"plan_id": plan.plan_id, "event": "pick_aborted_outside_workspace"},
-                    ensure_ascii=True,
-                ),
-            )
-            return
 
         print(
             "[EXEC]",
@@ -717,270 +742,172 @@ class RealRobotExecutor:
         status = self.dispatch(pick_packet)
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
-        self._wait_for_phase_completion(pick_packet)
+        if not self._wait_for_arm_arrival(plan, "pick", pick_packet, state):
+            plan.status = "failed"
+            return False
         plan.status = "completed"
+        return True
 
-    def _repredicted_pick_packet(
-        self, plan: PickPlan, original_packet: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """Re-compute the pick waypoints using the latest encoder position.
+    def _wait_for_arm_arrival(
+        self,
+        plan: PickPlan,
+        phase_name: str,
+        packet: dict[str, Any],
+        state: RealtimeState,
+    ) -> bool:
+        target = _packet_final_target(packet)
+        if target is None:
+            return True
+        expected_duration_s = _packet_duration_s(packet)
+        started_at = time.monotonic()
+        deadline = started_at + expected_duration_s + self.wait_margin_s
+        departed = False
+        static_accept_allowed: bool | None = None
 
-        Returns the updated packet, or None if the updated pick position is
-        outside the workspace window (plan must be aborted in that case).
-        If speed_source / frame / settings are not wired up, returns the
-        original packet unchanged.
-        """
-        if self.speed_source is None or self.frame is None or self.settings is None:
-            return original_packet
-
-        try:
-            sample = self.speed_source.sample(time.monotonic())
-        except Exception as exc:
-            print(f"[WARN] late re-prediction: speed_source.sample failed: {exc}")
-            return original_packet
-
-        u_anchor, v_anchor = plan.object_uv_anchor
-        u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
-        command_delay_s = (
-            self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
-        )
-        pick_z = self.settings.pickup_height
-        # Starting point of the pick phase: the arm is parked at the last goto
-        # waypoint (hover above the *old* predicted point). _build_pick_geometry /
-        # _build_pick_timing expect Position3D tuples for goto_points (they index
-        # goto_points[-1][0]); plan.trajectory_goto holds TrajectoryPoint objects,
-        # so convert the last waypoint to a tuple.
-        last_goto_pt = plan.trajectory_goto[-1]
-        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
-
-        # Contact lead: time from issuing the pick command until the gripper
-        # touches the part at Pos[0]=pickup. This is NOT just the 80 ms soft-start
-        # — when the part has drifted, the arm must traverse horizontally from the
-        # parked hover XY (last_goto_pos) to the new descent XY before dropping. We
-        # budget that full pick-phase approach flight via the PLC interpolator model
-        # (_trajectory_total_time over [hover -> descent], = soft_start + rest->rest
-        # segment time), iterating because the descent point depends on the lead.
-        # Mirrors the planning-time predictor (_predict_pick_position), which adds
-        # the full goto flight time. Degrades to the old soft-start-only lead when
-        # the traverse is ~0 (single-object case, arm already above the part).
-        v_belt = sample.speed_uv
-        approach_s = self.settings.interp_soft_start_s
-        u_contact = u_now + v_belt * (command_delay_s + approach_s)
-        for _ in range(6):
-            u_contact = u_now + v_belt * (command_delay_s + approach_s)
-            pick_xy = self.frame.to_robot(u_contact, v_anchor)
-            candidate: Position3D = (pick_xy[0], pick_xy[1], pick_z)
-            new_approach = _trajectory_total_time([last_goto_pos, candidate], self.settings)
-            if abs(new_approach - approach_s) < 0.005:
-                approach_s = new_approach
-                break
-            approach_s = new_approach
-        u_contact = u_now + v_belt * (command_delay_s + approach_s)
-
-        if not self.frame.is_in_window_uv(u_contact, v_anchor, self.settings.workspace_window_uv):
-            return None
-
-        pick_xy = self.frame.to_robot(u_contact, v_anchor)
-        new_pick_position: Position3D = (pick_xy[0], pick_xy[1], pick_z)
-
-        # Rebuild pick phase geometry from the parked goto waypoint as start point.
-        new_pick_points = _build_pick_geometry(
-            new_pick_position, plan.sorting_position, self.settings, [last_goto_pos]
-        )
-        new_pick_times = _build_pick_timing(
-            new_pick_position, new_pick_points, self.settings, [last_goto_pos]
-        )
-        new_trajectory_pick = [
-            TrajectoryPoint(pt[0], pt[1], pt[2], e_val, dur)
-            for pt, e_val, dur in zip(
-                new_pick_points, [1, 1, 1, 1, 1, 1, 0], new_pick_times
-            )
-        ]
-        print(
-            "[REPREDICT]",
-            json.dumps(
-                {
-                    "plan_id": plan.plan_id,
-                    "original_xy": [round(plan.predicted_pick_position_2d[0], 3),
-                                    round(plan.predicted_pick_position_2d[1], 3)],
-                    "updated_xy": [round(new_pick_position[0], 3), round(new_pick_position[1], 3)],
-                    "delta_u_mm": round(u_contact - (u_anchor + (sample.position_mm - plan.belt_pos_anchor)), 3),
-                },
-                ensure_ascii=True,
-            ),
-        )
-        return _trajectory_packet(new_trajectory_pick, self.interpolar_points)
-
-    def _wait_until_pick_dispatch(self, plan: PickPlan) -> None:
-        """Hold until the object actually reaches the workspace, then return.
-
-        The precomputed `pick_dispatch_time` assumes the belt holds the speed
-        seen at planning. Over the multi-second intercept wait the belt drifts
-        (noisy encoder + imprecise speed command), so a fixed sleep dispatches
-        early/late and the B2 re-prediction aborts as `outside_workspace`.
-        Instead, poll the live belt position and return as soon as the object's
-        contact point enters the window (or a safety deadline elapses) — the
-        caller's re-prediction then builds the pick from the true position.
-
-        Falls back to the legacy timed sleep when the live-feedback hooks
-        (speed_source / settings) are not wired (e.g. simulated executors).
-        """
-        if self.speed_source is None or self.settings is None:
-            remaining_s = plan.pick_dispatch_time - time.monotonic()
-            if remaining_s <= 0.0:
-                print(
-                    "[WARN]",
-                    json.dumps(
-                        {
-                            "plan_id": plan.plan_id,
-                            "event": "late_pick_dispatch",
-                            "late_by_s": round(abs(remaining_s), 4),
-                        },
-                        ensure_ascii=True,
-                    ),
-                )
-                return
-            time.sleep(remaining_s)
-            return
-
-        u_min, u_max, _v_min, _v_max = self.settings.workspace_window_uv
-        command_delay_s = (
-            self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
-        )
-        # Contact lead consistent with _repredicted_pick_packet: command delay plus
-        # the full pick-phase approach flight (parked hover -> descent point), not
-        # just the soft-start. Computed per-sample in the loop below because the
-        # descent point (and therefore the traverse distance) moves with the belt.
-        u_anchor, v_anchor = plan.object_uv_anchor
-        pick_z = self.settings.pickup_height
-        last_goto_pt = plan.trajectory_goto[-1]
-        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
-        # Dispatch threshold = the planner's predicted pick u, so the object
-        # arrives where the goto already parked the arm (minimal re-prediction
-        # correction). Fall back to the window entry if the frame isn't wired.
-        u_target = u_min
-        if self.frame is not None:
-            try:
-                u_target, _ = self.frame.to_conveyor(
-                    plan.predicted_pick_position_2d[0],
-                    plan.predicted_pick_position_2d[1],
-                )
-            except Exception:
-                u_target = u_min
-        u_target = min(max(u_target, u_min), u_max)
-        # Safety ceiling so a stalled/under-speed belt can never hang the loop.
-        deadline = max(plan.pick_dispatch_time, time.monotonic()) + self.wait_margin_s
         while True:
             now = time.monotonic()
-            try:
-                sample = self.speed_source.sample(now)
-            except Exception as exc:
-                print(f"[WARN] pick-dispatch belt poll failed: {exc}")
-                return
-            u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
-            # Project the contact point with the same approach-inclusive lead the
-            # re-prediction will use, so the dispatch threshold matches the motion
-            # model (and the timeout diagnostics report the true contact point).
-            if self.frame is not None:
-                approach_s = self.settings.interp_soft_start_s
-                for _ in range(3):
-                    u_c = u_now + sample.speed_uv * (command_delay_s + approach_s)
-                    xy = self.frame.to_robot(u_c, v_anchor)
-                    next_approach = _trajectory_total_time(
-                        [last_goto_pos, (xy[0], xy[1], pick_z)], self.settings
+            with state.state_lock:
+                pose = state.robot_pose
+            if pose is not None:
+                distance = _distance_3d(pose, target)
+                if static_accept_allowed is None:
+                    static_accept_allowed = (
+                        distance <= self.position_tolerance_mm and expected_duration_s <= 0.25
                     )
-                    if abs(next_approach - approach_s) < 0.005:
-                        approach_s = next_approach
-                        break
-                    approach_s = next_approach
-            else:
-                approach_s = self.settings.interp_soft_start_s
-            u_contact = u_now + sample.speed_uv * (command_delay_s + approach_s)
-            if u_contact >= u_target:
-                # Object has reached the planned pick point — dispatch now; the
-                # re-prediction enforces the downstream bound and aborts on
-                # genuine overshoot.
-                return
+                if distance > self.position_tolerance_mm:
+                    departed = True
+                elif departed or (
+                    bool(static_accept_allowed)
+                    and (now - started_at) >= min(0.2, expected_duration_s)
+                ):
+                    return True
             if now >= deadline:
                 print(
                     "[WARN]",
                     json.dumps(
                         {
                             "plan_id": plan.plan_id,
-                            "event": "pick_dispatch_timeout",
-                            "u_contact_mm": round(u_contact, 2),
-                            "u_min_mm": round(u_min, 2),
+                            "event": "arm_arrival_timeout",
+                            "phase": phase_name,
+                            "target": [round(value, 3) for value in target],
                         },
                         ensure_ascii=True,
                     ),
                 )
-                return
+                return False
             time.sleep(self.status_poll_interval_s)
 
-    def _phase_target(self, packet: dict[str, Any]) -> "Position3D | None":
-        """Final commanded waypoint (R-frame XYZ) of a trajectory packet."""
-        n = int(packet.get("argument_number", 0))
-        xs = packet.get("argument_x") or []
-        ys = packet.get("argument_y") or []
-        zs = packet.get("argument_z") or []
-        if n >= 1 and len(xs) >= n and len(ys) >= n and len(zs) >= n:
-            try:
-                return (float(xs[n - 1]), float(ys[n - 1]), float(zs[n - 1]))
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    def _wait_for_phase_completion(self, packet: dict[str, Any]) -> None:
-        """Block until the commanded motion of `packet` actually finishes.
-
-        Primary signal: pos_EE convergence on the final commanded waypoint. The
-        Omron firmware ignores argument_time (fixed-max-speed) and reports a
-        stale task_state, so the old fixed timer burned the whole margin every
-        phase and pushed the pick past its window. Polling pos_EE ends the phase
-        the moment the arm arrives. A timer ceiling (expected_duration +
-        wait_margin_s) caps the wait so a locked arm or missing pos_EE can never
-        hang.
-        """
-        argument_number = int(packet.get("argument_number", 0))
-        durations = list(packet.get("argument_time", []))[:argument_number]
-        expected_duration_s = max(sum(float(value) for value in durations), 0.0)
-        hard_deadline = time.monotonic() + expected_duration_s + self.wait_margin_s
-        target = self._phase_target(packet)
-        # Guard against a stale pos_EE (arm still at the previous waypoint, which
-        # for back-to-back picks can sit within tolerance of the new target):
-        # only accept "arrived" once the arm has first departed past tolerance.
-        departed = False
-
+    def _wait_for_object_arrival(self, plan: PickPlan, state: RealtimeState) -> bool:
+        deadline = max(plan.predicted_pick_time, time.monotonic()) + self.wait_margin_s
         while True:
             now = time.monotonic()
-            status = self.request_status()
-            # Primary: arm has reached the final waypoint (after departing).
-            if target is not None and isinstance(status, dict):
-                pos = status.get("pos_EE")
-                if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                    try:
-                        dx = float(pos[0]) - target[0]
-                        dy = float(pos[1]) - target[1]
-                        dz = float(pos[2]) - target[2]
-                        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-                    except (TypeError, ValueError):
-                        distance = None
-                    if distance is not None:
-                        if distance > self.position_tolerance_mm:
-                            departed = True
-                        elif departed:
-                            return
-            # Secondary (kept per CLAUDE.md §4.3): PLC reports idle.
-            task_state = status.get("task_state") if isinstance(status, dict) else None
-            if task_state is not None:
-                try:
-                    if int(task_state) == 0:
-                        return
-                except (TypeError, ValueError):
-                    pass
-            if now >= hard_deadline:
-                return
+            gate = _object_pick_gate_status(state, plan)
+            if gate is None:
+                print(
+                    "[WARN]",
+                    json.dumps(
+                        {"plan_id": plan.plan_id, "event": "pick_object_missing"},
+                        ensure_ascii=True,
+                    ),
+                )
+                return False
+            if gate["reached"]:
+                return True
+            if now >= deadline:
+                print(
+                    "[WARN]",
+                    json.dumps(
+                        {
+                            "plan_id": plan.plan_id,
+                            "event": "pick_object_timeout",
+                            "object_u_mm": round(gate["object_u"], 2),
+                            "pick_u_mm": round(gate["pick_u"], 2),
+                        },
+                        ensure_ascii=True,
+                    ),
+                )
+                return False
             time.sleep(self.status_poll_interval_s)
+
+
+def _packet_final_target(packet: dict[str, Any]) -> Position3D | None:
+    n = int(packet.get("argument_number", 0))
+    xs = packet.get("argument_x") or []
+    ys = packet.get("argument_y") or []
+    zs = packet.get("argument_z") or []
+    if n >= 1 and len(xs) >= n and len(ys) >= n and len(zs) >= n:
+        try:
+            return (float(xs[n - 1]), float(ys[n - 1]), float(zs[n - 1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _packet_duration_s(packet: dict[str, Any]) -> float:
+    argument_number = int(packet.get("argument_number", 0))
+    durations = list(packet.get("argument_time", []))[:argument_number]
+    total = 0.0
+    for value in durations:
+        try:
+            total += float(value)
+        except (TypeError, ValueError):
+            pass
+    return max(total, 0.0)
+
+
+def _distance_3d(a: Position3D, b: Position3D) -> float:
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _find_tracked_object(tracker: BeltTracker, object_id: str) -> TrackedObject | None:
+    for obj in tracker.objects():
+        if obj.object_id == object_id:
+            return obj
+    return None
+
+
+def _belt_lead_offset_mm(belt_speed_mm_s: float) -> float:
+    del belt_speed_mm_s
+    return 0.0
+
+
+def _object_pick_gate_status(state: RealtimeState, plan: PickPlan) -> dict[str, float | bool] | None:
+    with state.state_lock:
+        obj = _find_tracked_object(state.tracker, plan.object_id)
+        if obj is None:
+            return None
+        p_now = state.belt_position_mm
+        speed = state.belt_speed_mm_s
+        u_now, _ = obj.current_uv(p_now)
+        u_pick, _ = state.frame.to_conveyor(
+            plan.predicted_pick_position_2d[0],
+            plan.predicted_pick_position_2d[1],
+        )
+    threshold = u_pick - _belt_lead_offset_mm(speed)
+    return {
+        "reached": u_now >= threshold,
+        "object_u": u_now,
+        "pick_u": u_pick,
+        "threshold_u": threshold,
+    }
+
+
+def _prune_unclaimed_tracker(
+    tracker: BeltTracker,
+    claimed_object_ids: set[str],
+    p_now: float,
+    now: float,
+) -> int:
+    removed = 0
+    u_max = tracker.workspace_window_uv[1]
+    for obj in list(tracker.objects()):
+        if obj.object_id in claimed_object_ids:
+            continue
+        u_now, _ = obj.current_uv(p_now)
+        if u_now > u_max or (now - obj.last_seen_at) > tracker.stale_timeout_s:
+            tracker.remove(obj.object_id)
+            removed += 1
+    return removed
 
 
 class EvaluateExecutor:
@@ -1396,10 +1323,12 @@ class PickScheduler:
         obj: TrackedObject,
         sorting_position: Position3D,
         now: float,
+        prediction: tuple[float, float, Position3D] | None = None,
     ) -> PickPlan:
-        if self.latest_speed is None:
+        if self.latest_speed is None and prediction is None:
             raise RuntimeError("Cannot build pick plan without a current speed sample.")
-        prediction = self._predict_pick_position(obj, self.latest_speed, now)
+        if prediction is None:
+            prediction = self._predict_pick_position(obj, self.latest_speed, now)
         if prediction is None:
             raise RuntimeError("Unable to build pick plan for an unreachable detection.")
 
@@ -1560,6 +1489,143 @@ class PickScheduler:
         pick_position = (pick_xy[0], pick_xy[1], self.settings.pickup_height)
         pick_dispatch_time = guess_pick_time - command_delay_s
         return guess_pick_time, pick_dispatch_time, pick_position
+
+
+def _predict_realtime_pick_position(
+    scheduler: PickScheduler,
+    obj: TrackedObject,
+    speed_sample: SpeedSample,
+    now: float,
+) -> tuple[float, float, Position3D] | None:
+    """Predict the realtime pick using the kept solver and a caller-side lead.
+
+    The kept solver is probed with a zero lead so it still supplies the earliest
+    reachable intercept. The realtime caller then applies the configured minimum
+    lead and performs the final reachability / workspace check.
+    """
+    original_settings = scheduler.settings
+    try:
+        scheduler.settings = replace(original_settings, intercept_lead_time_s=0.0)
+        earliest = scheduler._predict_pick_position(obj, speed_sample, now)
+    finally:
+        scheduler.settings = original_settings
+    if earliest is None:
+        return None
+
+    earliest_pick_time, _, _ = earliest
+    settings = scheduler.settings
+    command_delay_s = settings.robot_movement_delay_s + settings.ethernet_delay_s
+    final_pick_time = max(earliest_pick_time, now + settings.intercept_lead_time_s)
+
+    u_anchor, v_anchor = obj.conveyor_uv
+    p_now = speed_sample.position_mm
+    u_now = u_anchor + (p_now - obj.belt_pos_anchor)
+    v_now = v_anchor
+    belt_speed = speed_sample.speed_uv
+    _u_min, u_max, v_min, v_max = settings.workspace_window_uv
+
+    if v_now < v_min or v_now > v_max:
+        return None
+    if u_now > u_max:
+        return None
+
+    dt_future = max(0.0, final_pick_time - now)
+    u_pick = u_now + belt_speed * dt_future
+    if u_pick > u_max:
+        if belt_speed <= 0.0:
+            return None
+        u_pick = u_max
+        final_pick_time = now + max(0.0, (u_pick - u_now) / belt_speed)
+
+    if not scheduler.frame.is_in_window_uv(u_pick, v_now, settings.workspace_window_uv):
+        return None
+
+    pick_xy = scheduler.frame.to_robot(u_pick, v_now)
+    pick_position: Position3D = (pick_xy[0], pick_xy[1], settings.pickup_height)
+    goto_points = _build_goto_geometry(scheduler.current_position, pick_position, settings)
+    goto_total = _trajectory_total_time(goto_points, settings)
+    arm_arrival_time = now + command_delay_s + goto_total
+    if arm_arrival_time > final_pick_time:
+        return None
+
+    return final_pick_time, final_pick_time - command_delay_s, pick_position
+
+
+def _cycle_distance_mm(
+    start_position: Position3D,
+    pick_position: Position3D,
+    sorting_position: Position3D,
+) -> float:
+    return math.dist(start_position, pick_position) + math.dist(pick_position, sorting_position)
+
+
+def _build_realtime_pick_plan(
+    scheduler: PickScheduler,
+    state: RealtimeState,
+    now: float,
+) -> PickPlan | None:
+    with state.state_lock:
+        sample = state.latest_speed
+        if sample is None:
+            return None
+        if now - sample.timestamp > scheduler.settings.speed_timeout_s:
+            return None
+
+        danger_u = scheduler.settings.workspace_window_uv[0] + (
+            (scheduler.settings.workspace_window_uv[1] - scheduler.settings.workspace_window_uv[0])
+            * (2.0 / 3.0)
+        )
+        current_position = scheduler.current_position
+        candidates: list[tuple[tuple[int, float], RealtimePickCandidate]] = []
+
+        for obj in scheduler.tracker.objects():
+            if obj.object_id in state.claimed_object_ids:
+                continue
+
+            sorting_position = scheduler._resolve_sorting_position(obj.object_type)
+            if sorting_position is None:
+                scheduler.metrics.skipped_unknown_type += 1
+                continue
+
+            prediction = _predict_realtime_pick_position(scheduler, obj, sample, now)
+            if prediction is None:
+                u_now, _ = obj.current_uv(sample.position_mm)
+                if u_now > scheduler.settings.workspace_window_uv[1]:
+                    scheduler.metrics.skipped_outside_workspace += 1
+                    scheduler.tracker.remove(obj.object_id)
+                continue
+
+            predicted_pick_time, pick_dispatch_time, pick_position = prediction
+            u_now, _ = obj.current_uv(sample.position_mm)
+            is_danger = u_now >= danger_u
+            cycle_distance = _cycle_distance_mm(current_position, pick_position, sorting_position)
+            candidate = RealtimePickCandidate(
+                obj=obj,
+                sorting_position=sorting_position,
+                predicted_pick_time=predicted_pick_time,
+                pick_dispatch_time=pick_dispatch_time,
+                pick_position=pick_position,
+                u_now=u_now,
+                u_pick=scheduler.frame.to_conveyor(pick_position[0], pick_position[1])[0],
+                is_danger=is_danger,
+                cycle_distance_mm=cycle_distance,
+            )
+            key = (0 if is_danger else 1, -u_now if is_danger else cycle_distance)
+            candidates.append((key, candidate))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        _, chosen = candidates[0]
+        plan = scheduler._build_pick_plan(
+            chosen.obj,
+            chosen.sorting_position,
+            now,
+            prediction=(chosen.predicted_pick_time, chosen.pick_dispatch_time, chosen.pick_position),
+        )
+        state.claimed_object_ids.add(chosen.obj.object_id)
+        return plan
 
 
 def _coerce_position3d(raw_value: Any, fallback: Position3D) -> Position3D:
@@ -2120,12 +2186,197 @@ def _run_evaluate_loop(
     print("[INFO] Evaluate metrics:", json.dumps(metrics.as_dict(), ensure_ascii=True))
 
 
+def _extract_robot_pose(status: dict[str, Any] | None) -> tuple[Position3D | None, int | None]:
+    if not isinstance(status, dict):
+        return None, None
+    pose = status.get("pos_EE")
+    if not isinstance(pose, (list, tuple)) or len(pose) < 3:
+        return None, None
+    try:
+        position = (float(pose[0]), float(pose[1]), float(pose[2]))
+    except (TypeError, ValueError):
+        return None, None
+    end_effector = status.get("end_effector")
+    try:
+        e_value = int(end_effector) if end_effector is not None else None
+    except (TypeError, ValueError):
+        e_value = None
+    return position, e_value
+
+
+def _run_realtime_pick_loop(
+    scenario_name: str,
+    settings: SchedulerSettings,
+    interpolar_points: int,
+    executor: RealtimePickExecutor,
+    image_processing: SimulatedImageProcessing | VisionImageProcessing,
+    frame: ConveyorFrame,
+    scheduler: PickScheduler,
+    speed_source: Any,
+    start_time: float,
+    duration_s: float | None,
+    event_sink: "Callable[[str, dict[str, Any]], None] | None",
+) -> None:
+    state = RealtimeState(tracker=scheduler.tracker, frame=frame, ipc_lock=executor.ipc_lock)
+
+    def perceive_tick(now: float | None = None) -> SpeedSample:
+        if now is None:
+            now = time.monotonic()
+        sample = speed_source.sample(now)
+        detections = image_processing.poll(now)
+        with state.state_lock:
+            state.latest_speed = sample
+            state.belt_position_mm = sample.position_mm
+            state.belt_speed_mm_s = sample.speed_uv
+            pose, end_effector = _extract_robot_pose(getattr(speed_source, "last_status", None))
+            state.robot_pose = pose
+            state.end_effector = end_effector
+            scheduler.update_speed(sample)
+            scheduler.ingest_detections(detections, sample.position_mm)
+            snapshot = [
+                {
+                    "id": obj.object_id,
+                    "type": obj.object_type,
+                    "x": round(x_r, 2),
+                    "y": round(y_r, 2),
+                }
+                for obj in scheduler.tracker.objects()
+                for x_r, y_r in (scheduler.tracker.current_position_R(obj, sample.position_mm),)
+            ]
+            removed = _prune_unclaimed_tracker(
+                scheduler.tracker,
+                state.claimed_object_ids,
+                sample.position_mm,
+                now,
+            )
+            scheduler.metrics.stale_drops += removed
+            limit = now - settings.stale_timeout_s
+            scheduler.seen_object_ids = {
+                obj_id: ts for obj_id, ts in scheduler.seen_object_ids.items() if ts >= limit
+            }
+            scheduler.planned_object_ids = {
+                obj_id: ts for obj_id, ts in scheduler.planned_object_ids.items() if ts >= limit
+            }
+        if event_sink is not None:
+            status_payload = {
+                "scenario": scenario_name,
+                "vx": round(sample.vx, 3),
+                "vy": round(sample.vy, 3),
+                "speed_mm_s": round(math.hypot(sample.vx, sample.vy), 3),
+                "position_mm": round(sample.position_mm, 2),
+            }
+            if state.robot_pose is not None:
+                status_payload["x"] = round(state.robot_pose[0], 2)
+                status_payload["y"] = round(state.robot_pose[1], 2)
+                status_payload["z"] = round(state.robot_pose[2], 2)
+            if state.end_effector is not None:
+                status_payload["e"] = state.end_effector
+            event_sink("status", status_payload)
+        if snapshot:
+            detect_payload = {
+                "t": round(now - start_time, 3),
+                "z": round(settings.pickup_height, 2),
+                "objects": snapshot,
+            }
+            print("[DETECT]", json.dumps(detect_payload, ensure_ascii=True), flush=True)
+            if event_sink is not None:
+                event_sink("detect", detect_payload)
+        return sample
+
+    perception_thread = threading.Thread(
+        target=lambda: _realtime_perception_loop(state, perceive_tick),
+        name="realtime-perception",
+        daemon=True,
+    )
+    perception_thread.start()
+
+    if scenario_name == "test_conveyor":
+        try:
+            executor.dispatch(
+                {
+                    "commandID": COMMAND_ID["change_speed"],
+                    "CommandID": COMMAND_ID["change_speed"],
+                    "rotate": 0.0,
+                    "speed": settings.test_conveyor_belt_speed_mm_s,
+                }
+            )
+            print(f"[INFO] Conveyor speed set to {settings.test_conveyor_belt_speed_mm_s} mm/s")
+        except Exception as exc:
+            print(f"[WARN] Could not set conveyor speed: {exc}")
+
+    deadline = None if duration_s is None else start_time + duration_s
+    try:
+        while not state.stop_event.is_set():
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                break
+
+            plan = _build_realtime_pick_plan(scheduler, state, now)
+            if plan is not None:
+                plan_summary = plan.to_summary()
+                print("[PLAN]", json.dumps(plan_summary, ensure_ascii=True))
+                if event_sink is not None:
+                    event_sink("plan", plan_summary)
+                predict_payload = {
+                    "t": round(now - start_time, 3),
+                    "x": round(plan.predicted_pick_position_2d[0], 2),
+                    "y": round(plan.predicted_pick_position_2d[1], 2),
+                    "z": round(plan.predicted_pick_position_2d[2], 2),
+                }
+                print("[PREDICT]", json.dumps(predict_payload, ensure_ascii=True))
+                if event_sink is not None:
+                    event_sink("predict", predict_payload)
+                success = executor.execute(plan, state=state, scenario_name=scenario_name)
+                with state.state_lock:
+                    state.claimed_object_ids.discard(plan.object_id)
+                    scheduler.planned_object_ids[plan.object_id] = time.monotonic()
+                    if success:
+                        scheduler.mark_completed(plan)
+                    else:
+                        goto_end = plan.trajectory_goto[-1]
+                        scheduler.current_position = (
+                            goto_end.x,
+                            goto_end.y,
+                            goto_end.z,
+                        )
+
+            if hasattr(image_processing, "render_window"):
+                if not image_processing.render_window():
+                    print("\n[INFO] Vision window closed by user (q)")
+                    break
+
+            time.sleep(settings.poll_interval_s)
+    except KeyboardInterrupt:
+        print("\n[INFO] Scheduler scenario interrupted by user")
+    finally:
+        state.stop_event.set()
+        perception_thread.join(timeout=2.0)
+        if hasattr(image_processing, "stop"):
+            image_processing.stop()
+        if hasattr(image_processing, "close_window"):
+            image_processing.close_window()
+
+    print("[INFO] Scheduler metrics:", json.dumps(scheduler.metrics.as_dict(), ensure_ascii=True))
+
+
+def _realtime_perception_loop(
+    state: RealtimeState,
+    perceive_tick: Callable[[float | None], SpeedSample],
+) -> None:
+    while not state.stop_event.is_set():
+        try:
+            perceive_tick(time.monotonic())
+        except Exception as exc:
+            print(f"[WARN] realtime perception tick failed: {exc}", flush=True)
+        time.sleep(0.025)
+
+
 def run_scheduler_scenario(
     scenario_name: str,
     *,
     duration_s: float | None,
     interpolar_points: int,
-    executor: SimulatedExecutor | RealRobotExecutor | NullExecutor | None = None,
+    executor: SimulatedExecutor | RealtimePickExecutor | NullExecutor | None = None,
     event_sink: "Callable[[str, dict[str, Any]], None] | None" = None,
     frame_register: "Callable[[Any], None] | None" = None,
     disable_native_window: bool = False,
@@ -2170,6 +2421,10 @@ def run_scheduler_scenario(
         raise RuntimeError(
             f"Scenario '{scenario_name}' requires live PLC conveyor_position feedback; "
             "do not use --simulate-executor for real scenarios."
+        )
+    if scenario_name in _plc_required_scenarios and not isinstance(executor, RealtimePickExecutor):
+        raise RuntimeError(
+            f"Scenario '{scenario_name}' requires RealtimePickExecutor for the rebuilt real path."
         )
 
     if scenario_name in _vision_scenarios:
@@ -2220,11 +2475,6 @@ def run_scheduler_scenario(
             speed_source = SimulatedSpeedSource(
                 scenario_name, settings, start_time, frame
             )
-        # Wire speed_source, frame, settings into RealRobotExecutor for B2 re-prediction.
-        if isinstance(executor, RealRobotExecutor):
-            executor.speed_source = speed_source
-            executor.frame = frame
-            executor.settings = settings
 
     # Belt scenarios must use live PLC conveyor_position feedback — never a
     # fabricated belt speed. Fail loudly if the wiring fell back to SimulatedSpeedSource.
@@ -2243,6 +2493,79 @@ def run_scheduler_scenario(
         print("[INFO] Scenario will run until interrupted")
     else:
         print(f"[INFO] Scenario duration: {duration_s:.2f}s")
+
+    if scenario_name in _plc_required_scenarios:
+        _run_realtime_pick_loop(
+            scenario_name,
+            settings,
+            interpolar_points,
+            executor,
+            image_processing,
+            frame,
+            scheduler,
+            speed_source,
+            start_time,
+            duration_s,
+            event_sink,
+        )
+        return
+
+    # Single-thread perception tick for simulated and camera-only scenarios. The
+    # rebuilt real pick path returns above and uses its dedicated perception thread.
+    def perceive_tick(now: float | None = None) -> SpeedSample:
+        if now is None:
+            now = time.monotonic()
+        sample = speed_source.sample(now)
+        scheduler.update_speed(sample)
+        if event_sink is not None:
+            status_payload = {
+                "scenario": scenario_name,
+                "vx": round(sample.vx, 3),
+                "vy": round(sample.vy, 3),
+                "speed_mm_s": round(math.hypot(sample.vx, sample.vy), 3),
+                "position_mm": round(sample.position_mm, 2),
+            }
+            # Robot end-effector pose for the dashboard charts. Available from
+            # the live PLC status (real / test_vision_only / test_conveyor);
+            # absent in --simulate-executor runs (no real pos_EE).
+            last_status = getattr(speed_source, "last_status", None)
+            pose = last_status.get("pos_EE") if isinstance(last_status, dict) else None
+            if isinstance(pose, (list, tuple)) and len(pose) >= 3:
+                status_payload["x"] = round(float(pose[0]), 2)
+                status_payload["y"] = round(float(pose[1]), 2)
+                status_payload["z"] = round(float(pose[2]), 2)
+                if isinstance(last_status, dict) and "end_effector" in last_status:
+                    status_payload["e"] = int(last_status.get("end_effector") or 0)
+            event_sink("status", status_payload)
+        detections = image_processing.poll(now)
+        scheduler.ingest_detections(detections, sample.position_mm)
+
+        # Emit a snapshot of every tracked object's real R-frame position so the
+        # web dashboard (--interface) can show objects moving live on the belt.
+        # Snapshot BEFORE prune so a freshly ingested object is reported at least
+        # once even if prune is about to drop it this loop (e.g. it already sits
+        # past workspace u_max).
+        tracked_objs = []
+        for obj in scheduler.tracker.objects():
+            x_r, y_r = scheduler.tracker.current_position_R(obj, sample.position_mm)
+            tracked_objs.append({
+                "id": obj.object_id,
+                "type": obj.object_type,
+                "x": round(x_r, 2),
+                "y": round(y_r, 2),
+            })
+        if tracked_objs:
+            detect_payload = {
+                "t": round(now - start_time, 3),
+                "z": round(settings.pickup_height, 2),
+                "objects": tracked_objs,
+            }
+            print("[DETECT]", json.dumps(detect_payload, ensure_ascii=True), flush=True)
+            if event_sink is not None:
+                event_sink("detect", detect_payload)
+
+        scheduler.prune_stale(now)
+        return sample
 
     deadline = None if duration_s is None else start_time + duration_s
     _conveyor_speed_sent = False
@@ -2269,58 +2592,11 @@ def run_scheduler_scenario(
                     except Exception as exc:
                         print(f"[WARN] Could not set conveyor speed: {exc}")
 
-            # Sample speed FIRST so that ingest_detections can anchor detections
-            # to the latest encoder reading.
-            sample = speed_source.sample(now)
-            scheduler.update_speed(sample)
-            if event_sink is not None:
-                status_payload = {
-                    "scenario": scenario_name,
-                    "vx": round(sample.vx, 3),
-                    "vy": round(sample.vy, 3),
-                    "speed_mm_s": round(math.hypot(sample.vx, sample.vy), 3),
-                    "position_mm": round(sample.position_mm, 2),
-                }
-                # Robot end-effector pose for the dashboard charts. Available from
-                # the live PLC status (real / test_vision_only / test_conveyor);
-                # absent in --simulate-executor runs (no real pos_EE).
-                last_status = getattr(speed_source, "last_status", None)
-                pose = last_status.get("pos_EE") if isinstance(last_status, dict) else None
-                if isinstance(pose, (list, tuple)) and len(pose) >= 3:
-                    status_payload["x"] = round(float(pose[0]), 2)
-                    status_payload["y"] = round(float(pose[1]), 2)
-                    status_payload["z"] = round(float(pose[2]), 2)
-                    if isinstance(last_status, dict) and "end_effector" in last_status:
-                        status_payload["e"] = int(last_status.get("end_effector") or 0)
-                event_sink("status", status_payload)
-            detections = image_processing.poll(now)
-            scheduler.ingest_detections(detections, sample.position_mm)
-
-            # Emit a snapshot of every tracked object's real R-frame position so
-            # the web dashboard (--interface) can show objects moving live on the belt.
-            # Snapshot BEFORE prune so a freshly ingested object is reported at
-            # least once even if prune is about to drop it this loop (e.g. it
-            # already sits past workspace u_max).
-            tracked_objs = []
-            for obj in scheduler.tracker.objects():
-                x_r, y_r = scheduler.tracker.current_position_R(obj, sample.position_mm)
-                tracked_objs.append({
-                    "id": obj.object_id,
-                    "type": obj.object_type,
-                    "x": round(x_r, 2),
-                    "y": round(y_r, 2),
-                })
-            if tracked_objs:
-                detect_payload = {
-                    "t": round(now - start_time, 3),
-                    "z": round(settings.pickup_height, 2),
-                    "objects": tracked_objs,
-                }
-                print("[DETECT]", json.dumps(detect_payload, ensure_ascii=True), flush=True)
-                if event_sink is not None:
-                    event_sink("detect", detect_payload)
-
-            scheduler.prune_stale(now)
+            # Pump one perception tick (sample belt, poll vision, ingest/re-anchor,
+            # snapshot for the dashboard, prune). Same path the executor pumps via
+            # realtime path uses a dedicated perception thread, so only the
+            # single-thread simulated/camera-only loop reaches this call.
+            perceive_tick(now)
 
             plan = scheduler.plan_next(now)
             if plan is not None:

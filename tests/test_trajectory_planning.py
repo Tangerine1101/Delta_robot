@@ -1,16 +1,21 @@
 import math
 import unittest
 
-from modules.conveyor import ConveyorFrame
-from modules.image_processing import SimulatedImageProcessing
+from modules.conveyor import BeltTracker, ConveyorFrame
+from modules.image_processing import ObjectDetection, SimulatedImageProcessing
 from modules.scheduler import (
     PickPlan,
-    RealRobotExecutor,
+    PickScheduler,
+    RealtimeState,
     SchedulerSettings,
     SpeedSample,
     TrajectoryPoint,
+    _build_realtime_pick_plan,
     _build_goto_geometry,
     _build_pick_geometry,
+    _object_pick_gate_status,
+    _predict_realtime_pick_position,
+    _prune_unclaimed_tracker,
     _segment_duration,
     _segment_profile_time,
     _trajectory_total_time,
@@ -26,7 +31,7 @@ def _settings(**overrides):
         "pre_pick_height": -300.0,
         "place_height": -290.0,
         "corner_blend_xy": 35.0,
-        "intercept_lead_time_s": 0.14,
+        "intercept_lead_time_s": 1.6,
         "release_descent_time_s": 0.14,
         "nominal_xy_speed": 50.0,
         "nominal_z_speed": 50.0,
@@ -145,113 +150,170 @@ class InterpolatorTimingTests(unittest.TestCase):
         self.assertLessEqual(total, stop_and_go + 1e-9)
 
 
-class _StubSpeedSource:
-    """Minimal speed_source for exercising the dispatch-time re-prediction."""
+def _identity_frame():
+    return ConveyorFrame(
+        (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        )
+    )
 
-    def __init__(self, position_mm, speed_uv):
-        self._position_mm = position_mm
-        self._speed_uv = speed_uv
 
-    def sample(self, now):
-        return SpeedSample(
-            vx=0.0,
-            vy=self._speed_uv,
+def _scheduler_and_state(settings=None):
+    settings = settings or _settings()
+    frame = _identity_frame()
+    tracker = BeltTracker(frame, settings.workspace_window_uv, stale_timeout_s=settings.stale_timeout_s)
+    scheduler = PickScheduler(settings, 7, frame, tracker)
+    state = RealtimeState(tracker=tracker, frame=frame)
+    return scheduler, state
+
+
+def _add_detection(tracker, object_id, u, v, object_type="object_A", p_now=0.0, now=1000.0):
+    return tracker.ingest_detection(
+        ObjectDetection(
+            object_id=object_id,
+            x=u,
+            y=v,
+            object_type=object_type,
             timestamp=now,
-            position_mm=self._position_mm,
-            speed_uv=self._speed_uv,
+        ),
+        p_now,
+    )
+
+
+def _pick_plan(settings, frame, object_id, pick_u, v_anchor, belt_pos):
+    pick_xy = frame.to_robot(pick_u, v_anchor)
+    last_goto = TrajectoryPoint(pick_xy[0], pick_xy[1], settings.pre_pick_height, 0, 0.1)
+    return PickPlan(
+        plan_id="plan-test",
+        object_id=object_id,
+        object_type="object_A",
+        detected_at=0.0,
+        source_position_2d=(pick_u, v_anchor),
+        cycle_start_position=settings.home_position,
+        assumed_speed=(0.0, 50.0),
+        predicted_pick_time=0.0,
+        pick_dispatch_time=0.0,
+        predicted_pick_position_2d=(pick_xy[0], pick_xy[1], settings.pickup_height),
+        sorting_position=settings.sorting_positions["object_A"],
+        trajectory_goto=[last_goto],
+        trajectory_pick=[last_goto],
+        object_uv_anchor=(pick_u, v_anchor),
+        belt_pos_anchor=belt_pos,
+    )
+
+
+class RealtimePickPlanningTests(unittest.TestCase):
+    def test_realtime_prediction_applies_1_6_second_lead(self):
+        settings = _settings(intercept_lead_time_s=1.6)
+        scheduler, _state = _scheduler_and_state(settings)
+        scheduler.current_position = (280.0, 65.0, settings.pre_pick_height)
+        obj = _add_detection(scheduler.tracker, "obj-lead", 280.0, 65.0)
+        sample = SpeedSample(vx=50.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=50.0)
+
+        prediction = _predict_realtime_pick_position(scheduler, obj, sample, 1000.0)
+
+        self.assertIsNotNone(prediction)
+        assert prediction is not None
+        predicted_time, _dispatch_time, pick_position = prediction
+        u_pick, _ = scheduler.frame.to_conveyor(pick_position[0], pick_position[1])
+        self.assertAlmostEqual(predicted_time, 1001.6, places=3)
+        self.assertAlmostEqual(u_pick, 360.0, places=3)
+
+    def test_realtime_prediction_clamps_downstream_edge(self):
+        settings = _settings(intercept_lead_time_s=1.6)
+        scheduler, _state = _scheduler_and_state(settings)
+        scheduler.current_position = (350.0, 65.0, settings.pre_pick_height)
+        obj = _add_detection(scheduler.tracker, "obj-clamp", 350.0, 65.0)
+        sample = SpeedSample(vx=50.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=50.0)
+
+        prediction = _predict_realtime_pick_position(scheduler, obj, sample, 1000.0)
+
+        self.assertIsNotNone(prediction)
+        assert prediction is not None
+        predicted_time, _dispatch_time, pick_position = prediction
+        u_pick, _ = scheduler.frame.to_conveyor(pick_position[0], pick_position[1])
+        self.assertAlmostEqual(predicted_time, 1001.0, places=3)
+        self.assertAlmostEqual(u_pick, settings.workspace_window_uv[1], places=3)
+
+    def test_danger_zone_priority_selects_most_downstream(self):
+        settings = _settings(intercept_lead_time_s=1.6)
+        scheduler, state = _scheduler_and_state(settings)
+        scheduler.current_position = (380.0, 65.0, settings.pre_pick_height)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        state.latest_speed = sample
+        state.belt_position_mm = sample.position_mm
+        _add_detection(scheduler.tracker, "danger-less", 365.0, 65.0)
+        _add_detection(scheduler.tracker, "danger-most", 390.0, 65.0)
+
+        plan = _build_realtime_pick_plan(scheduler, state, 1000.0)
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.object_id, "danger-most")
+
+    def test_secondary_priority_uses_current_pick_bin_distance(self):
+        settings = _settings(
+            object_type_map={"object_A": "A_bin", "object_B": "B_bin"},
+            object_dimensions={"object_A": (30.0, 40.0), "object_B": (30.0, 40.0)},
+            sorting_positions={
+                "A_bin": (1000.0, 65.0, -290.0),
+                "B_bin": (330.0, 65.0, -290.0),
+            },
         )
+        scheduler, state = _scheduler_and_state(settings)
+        scheduler.current_position = (280.0, 65.0, settings.pre_pick_height)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        state.latest_speed = sample
+        state.belt_position_mm = sample.position_mm
+        _add_detection(scheduler.tracker, "near-current-far-bin", 290.0, 65.0, "object_A")
+        _add_detection(scheduler.tracker, "far-current-near-bin", 330.0, 65.0, "object_B")
 
+        plan = _build_realtime_pick_plan(scheduler, state, 1000.0)
 
-class RepredictionLeadTests(unittest.TestCase):
-    """Layer-2 fix: the dispatch-time re-prediction must budget the full pick-phase
-    approach flight (parked hover -> descent traverse), not just command_delay +
-    soft_start. See doc/bug_report_final.md and doc/video_analysis_report.md."""
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.object_id, "far-current-near-bin")
 
-    def _executor(self, settings, frame, speed_source):
-        executor = RealRobotExecutor(
-            dispatch=lambda packet: None,
-            request_status=lambda: {},
-            interpolar_points=7,
-            wait_margin_s=1.0,
-            status_poll_interval_s=0.05,
-        )
-        executor.frame = frame
-        executor.settings = settings
-        executor.speed_source = speed_source
-        return executor
-
-    def _plan(self, settings, hover_xy, u_anchor, v_anchor, belt_pos, speed_uv):
-        last_goto = TrajectoryPoint(hover_xy[0], hover_xy[1], settings.pre_pick_height, 0, 0.1)
-        return PickPlan(
-            plan_id="plan-test",
-            object_id="obj-1",
-            object_type="object_A",
-            detected_at=0.0,
-            source_position_2d=(u_anchor, v_anchor),
-            cycle_start_position=settings.home_position,
-            assumed_speed=(0.0, speed_uv),
-            predicted_pick_time=0.0,
-            pick_dispatch_time=0.0,
-            predicted_pick_position_2d=(hover_xy[0], hover_xy[1], settings.pickup_height),
-            sorting_position=settings.sorting_positions["object_A"],
-            trajectory_goto=[last_goto],
-            trajectory_pick=[last_goto],
-            object_uv_anchor=(u_anchor, v_anchor),
-            belt_pos_anchor=belt_pos,
-        )
-
-    def test_lead_includes_pick_traverse_when_object_drifted(self):
+    def test_pick_gate_waits_for_live_object_u(self):
         settings = _settings()
-        frame = ConveyorFrame()
-        speed_uv, v_anchor, u_now, belt_pos = 50.0, 65.0, 290.0, 1000.0
-        speed_source = _StubSpeedSource(belt_pos, speed_uv)
-        executor = self._executor(settings, frame, speed_source)
+        scheduler, state = _scheduler_and_state(settings)
+        _add_detection(scheduler.tracker, "obj-gate", 300.0, 65.0, p_now=1000.0)
+        state.belt_position_mm = 1000.0
+        state.belt_speed_mm_s = 50.0
+        plan = _pick_plan(settings, scheduler.frame, "obj-gate", 320.0, 65.0, 1000.0)
 
-        # Park the hover ~100 mm downstream of the object so the pick phase needs a
-        # real horizontal traverse — the multi-object failure case.
-        hover_xy = frame.to_robot(390.0, v_anchor)
-        plan = self._plan(settings, hover_xy, u_now, v_anchor, belt_pos, speed_uv)
+        gate_before = _object_pick_gate_status(state, plan)
+        state.belt_position_mm = 1020.0
+        gate_after = _object_pick_gate_status(state, plan)
 
-        packet = executor._repredicted_pick_packet(plan, _trajectory_packet_dummy())
-        self.assertIsNotNone(packet)
+        self.assertIsNotNone(gate_before)
+        self.assertIsNotNone(gate_after)
+        assert gate_before is not None and gate_after is not None
+        self.assertFalse(gate_before["reached"])
+        self.assertTrue(gate_after["reached"])
 
-        new_u, _ = frame.to_conveyor(packet["argument_x"][0], packet["argument_y"][0])
-        command_delay = settings.robot_movement_delay_s + settings.ethernet_delay_s
-        old_u_contact = u_now + speed_uv * (command_delay + settings.interp_soft_start_s)
-
-        # Corrected lead places the descent further downstream than the old
-        # soft-start-only budget, and still inside the workspace window.
-        self.assertGreater(new_u, old_u_contact + 1.0)
-        u_min, u_max = settings.workspace_window_uv[0], settings.workspace_window_uv[1]
-        self.assertTrue(u_min <= new_u <= u_max)
-
-    def test_lead_degrades_to_soft_start_when_arm_already_above_object(self):
+    def test_prune_skips_claimed_objects(self):
         settings = _settings()
-        frame = ConveyorFrame()
-        speed_uv, v_anchor, u_now, belt_pos = 50.0, 65.0, 290.0, 1000.0
-        speed_source = _StubSpeedSource(belt_pos, speed_uv)
-        executor = self._executor(settings, frame, speed_source)
+        scheduler, _state = _scheduler_and_state(settings)
+        _add_detection(scheduler.tracker, "claimed", 410.0, 65.0)
+        _add_detection(scheduler.tracker, "unclaimed", 410.0, 80.0)
 
-        # Park the hover exactly where the old soft-start-only budget predicts the
-        # descent: zero traverse -> the new lead must collapse to the old value.
-        command_delay = settings.robot_movement_delay_s + settings.ethernet_delay_s
-        u_expected = u_now + speed_uv * (command_delay + settings.interp_soft_start_s)
-        hover_xy = frame.to_robot(u_expected, v_anchor)
-        plan = self._plan(settings, hover_xy, u_now, v_anchor, belt_pos, speed_uv)
-        # pre_pick hover z differs from pickup z; align so the traverse distance is ~0.
-        plan.trajectory_goto = [
-            TrajectoryPoint(hover_xy[0], hover_xy[1], settings.pickup_height, 0, 0.1)
-        ]
+        removed = _prune_unclaimed_tracker(
+            scheduler.tracker,
+            {"claimed"},
+            p_now=0.0,
+            now=1000.0,
+        )
 
-        packet = executor._repredicted_pick_packet(plan, _trajectory_packet_dummy())
-        self.assertIsNotNone(packet)
-        new_u, _ = frame.to_conveyor(packet["argument_x"][0], packet["argument_y"][0])
-        self.assertAlmostEqual(new_u, u_expected, delta=1.0)
-
-
-def _trajectory_packet_dummy():
-    return {"commandID": 3, "argument_number": 0, "argument_x": [], "argument_y": [],
-            "argument_z": [], "argument_e": [], "argument_time": []}
+        self.assertEqual(removed, 1)
+        self.assertIsNotNone(scheduler.tracker.objects())
+        remaining = {obj.object_id for obj in scheduler.tracker.objects()}
+        self.assertIn("claimed", remaining)
+        self.assertNotIn("unclaimed", remaining)
 
 
 class SimulatedPerceptionTests(unittest.TestCase):

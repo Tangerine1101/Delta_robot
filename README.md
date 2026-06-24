@@ -35,7 +35,7 @@ Execute these commands once connected to real PLCs:
 # Start interactive CLI mode
 python3 main.py --cli
 
-# Run auto-scheduler with Omron RealRobotExecutor
+# Run auto-scheduler with Omron RealtimePickExecutor
 python3 main.py --scheduler --scenario test_throughput
 ```
 
@@ -115,15 +115,36 @@ python3 -m modules.image_processing --no-window      # headless (no window)
    └──────────────────────────────────────────────────┘
 ```
 
-* **Threading Model**: 
-  - Main Process: CLI Parser / Auto-Scheduler planning loop.
-  - Worker Process (`multiprocessing` queue): PLCGateway communication to eliminate network latency blocking.
-* **PLC Package Contract**: Fixed 4-slot coordinate arrays sent to the `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
-* **Interception Math**: Predicts conveyor interception using the object's initial position, dynamic 2D speed vector `[vx, vy]`, and a fixed-point iteration search. The default simulated conveyor moves along positive Y while X stays fixed per lane.
-* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of actual conveyor speed. The PC is solely responsible for reading the belt position (`conveyor_position`, cm) from the Siemens S7-1200 and deriving speed from it, planning the interception trajectory, computing the optimal pick timing, and sending pre-calculated static coordinates to the Omron PLC. The robot simply executes the received coordinates.
-* **4-Point/2-Phase Trajectory**: Moves in a `goto` phase followed by a `pick` phase. `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not flat-then-vertical moves.
-* **Timing Compensation**: Command is dispatched ahead of interception to account for mechanics and communication:
-  $$t_{\text{dispatch}} = t_{\text{pick}} - t_{\text{robot\_movement\_delay}} - t_{\text{ethernet\_delay}}$$
+* **Threading Model (real pick path — `production` / `test_conveyor`)**: the scheduler runs
+  as **two cooperating threads** over one guarded `RealtimeState`, plus the IPC worker:
+  - **Perception/state thread** (`_realtime_perception_loop`, ~25 ms): the only regular PLC
+    status read — updates belt position/speed + `pos_EE`, polls vision, refreshes the
+    `BeltTracker` (prunes only *unclaimed* stale objects), emits `[SPEED]`/`[DETECT]`.
+  - **Main decision/execution thread** (`_run_realtime_pick_loop` → `RealtimePickExecutor`):
+    selects an object, predicts the pick point, dispatches goto/pick. Its wait loops read
+    shared state and issue **no PLC I/O**.
+  - **Worker Process** (`multiprocessing` queue): the single PLCGateway; an `ipc_lock` keeps
+    exactly one round-trip in flight, a `state_lock` guards the shared state.
+  (The simulated scenarios keep the original single-threaded loop.)
+* **PLC Package Contract**: Fixed 7-slot coordinate arrays (`interpolar_points`) sent to the
+  `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
+* **Interception Math**: The kept iterative solver `_predict_pick_position` projects the
+  object forward (belt velocity) to find the **earliest feasible straight-down pick
+  position** and verify reachability — it no longer fires the pick on a converged *time*.
+* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of belt speed. The PC
+  reads the belt position (`conveyor_position`, **mm — `conveyor_position_scale_mm = 1.0`**)
+  from the Siemens S7-1200, derives speed, and plans the pick. The robot simply executes the
+  received coordinates.
+* **2-Phase Trajectory**: A `goto` phase followed by a `pick` phase, each a 7-point template.
+  `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not
+  flat-then-vertical moves.
+* **Positional pick gate (replaces timing compensation)**: the arm parks `intercept_lead_time_s`
+  = **1.6 s** downstream of the object, then the pick packet is fired by a **live position
+  gate** — when the tracked object's `u` reaches the parked pick `u`
+  (`u_now >= u_pick - _belt_lead_offset_mm(speed)`). There is **no** time-based dispatch-ahead
+  formula; closing the loop on the live object makes the pick immune to belt-speed estimate
+  noise. The empty `_belt_lead_offset_mm` hook (returns `0.0`) is reserved for future
+  latency compensation — see §5 Roadmap.
 
 ---
 
@@ -231,6 +252,9 @@ Detailed documentation files are available in the `doc/` directory:
 * [theory_basis.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/theory_basis.md): Human-oriented software architecture, coordinate transforms, and high-level concepts; maintained by the human team.
 * [academic_report.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/academic_report.md): Formal academic archive of the mathematical model, kinematics, and trajectory generation derivations.
 * [ai_context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/ai_context.md): Compact summary of codebase facts, command maps, and verification scripts for quick AI context updates.
+* [rebuild_plan.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/rebuild_plan.md): **Design of record** for the real-time two-thread pick scheduler — the detailed spec (architecture, component design, kept/rewritten/removed inventory).
+* [realtime_pick_redesign.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/realtime_pick_redesign.md): **Design of record** companion — the post-implementation summary of the real-time pick flow and verification checklist.
+* `doc/archive/`: superseded multi-object-lag debugging reports (Gemini/GPT/final bug reports + video analyses). Kept for history; **not** a current reference.
 
 ---
 
@@ -286,7 +310,17 @@ turning several previously-guessed values into derivations from the PLC's own lo
   $$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
 
 ### Future Roadmap
-0. **Concurrent executor (bug `bug_report_final.md` Layer 1 — highest priority)**:
+- **Belt-speed lead offset (`_belt_lead_offset_mm`) — not yet developed**:
+  - Implement the currently-empty offset hook in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py) (it returns `0.0`) so the
+    positional pick gate fires `offset` mm **early**, compensating command + network +
+    mechanism latency. The gate already subtracts it
+    (`threshold = u_pick - _belt_lead_offset_mm(speed)`), so only the function body needs a
+    speed-dependent model (latency × belt speed, calibrated on the real belt).
+  - Rationale: negligible at the current 50–100 mm/s belt, but the lead grows with belt
+    speed; without it, faster belts will land the pick slightly behind the part.
+  - **Deferred — roadmap only.** Both design docs flag the same hook
+    ([doc/realtime_pick_redesign.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/realtime_pick_redesign.md) §Execution, [doc/rebuild_plan.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/rebuild_plan.md) §G); this Roadmap entry is the single source of truth for the work.
+0. **Concurrent executor (bug `doc/archive/bug_report_final.md` Layer 1 — highest priority)**:
    - Decouple `executor.execute` onto a background thread/process so the main loop keeps
      sampling the belt, polling vision, re-anchoring, and pre-planning the next object
      *while* the arm handles the current pick. This removes the strict pick serialization
@@ -294,7 +328,7 @@ turning several previously-guessed values into derivations from the PLC's own lo
      land behind the part. Deferred from the 24/6 update.
 1. **Endianness Fix & 4th-Axis Rotation (Upcoming)**:
    - Change Siemens communication structs from `ctypes.Structure` to `ctypes.BigEndianStructure` in [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) for automatic S7-1200 big-endian compatibility. *(Done)*
-   - Remove the hardcoded 90.0° rotation value in `RealRobotExecutor` in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py#L386-391) and replace with a dynamic $\theta$ angle supplied by the vision system.
+   - Remove the hardcoded 90.0° rotation value in `RealtimePickExecutor` in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py) and replace with a dynamic $\theta$ angle supplied by the vision system.
 2. **Vision Integration (Next milestone)**:
    - Set up a real camera and build an image processing module to classify PCB types (25×25 mm and 40×40 mm) and measure the PCB tilt angle $\theta$ using OpenCV or a YOLO model.
 3. **PC-side Workspace Safety Check**:

@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+*.mp4
+calib_result.jpg
 .venv/
 YOLO_OBB/
