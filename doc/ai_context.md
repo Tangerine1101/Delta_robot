@@ -40,7 +40,6 @@ Delta_robot/
 │   ├── image_processing.py    # YOLO-OBB inference and PyAV camera capture threads
 │   ├── interface.py           # In-process Web Dashboard (stdlib http.server + SSE)
 │   ├── cli.py                 # Interactive command-line command builder and parser
-│   ├── calibration.py         # Workspace and camera calibration utilities
 │   ├── test_module.py         # Standalone fake PLC simulator (TCP socket JSON-lines)
 │   └── config.json            # Active system configurations and parameters
 │
@@ -67,8 +66,6 @@ Delta_robot/
 │   ├── nano@1280/             # YOLO-OBB 1280p models
 │   ├── nano@1920/             # YOLO-OBB 1920p models (Default active model)
 │   └── small@1280_old_dataset/
-│
-└── runs/                      # YOLO validation and training plots
 ```
 
 ### Directories to AVOID / Ignore:

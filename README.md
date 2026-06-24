@@ -334,7 +334,6 @@ turning several previously-guessed values into derivations from the PLC's own lo
 3. **PC-side Workspace Safety Check**:
    - Add a kinematic workspace boundary check on the PC as a redundant safety layer (current motion limits are hardcoded directly on the PLC to keep the Python layer flexible).
 4. **Profile Smoothing**: Add jerk/acceleration-limited profiles on top of the mandatory 3D slope waypoints.
-5. **Calibration Utility**: Fix and integrate `modules/calibration.py` to auto-profile Ethernet round-trip latency and mechanical movement delays.
 
 ---
 
@@ -359,9 +358,7 @@ turning several previously-guessed values into derivations from the PLC's own lo
    - The correct PLC-side command trigger tag is `bit_doing`. This key must be synchronized across all PC-side communication data structures.
 4. **`goto_relative` command not implemented on PLC**:
    - Command ID 1 (`goto_relative`) has not been programmed on the physical PLC.
-5. **Calibration test failure in `calibration.py`**:
-   - The mechanical delay calibration sends a `stop` command (ID = 0) and waits for `task_doing == 1`. The mock PLC sets `task_doing` to the command ID (0 for `stop`), so the calibration step always times out.
-6. **`run_test.py` removed (replaced by `--interface` web dashboard)**:
+5. **`run_test.py` removed (replaced by `--interface` web dashboard)**:
    - The old subprocess + matplotlib launcher (and its hardcoded plot path) has been
      deleted. Live visualization now runs in-process via `modules/interface.py`
      (`main.py ... --interface`); simulation uses the scheduler's `--simulate-executor`.
