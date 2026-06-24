@@ -26,8 +26,8 @@
         "frame": {
             "theta_deg": 28.0,
             "robot_origin_uv": [
-                360.0,
-                130.0
+                298.0,
+                66.0
             ]
         },
         "camera_window_uv": [
@@ -37,8 +37,8 @@
             75.0
         ],
         "workspace_window_uv": [
-            275.0,
-            400.0,
+            188.0,
+            363.0,
             10.0,
             120.0
         ],
@@ -97,25 +97,25 @@
             "auto_exposure": 0,
             "exposure_time_absolute": 300
         },
-        "pixels_per_mm": 5.93,
+        "pixels_per_mm": 6.3451,
         "roi": {
             "enabled": true,
             "polygon": [
                 [
-                    556,
-                    172
+                    544,
+                    129
                 ],
                 [
-                    1328,
-                    172
+                    1335,
+                    124
                 ],
                 [
-                    1328,
-                    909
+                    1341,
+                    903
                 ],
                 [
-                    556,
-                    909
+                    567,
+                    904
                 ]
             ]
         },

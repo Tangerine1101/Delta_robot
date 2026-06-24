@@ -745,13 +745,37 @@ class RealRobotExecutor:
             self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         )
         pick_z = self.settings.pickup_height
-        # Contact lead: after the pick command is issued, the gripper reaches
-        # Pos[0]=pickup at the end of the PLC's 80 ms soft-start (State 10), which
-        # absorbs the small pre_pick->pickup descent. Mirrors the PLC model rather
-        # than a nominal-speed estimate (the Omron ignores argument_time).
-        u_contact = u_now + sample.speed_uv * (
-            command_delay_s + self.settings.interp_soft_start_s
-        )
+        # Starting point of the pick phase: the arm is parked at the last goto
+        # waypoint (hover above the *old* predicted point). _build_pick_geometry /
+        # _build_pick_timing expect Position3D tuples for goto_points (they index
+        # goto_points[-1][0]); plan.trajectory_goto holds TrajectoryPoint objects,
+        # so convert the last waypoint to a tuple.
+        last_goto_pt = plan.trajectory_goto[-1]
+        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
+
+        # Contact lead: time from issuing the pick command until the gripper
+        # touches the part at Pos[0]=pickup. This is NOT just the 80 ms soft-start
+        # — when the part has drifted, the arm must traverse horizontally from the
+        # parked hover XY (last_goto_pos) to the new descent XY before dropping. We
+        # budget that full pick-phase approach flight via the PLC interpolator model
+        # (_trajectory_total_time over [hover -> descent], = soft_start + rest->rest
+        # segment time), iterating because the descent point depends on the lead.
+        # Mirrors the planning-time predictor (_predict_pick_position), which adds
+        # the full goto flight time. Degrades to the old soft-start-only lead when
+        # the traverse is ~0 (single-object case, arm already above the part).
+        v_belt = sample.speed_uv
+        approach_s = self.settings.interp_soft_start_s
+        u_contact = u_now + v_belt * (command_delay_s + approach_s)
+        for _ in range(6):
+            u_contact = u_now + v_belt * (command_delay_s + approach_s)
+            pick_xy = self.frame.to_robot(u_contact, v_anchor)
+            candidate: Position3D = (pick_xy[0], pick_xy[1], pick_z)
+            new_approach = _trajectory_total_time([last_goto_pos, candidate], self.settings)
+            if abs(new_approach - approach_s) < 0.005:
+                approach_s = new_approach
+                break
+            approach_s = new_approach
+        u_contact = u_now + v_belt * (command_delay_s + approach_s)
 
         if not self.frame.is_in_window_uv(u_contact, v_anchor, self.settings.workspace_window_uv):
             return None
@@ -759,12 +783,7 @@ class RealRobotExecutor:
         pick_xy = self.frame.to_robot(u_contact, v_anchor)
         new_pick_position: Position3D = (pick_xy[0], pick_xy[1], pick_z)
 
-        # Rebuild pick phase geometry from last goto waypoint as starting point.
-        # _build_pick_geometry / _build_pick_timing expect Position3D tuples for
-        # goto_points (they index goto_points[-1][0]); plan.trajectory_goto holds
-        # TrajectoryPoint objects, so pass the converted last waypoint tuple.
-        last_goto_pt = plan.trajectory_goto[-1]
-        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
+        # Rebuild pick phase geometry from the parked goto waypoint as start point.
         new_pick_points = _build_pick_geometry(
             new_pick_position, plan.sorting_position, self.settings, [last_goto_pos]
         )
@@ -828,9 +847,14 @@ class RealRobotExecutor:
         command_delay_s = (
             self.settings.robot_movement_delay_s + self.settings.ethernet_delay_s
         )
-        # See _repredicted_pick_packet: contact = command_delay + PLC soft-start.
-        contact_lead_s = command_delay_s + self.settings.interp_soft_start_s
-        u_anchor, _v_anchor = plan.object_uv_anchor
+        # Contact lead consistent with _repredicted_pick_packet: command delay plus
+        # the full pick-phase approach flight (parked hover -> descent point), not
+        # just the soft-start. Computed per-sample in the loop below because the
+        # descent point (and therefore the traverse distance) moves with the belt.
+        u_anchor, v_anchor = plan.object_uv_anchor
+        pick_z = self.settings.pickup_height
+        last_goto_pt = plan.trajectory_goto[-1]
+        last_goto_pos: Position3D = (last_goto_pt.x, last_goto_pt.y, last_goto_pt.z)
         # Dispatch threshold = the planner's predicted pick u, so the object
         # arrives where the goto already parked the arm (minimal re-prediction
         # correction). Fall back to the window entry if the frame isn't wired.
@@ -854,7 +878,24 @@ class RealRobotExecutor:
                 print(f"[WARN] pick-dispatch belt poll failed: {exc}")
                 return
             u_now = u_anchor + (sample.position_mm - plan.belt_pos_anchor)
-            u_contact = u_now + sample.speed_uv * contact_lead_s
+            # Project the contact point with the same approach-inclusive lead the
+            # re-prediction will use, so the dispatch threshold matches the motion
+            # model (and the timeout diagnostics report the true contact point).
+            if self.frame is not None:
+                approach_s = self.settings.interp_soft_start_s
+                for _ in range(3):
+                    u_c = u_now + sample.speed_uv * (command_delay_s + approach_s)
+                    xy = self.frame.to_robot(u_c, v_anchor)
+                    next_approach = _trajectory_total_time(
+                        [last_goto_pos, (xy[0], xy[1], pick_z)], self.settings
+                    )
+                    if abs(next_approach - approach_s) < 0.005:
+                        approach_s = next_approach
+                        break
+                    approach_s = next_approach
+            else:
+                approach_s = self.settings.interp_soft_start_s
+            u_contact = u_now + sample.speed_uv * (command_delay_s + approach_s)
             if u_contact >= u_target:
                 # Object has reached the planned pick point — dispatch now; the
                 # re-prediction enforces the downstream bound and aborts on
