@@ -6,5 +6,19 @@ __pycache__/
 calib_result.jpg
 .venv/
 YOLO_OBB/
-doc/ref
+report/ref
 *.pdf
+
+# LaTeX build artifacts (latexmk/pdflatex)
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.bbl
+*.bcf
+*.blg
+*.run.xml

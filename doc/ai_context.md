@@ -1,7 +1,7 @@
 # AI Context Summary: Delta Robot
 
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
-> **Status (real-time pick rewrite)**: The real conveyor pick path (`production`) was rebuilt as a **two-thread** PC-side scheduler to kill the multi-object "arrive → wait → miss" lag. A daemon **perception thread** (`_realtime_perception_loop`, ~25 ms) owns the only PLC status read and keeps shared `RealtimeState` (belt position/speed, `pos_EE`, the `BeltTracker`, claimed ids) fresh under `state_lock`; the **main decision/execution thread** selects an object (danger-zone priority), predicts a stable straight-down pick point, parks the arm with a 1.6 s lead (`intercept_lead_time_s`), then fires the pick on a **live positional gate** — when the tracked object's `u` reaches the parked pick `u` — with no post-park time math. Dispatch/status round-trips share one `ipc_lock`. New code lives in `RealtimePickExecutor` + `_run_realtime_pick_loop`; the old time-based executor/wait logic was removed. Design of record: `doc/realtime_pick_redesign.md` + `doc/rebuild_plan.md`. The simulated path (`test_throughput`/`test_accuracy`/`test_acceptance`/`evaluate`) is unchanged.
+> **Status (real-time pick rewrite)**: The real conveyor pick path (`production`) was rebuilt as a **two-thread** PC-side scheduler to kill the multi-object "arrive → wait → miss" lag. A daemon **perception thread** (`_realtime_perception_loop`, ~25 ms) owns the only PLC status read and keeps shared `RealtimeState` (belt position/speed, `pos_EE`, the `BeltTracker`, claimed ids) fresh under `state_lock`; the **main decision/execution thread** selects an object (danger-zone priority), predicts a stable straight-down pick point, parks the arm with a 1.6 s lead (`intercept_lead_time_s`), then fires the pick on a **live positional gate** — when the tracked object's `u` reaches the parked pick `u` — with no post-park time math. Dispatch/status round-trips share one `ipc_lock`. New code lives in `RealtimePickExecutor` + `_run_realtime_pick_loop`; the old time-based executor/wait logic was removed. Design of record: `doc/archive/realtime_pick_redesign.md` + `doc/archive/rebuild_plan.md`. The simulated path (`test_throughput`/`test_accuracy`/`test_acceptance`/`evaluate`) is unchanged.
 > **Status (test scenario standardization, 2026-06-25)**: `test_conveyor` **retired** — it was behaviorally identical to `production` (the only difference, a startup `change_speed`, already fires for `production` too when `adaptive_speed_enabled`). `test_accuracy` now: (a) never commands suction (`PickScheduler.scenario_name` gates the pick-phase gripper bits to all-zero in `_build_pick_plan`) since its objects are static fakes with no real board to grip; (b) spawns a full **wave** of `accuracy_spawn_uv` points at once and blocks further spawns until the previous wave's picks all finish (`SimulatedImageProcessing._wave_pending` + `notify_pick_finished`), instead of a fixed timer decoupled from pick completion; (c) on real hardware (no `--simulate-executor`) now runs on `EvaluateExecutor` (the same dispatch-and-wait-for-pos_EE-convergence backend `evaluate` uses) instead of `RealtimePickExecutor` — the latter unconditionally required a `RealtimeState` the single-thread loop never built, so real-hardware `test_accuracy` **crashed on the first pick** before this fix; a belt-gate design was also the wrong fit for static objects anyway. New scenario **`test_acceptance`** (same family as `test_accuracy`) runs exactly `scheduler.test_acceptance_cycles` (default 9) picks then stops, printing per-phase `[ACCEPT]` wall-time/distance (goto and pick measured separately, dispatch→settle, via `EvaluateExecutor.metrics`) and a final `[ACCEPT-SUMMARY]`. `test_vision_only`'s belt-speed-not-visible bug was **dead code, not a design gap**: `main.py` had an early-return that called `run_scheduler_scenario` without `executor=`, skipping the already-correct `NullExecutor(dispatch=..., request_status=...)` construction further down — deleted the dead path.
 > **Status (adaptive belt speed)**: Implemented, **opt-in** via `scheduler.adaptive_speed_enabled` (default `false` → static `test_conveyor_belt_speed_mm_s`, unchanged; **currently `true` in the live config.json** — under active hardware testing). Density `N` is sensed **continuously by the perception thread** every ~25 ms tick (`state.belt_speed_target_mm_s = _adaptive_belt_speed(N, settings)`, doc/theory_basis.md §6 — belt speed **inverse** to density N, `v = clamp(λ_nom·L_meas/N, v_min, v_cap)`). The commit (`_commit_adaptive_speed`) fires **at the grip instant** — right after the pick packet dispatch in `RealtimePickExecutor.execute` — and again when the main loop is idle (no plan) so the belt relaxes toward `v_cap`; **revised 2026-06-25** from an earlier goto-piggyback design that only recomputed density once per multi-second `_build_realtime_pick_plan` call (reported as laggy/mistimed on hardware). Anti-thrash deadband `belt_speed_deadband_mm_s`. The pick-gate lead offset `_belt_lead_offset_mm` still returns `v·T_delay`. New config keys under `scheduler`: `pick_cycle_s` (t_pick, **calibrated** — robot beats the old 2.5 s; default 2.0), `pick_transit_min_s` (→ `v_cap=L/t_transit`), `belt_speed_headroom` (k), `belt_speed_min_mm_s`, `belt_speed_hw_max_mm_s`, `belt_density_length_mm` (0 → derive L_meas = u_max), `belt_accel_mm_s2`/`belt_ramp_s` (informational).
 > **Status (phantom re-pick fix)**: There was never intentional slip/miss-retry logic — `execute()` reports success once the arm's *motion* finishes; suction is never verified. A gap meant a completed pick's object stayed in `scheduler.tracker` (only `claimed_object_ids`, cleared right after `execute()`, excluded it), so it could be re-selected next plan build — "pick plan targets a board that no longer exists." **Fixed 2026-06-25**: the main loop now calls `scheduler.tracker.remove(plan.object_id)` in the same post-`execute()` block (success or failure), plus a defensive `planned_object_ids` skip in `_build_realtime_pick_plan`'s candidate loop. Each detected object is now pick-attempted **exactly once**; a genuine suction miss rides past `u_max` uncaught instead of a noisy phantom re-pick (see doc/theory_basis.md §6.8).
@@ -50,9 +50,10 @@ Delta_robot/
 │   ├── ai_context.md          # THIS FILE: Consolidated AI reference & coding guide
 │   ├── theory_basis.md        # Human-oriented mathematical concepts & brainstorming
 │   ├── academic_report.md     # Academic mathematical derivations & kinematics archive
-│   ├── rebuild_plan.md        # Design of record: real-time two-thread pick scheduler (detailed spec)
-│   ├── realtime_pick_redesign.md # Design of record: real-time pick flow summary (post-implementation)
-│   ├── archive/               # Superseded debugging reports (historical; NOT current reference)
+│   ├── Yolo_training_report.md # Vision system (YOLO26-OBB) training & validation report
+│   ├── Manuals/                # PLC & hardware datasheets (OMRON NX1P2, Siemens S7-1200, brochures)
+│   ├── archive/                # Superseded design docs/debugging reports (historical; NOT current reference)
+│   │   └── report_draft_v1/    # Old failed Markdown→docx thesis attempt, superseded by report/ (LaTeX)
 │   └── PLC_Program_description/ # PLC Structured Text & Ladder breakdowns
 │       ├── main_logic.md      # Rung-by-rung breakdown of main PLC program
 │       ├── inverse_kinematics.md # Inverse kinematics ST program derivations
@@ -61,6 +62,15 @@ Delta_robot/
 │       ├── s_and_trapodize.md # Mathematical justification of Trapezoidal fallback
 │       ├── easy_understand_talet_3d.md # LERP parametric synchronization proof
 │       └── Ethercat_config.md # PDO mappings & DC synchronization details
+│
+├── report/                    # LaTeX graduation thesis resources (see report/README.md)
+│   ├── README.md               # Describes the layout below; current completeness status
+│   ├── main.tex                # Main thesis entry point (skeleton; \input's tex/ sections)
+│   ├── diagram/                 # Mermaid (.mmd) flowchart sources + rendered .png/.svg/.pdf
+│   ├── img/                    # General photos (hardware, workspace) — currently empty
+│   ├── src/                    # Raw mixed-format material (pdf/docx/md) to mine for prose — currently empty
+│   ├── ref/                     # Academic references: textbooks, papers, FAE thesis template PDF
+│   └── tex/                     # Individual .tex section files included by main.tex — currently empty
 │
 ├── tests/                     # Unit tests
 │   └── test_trajectory_planning.py
@@ -74,6 +84,7 @@ Delta_robot/
 ### Directories to AVOID / Ignore:
 * **`.trash/`**: Contains legacy backup files. **NEVER read, edit, or reference** anything here.
 * **`doc/Manuals/`**: Large PDF documentation files. Only open when checking physical registers.
+* **`doc/archive/`**: Superseded/historical material. Not current reference.
 * **`.git/`, `.venv/`, `.agents/`, `__pycache__/`, `modules/__pycache__/`**: System metadata and Python caches. **IGNORE**.
 
 ---
