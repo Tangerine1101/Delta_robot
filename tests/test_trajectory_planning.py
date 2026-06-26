@@ -4,15 +4,19 @@ import unittest
 from modules.conveyor import BeltTracker, ConveyorFrame
 from modules.image_processing import ObjectDetection, SimulatedImageProcessing
 from modules.scheduler import (
+    EvaluateExecutor,
     PickPlan,
     PickScheduler,
     RealtimeState,
     SchedulerSettings,
     SpeedSample,
     TrajectoryPoint,
+    _adaptive_belt_speed,
+    _belt_lead_offset_mm,
     _build_realtime_pick_plan,
     _build_goto_geometry,
     _build_pick_geometry,
+    _commit_adaptive_speed,
     _object_pick_gate_status,
     _predict_realtime_pick_position,
     _prune_unclaimed_tracker,
@@ -316,13 +320,178 @@ class RealtimePickPlanningTests(unittest.TestCase):
         self.assertNotIn("unclaimed", remaining)
 
 
+class AdaptiveBeltSpeedTests(unittest.TestCase):
+    # Clean derived values: L = u_max-u_min = 100, v_cap = L/t_transit = 50,
+    # L_meas = u_max = 100, mu_max = 1/2 = 0.5, lambda_nom = 0.8*0.5 = 0.4,
+    # so v = 0.4*100/N = 40/N.
+    def _adaptive_settings(self, **overrides):
+        values = {
+            "workspace_window_uv": (0.0, 100.0, 0.0, 120.0),
+            "pick_transit_min_s": 2.0,
+            "pick_cycle_s": 2.0,
+            "belt_speed_headroom": 0.8,
+            "belt_speed_min_mm_s": 30.0,
+            "belt_speed_hw_max_mm_s": 200.0,
+            "belt_density_length_mm": 0.0,
+        }
+        values.update(overrides)
+        return _settings(**values)
+
+    def test_sparse_returns_v_cap(self):
+        settings = self._adaptive_settings()
+        self.assertAlmostEqual(_adaptive_belt_speed(0, settings), 50.0)  # v_cap
+
+    def test_regulated_interior(self):
+        settings = self._adaptive_settings()
+        v = _adaptive_belt_speed(1, settings)
+        self.assertAlmostEqual(v, 40.0)  # 40/1, inside (30, 50)
+        self.assertTrue(30.0 < v < 50.0)
+
+    def test_dense_clamps_to_floor(self):
+        settings = self._adaptive_settings()
+        self.assertAlmostEqual(_adaptive_belt_speed(5, settings), 30.0)  # 40/5=8 -> v_min
+
+    def test_inverse_monotonic_non_increasing(self):
+        settings = self._adaptive_settings()
+        speeds = [_adaptive_belt_speed(n, settings) for n in range(1, 8)]
+        for earlier, later in zip(speeds, speeds[1:]):
+            self.assertGreaterEqual(earlier, later)
+
+    def test_v_cap_hard_clamped_to_hw_max(self):
+        # L/t_transit = 1000/2 = 500, but hw max caps it at 200.
+        settings = self._adaptive_settings(
+            workspace_window_uv=(0.0, 1000.0, 0.0, 120.0), belt_speed_hw_max_mm_s=200.0
+        )
+        self.assertAlmostEqual(_adaptive_belt_speed(0, settings), 200.0)
+
+
+class BeltLeadOffsetTests(unittest.TestCase):
+    def test_steady_form_v_times_tdelay(self):
+        self.assertAlmostEqual(_belt_lead_offset_mm(50.0, 0.05), 2.5)
+
+    def test_zero_delay_is_zero(self):
+        self.assertEqual(_belt_lead_offset_mm(50.0, 0.0), 0.0)
+
+    def test_never_negative(self):
+        self.assertEqual(_belt_lead_offset_mm(-50.0, 0.05), 0.0)
+
+
+class AdaptiveSpeedCommitTests(unittest.TestCase):
+    # _commit_adaptive_speed (doc/theory_basis.md §6.6): the live target is
+    # sensed continuously by the perception thread (state.belt_speed_target_mm_s)
+    # and committed here at the grip instant / when idle — decoupled from plan
+    # build time so a density change is reflected right after the lift, not at
+    # the start of the next ~multi-second pick cycle.
+    def _state(self, **overrides):
+        _scheduler, state = _scheduler_and_state(_settings())
+        state.adaptive_speed_enabled = True
+        state.belt_speed_setpoint_mm_s = 0.0
+        state.belt_speed_target_mm_s = 0.0
+        state.belt_speed_deadband_mm_s = 8.0
+        for key, value in overrides.items():
+            setattr(state, key, value)
+        return state
+
+    def test_disabled_never_commits(self):
+        state = self._state(adaptive_speed_enabled=False, belt_speed_target_mm_s=40.0)
+        calls: list[dict] = []
+        _commit_adaptive_speed(calls.append, state)
+        self.assertEqual(calls, [])
+        self.assertAlmostEqual(state.belt_speed_setpoint_mm_s, 0.0)
+
+    def test_zero_target_never_commits(self):
+        state = self._state(belt_speed_target_mm_s=0.0)
+        calls: list[dict] = []
+        _commit_adaptive_speed(calls.append, state)
+        self.assertEqual(calls, [])
+
+    def test_deadband_suppresses_small_change(self):
+        state = self._state(belt_speed_setpoint_mm_s=40.0, belt_speed_target_mm_s=45.0)
+        calls: list[dict] = []
+        _commit_adaptive_speed(calls.append, state)
+        self.assertEqual(calls, [])
+        self.assertAlmostEqual(state.belt_speed_setpoint_mm_s, 40.0)
+
+    def test_commits_when_beyond_deadband(self):
+        state = self._state(belt_speed_setpoint_mm_s=0.0, belt_speed_target_mm_s=40.0)
+        calls: list[dict] = []
+        _commit_adaptive_speed(calls.append, state)
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0]["speed"], 40.0)
+        self.assertAlmostEqual(state.belt_speed_setpoint_mm_s, 40.0)
+
+    def test_dispatch_failure_does_not_advance_setpoint(self):
+        def _boom(_packet):
+            raise RuntimeError("ipc down")
+
+        state = self._state(belt_speed_setpoint_mm_s=0.0, belt_speed_target_mm_s=40.0)
+        _commit_adaptive_speed(_boom, state)
+        self.assertAlmostEqual(state.belt_speed_setpoint_mm_s, 0.0)
+
+
+class PhantomRepickGuardTests(unittest.TestCase):
+    # Issue-2 fix: a completed/attempted object must never be re-targeted as a
+    # candidate for a board that no longer exists.
+    def test_completed_object_removed_from_tracker_is_not_reselected(self):
+        settings = _settings()
+        scheduler, state = _scheduler_and_state(settings)
+        scheduler.current_position = (280.0, 65.0, settings.pre_pick_height)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        state.latest_speed = sample
+        state.belt_position_mm = sample.position_mm
+        _add_detection(scheduler.tracker, "obj-1", 300.0, 65.0)
+
+        plan = _build_realtime_pick_plan(scheduler, state, 1000.0)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.object_id, "obj-1")
+
+        # Mirrors the post-execute bookkeeping in _run_realtime_pick_loop:
+        # discard the claim, record as planned, and remove from the tracker so
+        # it can never be re-selected.
+        state.claimed_object_ids.discard(plan.object_id)
+        scheduler.planned_object_ids[plan.object_id] = 1000.0
+        scheduler.tracker.remove(plan.object_id)
+
+        # Vision re-emits the same still-visible id on the next frame.
+        scheduler.ingest_detections(
+            [
+                ObjectDetection(
+                    object_id="obj-1", x=300.0, y=65.0, object_type="object_A", timestamp=1000.05
+                )
+            ],
+            sample.position_mm,
+        )
+
+        next_plan = _build_realtime_pick_plan(scheduler, state, 1000.05)
+        self.assertIsNone(next_plan)
+        self.assertNotIn("obj-1", {obj.object_id for obj in scheduler.tracker.objects()})
+
+    def test_planned_object_ids_guard_skips_residual_tracker_entry(self):
+        # Defensive guard: even if an object id is still physically present in
+        # the tracker, planned_object_ids alone must exclude it from candidate
+        # selection (belt-and-suspenders against the tracker-removal race).
+        settings = _settings()
+        scheduler, state = _scheduler_and_state(settings)
+        scheduler.current_position = (280.0, 65.0, settings.pre_pick_height)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        state.latest_speed = sample
+        state.belt_position_mm = sample.position_mm
+        _add_detection(scheduler.tracker, "obj-ghost", 300.0, 65.0)
+        scheduler.planned_object_ids["obj-ghost"] = 999.0  # already attempted earlier
+
+        plan = _build_realtime_pick_plan(scheduler, state, 1000.0)
+        self.assertIsNone(plan)
+
+
 class SimulatedPerceptionTests(unittest.TestCase):
-    def test_accuracy_points_cycle_in_order(self):
-        start = 1000.0
-        # test_accuracy now spawns objects at C-frame (u, v) from accuracy_spawn_uv;
-        # detection.x = u, detection.y = v.
-        sim = SimulatedImageProcessing(
-            "test_accuracy",
+    def _accuracy_sim(self, scenario_name="test_accuracy", start=1000.0):
+        # test_accuracy/test_acceptance spawn objects at C-frame (u, v) from
+        # accuracy_spawn_uv; detection.x = u, detection.y = v.
+        return SimulatedImageProcessing(
+            scenario_name,
             {
                 "throughput_object_types": ["object_A"],
                 "accuracy_emit_interval_s": 0.8,
@@ -335,14 +504,65 @@ class SimulatedPerceptionTests(unittest.TestCase):
             start,
         )
 
-        detections = []
-        for index in range(4):
-            detections.extend(sim.poll(start + index * 0.8))
-
+    def test_accuracy_spawns_full_wave_at_once(self):
+        sim = self._accuracy_sim()
+        detections = sim.poll(1000.0)
         self.assertEqual(
             [(d.x, d.y) for d in detections],
-            [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0), (40.0, -60.0)],
+            [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0)],
         )
+
+    def test_accuracy_blocks_next_wave_until_previous_clears(self):
+        sim = self._accuracy_sim()
+        first_wave = sim.poll(1000.0)
+        self.assertEqual(len(first_wave), 3)
+
+        # Nothing has been picked yet — repeated polls must not spawn more.
+        self.assertEqual(sim.poll(1000.8), [])
+        self.assertEqual(sim.poll(1001.6), [])
+
+        for detection in first_wave[:-1]:
+            sim.notify_pick_finished(detection.object_id)
+        self.assertEqual(sim.poll(1002.4), [])  # one object still outstanding
+
+        sim.notify_pick_finished(first_wave[-1].object_id)
+        second_wave = sim.poll(1003.2)
+        self.assertEqual(
+            [(d.x, d.y) for d in second_wave],
+            [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0)],
+        )
+
+    def test_acceptance_scenario_also_wave_gated(self):
+        sim = self._accuracy_sim(scenario_name="test_acceptance")
+        first_wave = sim.poll(1000.0)
+        self.assertEqual(len(first_wave), 3)
+        self.assertEqual(sim.poll(1000.1), [])
+
+    def test_accuracy_defaults_to_tqfp_only_independent_of_throughput_types(self):
+        # throughput_object_types deliberately set to something else, to prove
+        # accuracy's object mix does not fall back to/inherit it.
+        sim = SimulatedImageProcessing(
+            "test_accuracy",
+            {
+                "throughput_object_types": ["QFP", "object_A"],
+                "accuracy_spawn_uv": [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0)],
+            },
+            1000.0,
+        )
+        wave = sim.poll(1000.0)
+        self.assertEqual([d.object_type for d in wave], ["TQFP", "TQFP", "TQFP"])
+
+    def test_accuracy_object_types_configurable(self):
+        sim = SimulatedImageProcessing(
+            "test_accuracy",
+            {
+                "accuracy_spawn_uv": [(40.0, -60.0), (0.0, 0.0), (-40.0, 60.0)],
+                "accuracy_object_types": ["QFP"],
+            },
+            1000.0,
+        )
+        wave = sim.poll(1000.0)
+        self.assertEqual([d.object_type for d in wave], ["QFP", "QFP", "QFP"])
 
     def test_throughput_spawns_at_u_spawn_across_v_lanes(self):
         # C-frame convention: throughput_spawn_y is the upstream u_spawn (shared by
@@ -364,6 +584,114 @@ class SimulatedPerceptionTests(unittest.TestCase):
             [(d.x, d.y) for d in detections],
             [(-180.0, -50.0), (-180.0, 0.0), (-180.0, 50.0)],
         )
+
+
+class AccuracySuctionOverrideTests(unittest.TestCase):
+    def _plan_for_scenario(self, scenario_name):
+        settings = _settings(intercept_lead_time_s=1.6)
+        frame = _identity_frame()
+        tracker = BeltTracker(frame, settings.workspace_window_uv, stale_timeout_s=settings.stale_timeout_s)
+        scheduler = PickScheduler(settings, 7, frame, tracker, scenario_name)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        _add_detection(scheduler.tracker, "obj-1", 300.0, 65.0)
+        plan = scheduler.plan_next(1000.0)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        return plan
+
+    def test_accuracy_scenario_forces_suction_off(self):
+        plan = self._plan_for_scenario("test_accuracy")
+        self.assertTrue(all(pt.e == 0 for pt in plan.trajectory_pick))
+
+    def test_acceptance_scenario_forces_suction_off(self):
+        plan = self._plan_for_scenario("test_acceptance")
+        self.assertTrue(all(pt.e == 0 for pt in plan.trajectory_pick))
+
+    def test_other_scenarios_keep_suction_on(self):
+        plan = self._plan_for_scenario("production")
+        self.assertEqual([pt.e for pt in plan.trajectory_pick], [1, 1, 1, 1, 1, 1, 0])
+
+
+class EvaluateExecutorCompatTests(unittest.TestCase):
+    def _real_plan(self, scenario_name="test_accuracy"):
+        settings = _settings(intercept_lead_time_s=1.6)
+        frame = _identity_frame()
+        tracker = BeltTracker(frame, settings.workspace_window_uv, stale_timeout_s=settings.stale_timeout_s)
+        scheduler = PickScheduler(settings, 7, frame, tracker, scenario_name)
+        sample = SpeedSample(vx=0.0, vy=0.0, timestamp=1000.0, position_mm=0.0, speed_uv=0.0)
+        scheduler.update_speed(sample)
+        _add_detection(scheduler.tracker, "obj-1", 300.0, 65.0)
+        plan = scheduler.plan_next(1000.0)
+        assert plan is not None
+        return plan
+
+    def test_execute_reaches_target_and_appends_two_phase_metrics(self):
+        last_target: dict[str, tuple[float, float, float]] = {}
+
+        def fake_dispatch(packet):
+            if "argument_x" in packet:
+                last_target["xyz"] = (
+                    packet["argument_x"][-1],
+                    packet["argument_y"][-1],
+                    packet["argument_z"][-1],
+                )
+            return {"ok": True}
+
+        def fake_request_status():
+            xyz = last_target.get("xyz", (0.0, 0.0, 0.0))
+            return {"pos_EE": list(xyz), "task_state": 0}
+
+        executor = EvaluateExecutor(
+            fake_dispatch,
+            fake_request_status,
+            interpolar_points=7,
+            position_tolerance_mm=0.5,
+            status_poll_interval_s=0.005,
+            wait_timeout_s=2.0,
+        )
+        try:
+            plan = self._real_plan()
+            before = len(executor.metrics.phase_wall_times)
+
+            success = executor.execute(plan, scenario_name="test_accuracy")
+
+            self.assertTrue(success)
+            self.assertEqual(plan.status, "completed")
+            self.assertEqual(len(executor.metrics.phase_wall_times) - before, 2)
+            self.assertEqual(len(executor.metrics.phase_distances) - before, 2)
+        finally:
+            executor.close()
+
+    def test_execute_dispatches_planned_rotate_not_fixed_90(self):
+        # execute_evaluate's own call site (used by the 'evaluate' scenario) keeps
+        # the legacy fixed-90 rotate; the execute() compat wrapper used by
+        # test_accuracy/test_acceptance must pass the plan's real rotate_deg.
+        rotates: list[float] = []
+
+        def fake_dispatch(packet):
+            if "argument_x" not in packet:  # the standalone rotate_absolute command
+                rotates.append(packet["rotate"])
+            return {"ok": True, "pos_EE": [0.0, 0.0, 0.0], "task_state": 0}
+
+        def fake_request_status():
+            return {"pos_EE": [0.0, 0.0, 0.0], "task_state": 0}
+
+        executor = EvaluateExecutor(
+            fake_dispatch,
+            fake_request_status,
+            interpolar_points=7,
+            position_tolerance_mm=10_000.0,  # accept immediately regardless of target
+            status_poll_interval_s=0.005,
+            wait_timeout_s=2.0,
+        )
+        try:
+            plan = self._real_plan()
+            plan.rotate_deg = 17.5
+            executor.execute(plan, scenario_name="test_accuracy")
+            self.assertEqual(rotates, [17.5])
+        finally:
+            executor.close()
 
 
 if __name__ == "__main__":

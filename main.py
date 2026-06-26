@@ -9,7 +9,15 @@ from typing import Any
 from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
 from modules.cli import run_interactive
 from modules.interface import DashboardServer
-from modules.scheduler import NullExecutor, RealtimePickExecutor, SCENARIO_NAMES, run_scheduler_scenario
+from modules.scheduler import (
+    EvaluateExecutor,
+    NullExecutor,
+    RealtimePickExecutor,
+    SCENARIO_NAMES,
+    run_scheduler_scenario,
+)
+
+_ACCURACY_SCENARIOS = ("test_accuracy", "test_acceptance")
 
 # How often (seconds) the worker probes the PLC connection when idle, to prevent
 # EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
@@ -286,23 +294,6 @@ def _run_scheduler(args: argparse.Namespace) -> None:
                 server.stop()
         return
 
-    if args.scenario == "test_vision_only":
-        # Camera-only: no PLC, static belt. Read the board's live R-frame position
-        # on the dashboard to calibrate the conveyor->robot transform. No PLC worker
-        # is started, so the scheduler builds a NullExecutor + static speed source.
-        server, iface_kwargs = _start_interface(args)
-        try:
-            run_scheduler_scenario(
-                args.scenario,
-                duration_s=args.duration,
-                interpolar_points=args.interpolar_points,
-                **iface_kwargs,
-            )
-        finally:
-            if server is not None:
-                server.stop()
-        return
-
     ctx = mp.get_context("spawn")
     command_queue: mp.Queue = ctx.Queue()
     response_queue: mp.Queue = ctx.Queue()
@@ -342,6 +333,22 @@ def _run_scheduler(args: argparse.Namespace) -> None:
         # the robot idle: NullExecutor reads conveyor_position and sends the belt
         # speed command without dispatching any Omron trajectory.
         executor = NullExecutor(dispatch=dispatch, request_status=request_status)
+    elif args.scenario in _ACCURACY_SCENARIOS:
+        # test_accuracy/test_acceptance grip static fake objects, not a moving belt
+        # — no live position gate needed. EvaluateExecutor (the same real-hardware
+        # backend the 'evaluate' scenario uses) dispatches each phase and waits for
+        # real pos_EE convergence, and accumulates per-phase wall-clock timing.
+        executor = EvaluateExecutor(
+            dispatch,
+            request_status,
+            interpolar_points=args.interpolar_points,
+            position_tolerance_mm=float(scheduler_config.get("evaluate_position_tolerance_mm", 0.01)),
+            status_poll_interval_s=status_poll_interval_s,
+            wait_timeout_s=float(scheduler_config.get("evaluate_wait_timeout_s", 10.0)),
+            stability_window_s=float(scheduler_config.get("evaluate_stability_window_s", 0.4)),
+            stability_mm=float(scheduler_config.get("evaluate_stability_mm", 0.3)),
+            stability_arm_mm=float(scheduler_config.get("evaluate_stability_arm_mm", 3.0)),
+        )
     else:
         executor = RealtimePickExecutor(
             dispatch,
@@ -364,6 +371,8 @@ def _run_scheduler(args: argparse.Namespace) -> None:
     finally:
         if server is not None:
             server.stop()
+        if hasattr(executor, "close"):
+            executor.close()
         _stop_worker(worker, command_queue, response_queue, req_counter)
 
 

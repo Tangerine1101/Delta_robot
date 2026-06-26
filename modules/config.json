@@ -31,44 +31,44 @@
             ]
         },
         "camera_window_uv": [
-            50.0,
-            250.0,
-            -75.0,
-            75.0
+            0.0,
+            120.0,
+            0.0,
+            125.0
         ],
         "workspace_window_uv": [
             188.0,
             363.0,
-            10.0,
-            120.0
+            0.0,
+            125.0
         ],
         "accuracy_points_uv": [
             [
-                300.0,
-                40.0,
-                -290.0
+                330.0,
+                80.0,
+                -293.0
             ],
             [
-                350.0,
-                50.0,
-                -290.0
-            ],
-            [
-                400.0,
+                220.0,
                 20.0,
-                -290.0
+                -293.0
+            ],
+            [
+                220.0,
+                100.0,
+                -293.0
             ]
         ]
     },
     "QFP": [
-        30.0,
-        0.0,
-        -285.0
+        95.58,
+        41.76,
+        -260.0
     ],
     "TQFP": [
-        30.0,
-        30.0,
-        -285.0
+        114.36,
+        6.44,
+        -260.0
     ],
     "vision": {
         "model_weights": "models/nano@1920/weights/best.pt",
@@ -106,16 +106,16 @@
                     129
                 ],
                 [
-                    1335,
-                    124
+                    1341,
+                    129
                 ],
                 [
                     1341,
                     903
                 ],
                 [
-                    567,
-                    904
+                    544,
+                    903
                 ]
             ]
         },
@@ -160,13 +160,13 @@
             0.0,
             -290.0
         ],
-        "clearance_height": -270.0,
-        "slope_transition_height": -280.0,
+        "clearance_height": -260.0,
+        "slope_transition_height": -275.0,
         "pickup_height": -300.0,
-        "pre_pick_height": -290.0,
-        "place_height": -282.0,
+        "pre_pick_height": -295.0,
+        "place_height": -280.0,
         "corner_blend_xy": 25.0,
-        "intercept_lead_time_s": 1.6,
+        "intercept_lead_time_s": 0.8,
         "release_descent_time_s": 0.14,
         "nominal_xy_speed": 220.0,
         "nominal_z_speed": 220.0,
@@ -184,9 +184,26 @@
             30.0,
             0.0
         ],
-        "robot_movement_delay_s": 0.05,
-        "ethernet_delay_s": 0.00016,
+        "robot_movement_delay_s": 0.1,
+        "ethernet_delay_s": 0.025,
         "rotate_offset_deg": 0.0,
+        "test_acceptance_cycles": 9,
+        "accuracy_spawn_uv": [
+            [298.0, 66.0],
+            [330.0, 80.0],
+            [220.0, 100.0]
+        ],
+        "accuracy_object_types": ["TQFP"],
+        "adaptive_speed_enabled": true,
+        "pick_cycle_s": 2,
+        "pick_transit_min_s": 1.6,
+        "belt_speed_headroom": 0.6,
+        "belt_speed_min_mm_s": 30.0,
+        "belt_speed_hw_max_mm_s": 200.0,
+        "belt_speed_deadband_mm_s": 8.0,
+        "belt_density_length_mm": 0.0,
+        "belt_accel_mm_s2": 22.31,
+        "belt_ramp_s": 0.25,
         "throughput_object_types": [
             "QFP",
             "TQFP"
@@ -205,19 +222,19 @@
         "evaluate_wait_timeout_s": 10.0,
         "accuracy_points": [
             [
-                -30.0,
-                40.0,
-                -310.0
+                66.64,
+                -52.9,
+                -290.0
             ],
             [
-                -30.0,
-                10.0,
-                -310.0
+                -2.66,
+                -34.8,
+                -290.0
             ],
             [
-                -20.0,
-                -80.0,
-                -310.0
+                -22.5,
+                -76.4,
+                -290.0
             ]
         ],
         "log_path": "data.log"

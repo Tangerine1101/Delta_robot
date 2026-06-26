@@ -1,0 +1,48 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "DELTA ROBOT · LIVE TEST" [level=1] [ref=e3]
+    - generic [ref=e4]: live
+    - generic [ref=e5]: demo
+    - navigation [ref=e6]:
+      - button "Live" [ref=e7] [cursor=pointer]
+      - button "Charts (30s)" [ref=e8] [cursor=pointer]
+  - generic [ref=e10]:
+    - generic [ref=e11]:
+      - heading "Camera (annotated overlay)" [level=2] [ref=e12]
+      - img "camera stream" [ref=e13]
+    - generic [ref=e14]:
+      - generic [ref=e15]:
+        - generic [ref=e16]:
+          - heading "Conveyor" [level=2] [ref=e17]
+          - generic [ref=e18]:
+            - generic [ref=e19]: speed
+            - generic [ref=e20]: 149.30 mm/s
+            - generic [ref=e21]: vx, vy
+            - generic [ref=e22]: 120.00, 0.00
+            - generic [ref=e23]: position
+            - generic [ref=e24]: 2475.70 mm
+        - generic [ref=e25]:
+          - heading "Performance" [level=2] [ref=e26]
+          - generic [ref=e27]:
+            - generic [ref=e28]: PLC round-trip
+            - generic [ref=e29]: 7.6 ms
+            - generic [ref=e30]: pick cycle (avg)
+            - generic [ref=e31]: 1.82 s
+      - generic [ref=e32]:
+        - heading "Detected objects (R-frame)" [level=2] [ref=e33]
+        - table [ref=e34]:
+          - rowgroup [ref=e35]:
+            - row "id type x y" [ref=e36]:
+              - columnheader "id" [ref=e37]
+              - columnheader "type" [ref=e38]
+              - columnheader "x" [ref=e39]
+              - columnheader "y" [ref=e40]
+          - rowgroup [ref=e41]:
+            - row "yolo-1 QFP 479.30 -4.20" [ref=e42]:
+              - cell "yolo-1" [ref=e43]
+              - cell "QFP" [ref=e44]
+              - cell "479.30" [ref=e45]
+              - cell "-4.20" [ref=e46]
+      - generic [ref=e47]:
+        - heading "Plan log" [level=2] [ref=e48]
+        - generic [ref=e49]: "[18] obj=yolo-1 [540,0,-310]"

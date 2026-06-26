@@ -181,3 +181,56 @@ Applying the half-angle identity, the corner velocity limit is:
 $$V_{\text{corner}} = V_{\text{max}} \cdot \cos\left(\frac{\Theta}{2}\right) = V_{\text{max}} \cdot \sqrt{\frac{\cos(\Theta) + 1}{2}}$$
 
 This reduces centripetal acceleration and mechanical shock during corner transitions.
+
+---
+
+## 4. Software Architecture and Concurrency Model
+
+The real-time control system employs a hybrid multiprocessing and multithreading architecture to isolate network communication latency from high-frequency perception and decision-making loops.
+
+### 4.1. Threading Topology
+The system is partitioned into three principal concurrency domains:
+1. **Background Communication Process**: An isolated OS-level process handling asynchronous I/O with programmable logic controllers (PLCs) via Modbus/TCP and EtherNet/IP. Inter-process communication (IPC) queues bridge this process with the main application, effectively absorbing network jitter.
+2. **Perception and State Daemon Thread**: A high-frequency (~40 Hz, 25 ms period) background thread dedicated to sensor fusion. It reads absolute conveyor encoder positions, polls the vision inference pipeline, and maintains a thread-safe `RealtimeState` structure containing object centroids and velocity estimates.
+3. **Decision and Execution Main Thread**: The primary scheduler loop that evaluates kinematic feasibility, builds multi-point trajectory plans, and triggers execution. 
+
+### 4.2. Synchronization Primitives
+To ensure memory consistency without introducing blocking delays:
+*   **State Lock (`state_lock`)**: A mutex protecting the shared `RealtimeState` during perception updates and main-thread snapshot reads.
+*   **IPC Lock (`ipc_lock`)**: A mutex guaranteeing that dispatch/status round-trips to the communication process remain atomic, preventing interleaved packet responses.
+
+---
+
+## 5. Object Tracking and Positional Pick Gate
+
+To robustly intercept moving targets under varying conveyor speeds, the system utilizes absolute encoder anchoring and a positional triggering gate.
+
+### 5.1. Encoder-Anchored Dead-Reckoning
+Integrating velocity over time ($u = \int v \, dt$) introduces cumulative drift, especially under acceleration. The system mitigates this by anchoring each detected object to the absolute conveyor encoder counter $p(t)$ at the instant of detection $t_{\text{anchor}}$:
+$$u(t) = u_{\text{anchor}} + (p(t) - p_{\text{anchor}})$$
+This formulation defines object position as a direct function of physical belt displacement, achieving zero-drift tracking regardless of velocity variations.
+
+### 5.2. Positional Pick Gate
+The interception sequence eschews time-domain triggering (which is susceptible to velocity estimation noise) in favor of a live positional gate:
+1.  **Predictive Park**: The arm solves for a kinematically feasible interception coordinate $u_{\text{pick}}$ and physically moves to this "park" position.
+2.  **Live Gate Evaluation**: The system continuously evaluates the live target position against the parked coordinate, adjusted for system latency $T_{\text{delay}}$ (encompassing network and mechanical actuation delays). The descent is triggered when:
+    $$u(t) \ge u_{\text{pick}} - v_{\text{belt}} \cdot T_{\text{delay}}$$
+This closed-loop spatial trigger ensures precision interception even if the conveyor speed fluctuates during the arm's transit phase.
+
+---
+
+## 6. Adaptive Conveyor Speed Regulation
+
+To optimize robot throughput when presented with irregular upstream supply, the conveyor acts as a dynamic rate regulator.
+
+### 6.1. Inverse Density Law
+The objective is to maintain a constant optimal presentation rate $\lambda_{\text{nom}}$ (objects/second) to the robotic arm. Given a measured linear product density $\rho$ (objects/mm), the required belt velocity $v$ is inversely proportional to density:
+$$v = \text{clamp}\!\left(\frac{\lambda_{\text{nom}}}{\rho},\; v_{\min},\; v_{\text{cap}}\right)$$
+where $v_{\min}$ and $v_{\text{cap}}$ represent the hardware control floor and the kinematic pickability ceiling, respectively. 
+
+### 6.2. Kinematic Pickability Ceiling
+The upper velocity bound $v_{\text{cap}}$ ensures the target remains within the $L$-length operational workspace for at least the minimum duration $t_{\text{transit}}$ required for the arm to execute a pick:
+$$v_{\text{cap}} = \min\left(\frac{L}{t_{\text{transit}}},\, v_{\text{hw,max}}\right)$$
+
+### 6.3. Emergent Overload Handling
+By selecting $\lambda_{\text{nom}}$ slightly below the robot's maximum theoretical throughput $\mu_{\max}$, the system retains headroom for burst absorption. During extreme density peaks, the control law saturates at $v_{\min}$. The belt operates at minimum speed, presenting targets continuously, causing the robot utilization to organically rise to 100% capacity without requiring a discrete exception-handling state.

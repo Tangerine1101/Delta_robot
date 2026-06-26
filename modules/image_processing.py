@@ -161,9 +161,16 @@ class SimulatedImageProcessing:
     - `throughput_spawn_y` is reused as the upstream `u_spawn`.
     - `throughput_lanes` is reused as the per-object `v_lane` values.
     - `accuracy_spawn_uv`: list of [u, v] points inside workspace_window_uv used
-      by test_accuracy. Separate from `accuracy_points` (which are robot-frame XYZ
-      targets used only by the evaluate scenario).
+      by test_accuracy/test_acceptance. Separate from `accuracy_points` (which are
+      robot-frame XYZ targets used only by the evaluate scenario).
+    - `accuracy_object_types`: object type cycled across each wave for
+      test_accuracy/test_acceptance (default `["TQFP"]`). Independent of
+      `throughput_object_types`, which only test_throughput reads.
     """
+
+    # Scenarios that spawn a static wave of fake objects and wait for the robot to
+    # finish all of them before spawning the next wave (see notify_pick_finished).
+    _WAVE_GATED_SCENARIOS = ("test_accuracy", "test_acceptance")
 
     def __init__(self, scenario_name: str, config: dict[str, Any], start_time: float) -> None:
         self.scenario_name = scenario_name
@@ -181,14 +188,31 @@ class SimulatedImageProcessing:
             [[470.0, 40.0], [520.0, 10.0], [560.0, -30.0]],
         )
         self.accuracy_spawn_uv = [(float(pt[0]), float(pt[1])) for pt in raw_spawn_uv]
+        # Independent from throughput_types: test_accuracy/test_acceptance spawn a
+        # fixed, controlled object mix (defaults to TQFP-only) regardless of what
+        # test_throughput is configured to cycle through.
+        self.accuracy_object_types = list(config.get("accuracy_object_types", ["TQFP"]))
+        self._wave_gated = scenario_name in self._WAVE_GATED_SCENARIOS
+        self._wave_pending: set[str] = set()
 
     def poll(self, now: float) -> list[ObjectDetection]:
+        if self._wave_gated:
+            if self._wave_pending:
+                return []  # previous wave still in flight — hold until it clears
+            wave = [self._build_detection(now) for _ in self.accuracy_spawn_uv]
+            self._wave_pending = {detection.object_id for detection in wave}
+            return wave
+
         detections: list[ObjectDetection] = []
         interval = self._scenario_interval()
         while now >= self.next_emit_at:
             detections.append(self._build_detection(self.next_emit_at))
             self.next_emit_at += interval
         return detections
+
+    def notify_pick_finished(self, object_id: str) -> None:
+        """Release the wave gate for an attempted (succeeded or failed) object."""
+        self._wave_pending.discard(object_id)
 
     def _scenario_interval(self) -> float:
         if self.scenario_name == "test_accuracy":
@@ -197,9 +221,9 @@ class SimulatedImageProcessing:
 
     def _build_detection(self, timestamp: float) -> ObjectDetection:
         self.counter += 1
-        if self.scenario_name == "test_accuracy":
+        if self.scenario_name in self._WAVE_GATED_SCENARIOS:
             u, v = self.accuracy_spawn_uv[(self.counter - 1) % len(self.accuracy_spawn_uv)]
-            object_type = self.throughput_types[(self.counter - 1) % len(self.throughput_types)]
+            object_type = self.accuracy_object_types[(self.counter - 1) % len(self.accuracy_object_types)]
             return ObjectDetection(
                 object_id=f"accuracy-{self.counter:06d}",
                 x=u,

@@ -79,6 +79,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
              color:#b8c0cc; line-height:1.5; }
   .pill { display:inline-block; padding:1px 7px; border-radius:9px; background:#243; color:#9f9; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .section-h { font-size:13px; font-weight:600; color:#cfe3ff; letter-spacing:.3px;
+               margin:18px 0 6px; padding-bottom:4px; border-bottom:1px solid #2c313a; }
+  .section-h:first-child { margin-top:0; }
 </style>
 </head>
 <body>
@@ -93,14 +96,29 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 </header>
 <div id="tab-charts" class="tabpage">
   <div class="wrap" style="grid-template-columns:1fr;">
+    <div class="section-h">Conveyor</div>
     <div class="card">
       <h2>Conveyor speed — last 30s (mm/s)</h2>
       <canvas id="chart_belt"></canvas>
     </div>
     <div class="card">
+      <h2>Object density — last 30s (count in workspace)</h2>
+      <canvas id="chart_density"></canvas>
+    </div>
+
+    <div class="section-h">End effector</div>
+    <div class="card">
       <h2>End-effector position — last 30s (mm)</h2>
       <canvas id="chart_pose"></canvas>
       <div id="pose_note" style="font-size:11px; color:#8a93a3; margin-top:6px;"></div>
+    </div>
+    <div class="card">
+      <h2>End-effector horizontal speed (XY) — last 30s (mm/s)</h2>
+      <canvas id="chart_ee_xy_speed"></canvas>
+    </div>
+    <div class="card">
+      <h2>End-effector vertical speed (Z) — last 30s (mm/s)</h2>
+      <canvas id="chart_ee_z_speed"></canvas>
     </div>
   </div>
 </div>
@@ -121,12 +139,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div class="card">
-        <h2>Predicted pick</h2>
+        <h2>Performance</h2>
         <div class="kv">
-          <b>x</b><span id="pred_x">—</span>
-          <b>y</b><span id="pred_y">—</span>
-          <b>z</b><span id="pred_z">—</span>
-          <b>at t</b><span id="pred_t">—</span>
+          <b>PLC round-trip</b><span id="perf_rtt">—</span>
+          <b>pick cycle (avg)</b><span id="perf_cycle">—</span>
         </div>
       </div>
     </div>
@@ -149,13 +165,25 @@ const planlines = [];
 
 // Rolling 30s history of status samples for the Charts tab.
 const WINDOW_S = 30;
-const hist = [];   // {t, speed, x, y, z}
+const hist = [];   // {t, speed, density, x, y, z, vxy, vz}
 let hasPose = false;
 
 function pushHistory(d){
   const now = Date.now()/1000;
+  const prev = hist.length ? hist[hist.length-1] : null;
+  // End-effector velocity: finite-difference of consecutive pos_EE samples
+  // already in hist — no backend instrumentation needed for these two charts.
+  let vxy = null, vz = null;
+  if(prev && prev.x!==undefined && d.x!==undefined){
+    const dt = now - prev.t;
+    if(dt > 0){
+      vxy = Math.hypot(d.x-prev.x, d.y-prev.y)/dt;
+      vz = (d.z-prev.z)/dt;
+    }
+  }
   const s = {t: now, speed: (d.speed_mm_s!==undefined? d.speed_mm_s : null),
-             x: d.x, y: d.y, z: d.z};
+             density: (d.object_density!==undefined? d.object_density : null),
+             x: d.x, y: d.y, z: d.z, vxy: vxy, vz: vz};
   if(d.x!==undefined) hasPose = true;
   hist.push(s);
   const cutoff = now - WINDOW_S - 1;
@@ -175,10 +203,9 @@ function apply(type, d){
     $("belt_v").textContent = fmt(d.vx)+", "+fmt(d.vy);
     if(d.position_mm!==undefined) $("belt_pos").textContent = fmt(d.position_mm)+" mm";
     if(d.scenario) $("scn").textContent = d.scenario;
+    if(d.round_trip_latency_s!==undefined) $("perf_rtt").textContent = (d.round_trip_latency_s*1000).toFixed(1)+" ms";
+    if(d.pick_cycle_s!==undefined) $("perf_cycle").textContent = fmt(d.pick_cycle_s)+" s";
     pushHistory(d);
-  } else if(type==="predict"){
-    $("pred_x").textContent=fmt(d.x); $("pred_y").textContent=fmt(d.y);
-    $("pred_z").textContent=fmt(d.z); $("pred_t").textContent=fmt(d.t)+" s";
   } else if(type==="detect"){
     const tb=$("objs"); const rows=(d.objects||[]);
     tb.innerHTML = rows.length ? rows.map(o=>
@@ -186,6 +213,15 @@ function apply(type, d){
       : '<tr><td colspan="4" style="color:#666">no detections</td></tr>';
   } else if(type==="plan"){
     planlines.unshift("["+(d.plan_id??"?")+"] obj="+(d.object_id??"?")+" "+JSON.stringify(d.predicted_pick_position_2d||d));
+    if(planlines.length>40) planlines.pop();
+    $("planlog").textContent = planlines.join("\\n");
+  } else if(type==="accept_phase"){
+    planlines.unshift("[ACCEPT] cycle="+(d.cycle??"?")+" obj="+(d.object_id??"?")+" phase="+(d.phase??"?")
+      +" wall_s="+fmt(d.wall_s)+" dist_mm="+fmt(d.distance_mm));
+    if(planlines.length>40) planlines.pop();
+    $("planlog").textContent = planlines.join("\\n");
+  } else if(type==="accept_summary"){
+    planlines.unshift("[ACCEPT-SUMMARY] "+JSON.stringify(d));
     if(planlines.length>40) planlines.pop();
     $("planlog").textContent = planlines.join("\\n");
   }
@@ -255,12 +291,18 @@ function redraw(){
   if($("tab-charts").classList.contains("active")){
     drawChart($("chart_belt"), [{key:"speed", color:"#39FF14", label:"v"}],
               {empty:"waiting for belt speed…"});
+    drawChart($("chart_density"), [{key:"density", color:"#c792ea", label:"N"}],
+              {empty:"waiting for density…"});
     drawChart($("chart_pose"),
               [{key:"x",color:"#00F0FF",label:"X"},{key:"y",color:"#FFB000",label:"Y"},
                {key:"z",color:"#FF007F",label:"Z"}],
               {empty:"no pos_EE (simulated run has no robot pose)"});
+    drawChart($("chart_ee_xy_speed"), [{key:"vxy", color:"#00F0FF", label:"v_xy"}],
+              {empty:"no pos_EE (simulated run has no robot pose)"});
+    drawChart($("chart_ee_z_speed"), [{key:"vz", color:"#FF007F", label:"v_z"}],
+              {empty:"no pos_EE (simulated run has no robot pose)"});
     $("pose_note").textContent = hasPose ? "" :
-      "End-effector pose is only available on live-PLC scenarios (test_vision_only / test_conveyor / production), not with --simulate-executor.";
+      "End-effector pose is only available on live-PLC scenarios (test_vision_only / test_accuracy / test_acceptance / production), not with --simulate-executor.";
   }
   requestAnimationFrame(redraw);
 }
@@ -459,6 +501,9 @@ def _demo() -> None:
                                    "speed_mm_s": round(120.0 + 30.0 * math.sin(t), 1),
                                    "vx": 120.0, "vy": 0.0,
                                    "position_mm": round(120.0 * t, 1),
+                                   "object_density": 2 + int(math.sin(t / 2.0) > 0),
+                                   "round_trip_latency_s": round(0.01 + 0.003 * math.sin(t * 3), 4),
+                                   "pick_cycle_s": round(2.0 + 0.2 * math.sin(t / 4.0), 2),
                                    "x": round(-100 + 80 * math.sin(t), 1),
                                    "y": round(60 * math.cos(t), 1),
                                    "z": round(-300 + 20 * math.sin(2 * t), 1),
@@ -468,7 +513,6 @@ def _demo() -> None:
                  "x": round(450 + 30 * math.sin(t), 1), "y": round(20 * math.cos(t), 1)},
             ]})
             if int(t) % 3 == 0:
-                server.emit("predict", {"t": round(t, 2), "x": 540.0, "y": 0.0, "z": -310.0})
                 server.emit("plan", {"plan_id": int(t), "object_id": "yolo-1",
                                      "predicted_pick_position_2d": [540.0, 0.0, -310.0]})
             time.sleep(0.2)

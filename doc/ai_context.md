@@ -1,8 +1,11 @@
 # AI Context Summary: Delta Robot
 
 > **Target Audience**: AI Coding Assistants, Subagents, and compact context updates during chat session resets.
-> **Status (real-time pick rewrite)**: The real conveyor pick path (`production` / `test_conveyor`) was rebuilt as a **two-thread** PC-side scheduler to kill the multi-object "arrive → wait → miss" lag. A daemon **perception thread** (`_realtime_perception_loop`, ~25 ms) owns the only PLC status read and keeps shared `RealtimeState` (belt position/speed, `pos_EE`, the `BeltTracker`, claimed ids) fresh under `state_lock`; the **main decision/execution thread** selects an object (danger-zone priority), predicts a stable straight-down pick point, parks the arm with a 1.6 s lead (`intercept_lead_time_s`), then fires the pick on a **live positional gate** — when the tracked object's `u` reaches the parked pick `u` — with no post-park time math. Dispatch/status round-trips share one `ipc_lock`. New code lives in `RealtimePickExecutor` + `_run_realtime_pick_loop`; the old time-based executor/wait logic was removed. Design of record: `doc/realtime_pick_redesign.md` + `doc/rebuild_plan.md`. The simulated path (`test_throughput`/`test_accuracy`/`evaluate`) is unchanged.
-> **Status**: Phase 3 image processing **rebuilt** (self-contained). `VisionImageProcessing` (YOLO-OBB + centroid tracker) runs in-process via background threads and opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt-speed estimate). Camera frames are captured with **PyAV** (FFmpeg-backed) — sustains **~30 fps at 1080p MJPG**; the old `cv2.VideoCapture` V4L2 backend was the real <20 fps bottleneck (not the model/GPU). The module no longer imports `YOLO_OBB/src/*` and no longer reads `system_config.yaml`: every vision parameter lives in the `vision` section of `config.json`. Default model `models/nano@1920/weights/best.pt` (mAP50-95≈0.983, per `models/nano@1920/results.csv`). `models/nano@1280/weights/best.pt` (mAP50-95≈0.986) is available as a faster, slightly lower-resolution alternative but is not the active `config.json` weight. Also computes a belt-speed estimate from object tracking (`BeltVelocityEstimator`) — **informational only**, logged/drawn but NOT fed to the scheduler. Belt position for operation still arrives pre-decoded from Siemens as a single `conveyor_position` field (**≈mm as of June 2026 → `conveyor_position_scale_mm = 1.0`**, not the old cm/×10 — the ×10 inflated belt speed ~10× and broke every `test_conveyor` pick); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_conveyor`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
+> **Status (real-time pick rewrite)**: The real conveyor pick path (`production`) was rebuilt as a **two-thread** PC-side scheduler to kill the multi-object "arrive → wait → miss" lag. A daemon **perception thread** (`_realtime_perception_loop`, ~25 ms) owns the only PLC status read and keeps shared `RealtimeState` (belt position/speed, `pos_EE`, the `BeltTracker`, claimed ids) fresh under `state_lock`; the **main decision/execution thread** selects an object (danger-zone priority), predicts a stable straight-down pick point, parks the arm with a 1.6 s lead (`intercept_lead_time_s`), then fires the pick on a **live positional gate** — when the tracked object's `u` reaches the parked pick `u` — with no post-park time math. Dispatch/status round-trips share one `ipc_lock`. New code lives in `RealtimePickExecutor` + `_run_realtime_pick_loop`; the old time-based executor/wait logic was removed. Design of record: `doc/realtime_pick_redesign.md` + `doc/rebuild_plan.md`. The simulated path (`test_throughput`/`test_accuracy`/`test_acceptance`/`evaluate`) is unchanged.
+> **Status (test scenario standardization, 2026-06-25)**: `test_conveyor` **retired** — it was behaviorally identical to `production` (the only difference, a startup `change_speed`, already fires for `production` too when `adaptive_speed_enabled`). `test_accuracy` now: (a) never commands suction (`PickScheduler.scenario_name` gates the pick-phase gripper bits to all-zero in `_build_pick_plan`) since its objects are static fakes with no real board to grip; (b) spawns a full **wave** of `accuracy_spawn_uv` points at once and blocks further spawns until the previous wave's picks all finish (`SimulatedImageProcessing._wave_pending` + `notify_pick_finished`), instead of a fixed timer decoupled from pick completion; (c) on real hardware (no `--simulate-executor`) now runs on `EvaluateExecutor` (the same dispatch-and-wait-for-pos_EE-convergence backend `evaluate` uses) instead of `RealtimePickExecutor` — the latter unconditionally required a `RealtimeState` the single-thread loop never built, so real-hardware `test_accuracy` **crashed on the first pick** before this fix; a belt-gate design was also the wrong fit for static objects anyway. New scenario **`test_acceptance`** (same family as `test_accuracy`) runs exactly `scheduler.test_acceptance_cycles` (default 9) picks then stops, printing per-phase `[ACCEPT]` wall-time/distance (goto and pick measured separately, dispatch→settle, via `EvaluateExecutor.metrics`) and a final `[ACCEPT-SUMMARY]`. `test_vision_only`'s belt-speed-not-visible bug was **dead code, not a design gap**: `main.py` had an early-return that called `run_scheduler_scenario` without `executor=`, skipping the already-correct `NullExecutor(dispatch=..., request_status=...)` construction further down — deleted the dead path.
+> **Status (adaptive belt speed)**: Implemented, **opt-in** via `scheduler.adaptive_speed_enabled` (default `false` → static `test_conveyor_belt_speed_mm_s`, unchanged; **currently `true` in the live config.json** — under active hardware testing). Density `N` is sensed **continuously by the perception thread** every ~25 ms tick (`state.belt_speed_target_mm_s = _adaptive_belt_speed(N, settings)`, doc/theory_basis.md §6 — belt speed **inverse** to density N, `v = clamp(λ_nom·L_meas/N, v_min, v_cap)`). The commit (`_commit_adaptive_speed`) fires **at the grip instant** — right after the pick packet dispatch in `RealtimePickExecutor.execute` — and again when the main loop is idle (no plan) so the belt relaxes toward `v_cap`; **revised 2026-06-25** from an earlier goto-piggyback design that only recomputed density once per multi-second `_build_realtime_pick_plan` call (reported as laggy/mistimed on hardware). Anti-thrash deadband `belt_speed_deadband_mm_s`. The pick-gate lead offset `_belt_lead_offset_mm` still returns `v·T_delay`. New config keys under `scheduler`: `pick_cycle_s` (t_pick, **calibrated** — robot beats the old 2.5 s; default 2.0), `pick_transit_min_s` (→ `v_cap=L/t_transit`), `belt_speed_headroom` (k), `belt_speed_min_mm_s`, `belt_speed_hw_max_mm_s`, `belt_density_length_mm` (0 → derive L_meas = u_max), `belt_accel_mm_s2`/`belt_ramp_s` (informational).
+> **Status (phantom re-pick fix)**: There was never intentional slip/miss-retry logic — `execute()` reports success once the arm's *motion* finishes; suction is never verified. A gap meant a completed pick's object stayed in `scheduler.tracker` (only `claimed_object_ids`, cleared right after `execute()`, excluded it), so it could be re-selected next plan build — "pick plan targets a board that no longer exists." **Fixed 2026-06-25**: the main loop now calls `scheduler.tracker.remove(plan.object_id)` in the same post-`execute()` block (success or failure), plus a defensive `planned_object_ids` skip in `_build_realtime_pick_plan`'s candidate loop. Each detected object is now pick-attempted **exactly once**; a genuine suction miss rides past `u_max` uncaught instead of a noisy phantom re-pick (see doc/theory_basis.md §6.8).
+> **Status**: Phase 3 image processing **rebuilt** (self-contained). `VisionImageProcessing` (YOLO-OBB + centroid tracker) runs in-process via background threads and opens a live overlay window (boxes + id/type/angle + CAM/PROC FPS + belt-speed estimate). Camera frames are captured with **PyAV** (FFmpeg-backed) — sustains **~30 fps at 1080p MJPG**; the old `cv2.VideoCapture` V4L2 backend was the real <20 fps bottleneck (not the model/GPU). The module no longer imports `YOLO_OBB/src/*` and no longer reads `system_config.yaml`: every vision parameter lives in the `vision` section of `config.json`. Default model `models/nano@1920/weights/best.pt` (mAP50-95≈0.983, per `models/nano@1920/results.csv`). `models/nano@1280/weights/best.pt` (mAP50-95≈0.986) is available as a faster, slightly lower-resolution alternative but is not the active `config.json` weight. Also computes a belt-speed estimate from object tracking (`BeltVelocityEstimator`) — **informational only**, logged/drawn but NOT fed to the scheduler. Belt position for operation still arrives pre-decoded from Siemens as a single `conveyor_position` field (**≈mm as of June 2026 → `conveyor_position_scale_mm = 1.0`**, not the old cm/×10 — the ×10 inflated belt speed ~10× and broke every `test_conveyor` pick); raw `encoderA`/`encoderB` removed. Scenarios `production`, `test_vision_only` wire the real camera into the scheduler. Object types: `QFP` / `TQFP`.
 
 ---
 
@@ -207,7 +210,7 @@ Always disable auto-exposure **before** writing the manual exposure value.
 ### 6.1. Threading Layout
 
 The communication worker, perception capture process, and dashboard are unchanged. What
-changed is that the **real** pick path (`production` / `test_conveyor`) now runs the
+changed is that the **real** pick path (`production`) now runs the
 scheduler itself as **two cooperating threads** sharing one guarded `RealtimeState`
 (`scheduler.py:140`), instead of one blocking single-threaded loop.
 
@@ -243,19 +246,22 @@ All scenarios are executed via `main.py --scheduler --scenario <name>`.
 
 | Scenario | Vision | Robot | Conveyor Speed | Display |
 |---|---|---|---|---|
-| `test_throughput` | Simulated | Sim/Real | Synthetic | Web (`--interface`) |
-| `test_accuracy` | Simulated | Sim/Real | Static (None) | Web (`--interface`) |
-| `evaluate` | Simulated | Sim/Real | Synthetic | Console |
+| `test_throughput` | Simulated | Sim/Real (`RealtimePickExecutor`) | Synthetic | Web (`--interface`) |
+| `test_accuracy` | Simulated | Sim/Real (`EvaluateExecutor`) | Static (None) | Web (`--interface`) |
+| `test_acceptance` | Simulated | Sim/Real (`EvaluateExecutor`) | Static (None) | Web + console `[ACCEPT]`/`[ACCEPT-SUMMARY]` |
+| `evaluate` | Simulated | Sim/Real (`EvaluateExecutor`) | Synthetic | Console |
 | `test_vision_only` | **Real camera** | Idle (`NullExecutor`) | Siemens PLC | Web or native cv2 |
-| `test_conveyor` | **Real camera** | Real (two-thread) | Siemens PLC | Web or native cv2 |
 | `production` | **Real camera** | Real (two-thread) | Siemens PLC | Web or native cv2 |
 
-> **`production` / `test_conveyor` execution model**: these run the §6.1 two-thread
-> `RealtimePickExecutor` loop — danger-zone priority selection, a 1.6 s downstream park lead,
-> and a **positional pick gate** (fire when the live tracked object reaches the parked pick
-> `u`; no post-park arrival-time computation). `test_vision_only` keeps the perception thread
-> live but uses a `NullExecutor` (no arm). The simulated scenarios above retain the original
-> single-threaded harness.
+> **`production` execution model**: runs the §6.1 two-thread `RealtimePickExecutor` loop —
+> danger-zone priority selection, a 1.6 s downstream park lead, and a **positional pick gate**
+> (fire when the live tracked object reaches the parked pick `u`; no post-park arrival-time
+> computation). `test_vision_only` keeps the perception thread live but uses a `NullExecutor`
+> (no arm). `test_accuracy`/`test_acceptance`/`evaluate` use `EvaluateExecutor` instead — no
+> belt-gate (their targets are static, not a moving tracked object): dispatch a phase, poll
+> `pos_EE` until it converges, record the wall time. All of these (plus `test_throughput`) run
+> on the original single-threaded harness, not the two-thread realtime loop. `test_conveyor`
+> was retired 2026-06-25 (behaviorally identical to `production`); use `production`.
 
 ---
 
@@ -289,6 +295,7 @@ python3 -m modules.interface
 # 9. Vision-only (real camera, no robot) + live web dashboard (annotated MJPEG + data)
 python3 main.py --scheduler --scenario test_vision_only --interface --duration 20
 
-# 10. Conveyor test (real camera + robot + Siemens conveyor_position feedback) + dashboard
-python3 main.py --scheduler --scenario test_conveyor --interface --duration 30
+# 10. Real-hardware acceptance run: exactly test_acceptance_cycles picks (default 9), then
+#     stops on its own and prints a final [ACCEPT-SUMMARY] (per-phase goto/pick wall times).
+python3 main.py --scheduler --scenario test_acceptance --interface
 ```
