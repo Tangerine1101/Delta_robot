@@ -117,7 +117,7 @@ classDiagram
 ```
 
 The raw OBB angle predicted by Ultralytics YOLO-OBB is constrained to:
-$$\theta \in \left[-\frac{\pi}{4}, \frac{3\pi}{4}\right) = [-45^\circ, 135^\circ)$$
+$$\theta \in \left[-\frac{\pi}{2}, \frac{\pi}{2}\right) = [-90^\circ, 90^\circ)$$
 
 ### 3.2 Asymmetric Marker Anchor
 To break this symmetry, each PCB has an asymmetric white silkscreen box on its surface, detected as `marker_TQFP` and `marker_QFP` respectively.

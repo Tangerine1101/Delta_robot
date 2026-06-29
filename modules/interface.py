@@ -147,9 +147,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div class="card" style="margin-top:14px;">
-      <h2>Detected objects (R-frame)</h2>
-      <table><thead><tr><th>id</th><th>type</th><th>x</th><th>y</th></tr></thead>
-      <tbody id="objs"><tr><td colspan="4" style="color:#666">no detections yet</td></tr></tbody></table>
+      <h2>Objects on belt (ROI → workspace)</h2>
+      <table><thead><tr><th>id</th><th>type</th><th>zone</th><th>u (mm)</th><th>x</th><th>y</th></tr></thead>
+      <tbody id="objs"><tr><td colspan="6" style="color:#666">no detections yet</td></tr></tbody></table>
     </div>
     <div class="card" style="margin-top:14px;">
       <h2>Plan log</h2>
@@ -207,10 +207,15 @@ function apply(type, d){
     if(d.pick_cycle_s!==undefined) $("perf_cycle").textContent = fmt(d.pick_cycle_s)+" s";
     pushHistory(d);
   } else if(type==="detect"){
-    const tb=$("objs"); const rows=(d.objects||[]);
+    const tb=$("objs");
+    // Every object on the belt, furthest along (nearest the workspace exit) first.
+    const rows=(d.objects||[]).slice().sort((a,b)=>(b.u??-1)-(a.u??-1));
+    const zoneColor={ROI:"#3a86ff", transit:"#ffb703", workspace:"#2dc653", past:"#888", upstream:"#888"};
     tb.innerHTML = rows.length ? rows.map(o=>
-      `<tr><td>${o.id}</td><td>${o.type||""}</td><td>${fmt(o.x)}</td><td>${fmt(o.y)}</td></tr>`).join("")
-      : '<tr><td colspan="4" style="color:#666">no detections</td></tr>';
+      `<tr><td>${o.id}</td><td>${o.type||""}</td>`
+      +`<td style="color:${zoneColor[o.zone]||'#ccc'}">${o.zone||"—"}</td>`
+      +`<td>${fmt(o.u)}</td><td>${fmt(o.x)}</td><td>${fmt(o.y)}</td></tr>`).join("")
+      : '<tr><td colspan="6" style="color:#666">no detections</td></tr>';
   } else if(type==="plan"){
     planlines.unshift("["+(d.plan_id??"?")+"] obj="+(d.object_id??"?")+" "+JSON.stringify(d.predicted_pick_position_2d||d));
     if(planlines.length>40) planlines.pop();
@@ -508,8 +513,13 @@ def _demo() -> None:
                                    "y": round(60 * math.cos(t), 1),
                                    "z": round(-300 + 20 * math.sin(2 * t), 1),
                                    "e": 1 if math.sin(2 * t) > 0 else 0})
+            # Sweep a fake object's belt position u across the ROI→workspace span
+            # so the demo exercises the new zone/u columns.
+            u_demo = (t * 40.0) % 380.0
+            zone_demo = ("ROI" if u_demo <= 120 else "transit" if u_demo < 188
+                         else "workspace" if u_demo <= 363 else "past")
             server.emit("detect", {"t": round(t, 2), "objects": [
-                {"id": "yolo-1", "type": "QFP",
+                {"id": "yolo-1", "type": "QFP", "u": round(u_demo, 1), "zone": zone_demo,
                  "x": round(450 + 30 * math.sin(t), 1), "y": round(20 * math.cos(t), 1)},
             ]})
             if int(t) % 3 == 0:

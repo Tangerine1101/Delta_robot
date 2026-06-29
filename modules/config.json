@@ -10,14 +10,14 @@
         "QFP": {
             "destination": "QFP",
             "thickness_mm": 1.6,
-            "w": 30.0,
-            "h": 40.0
+            "w": 25.4,
+            "h": 25.4
         },
         "TQFP": {
             "destination": "TQFP",
             "thickness_mm": 1.6,
-            "w": 40.0,
-            "h": 50.0
+            "w": 46.0,
+            "h": 38.0
         }
     },
     "conveyor": {
@@ -97,25 +97,25 @@
             "auto_exposure": 0,
             "exposure_time_absolute": 300
         },
-        "pixels_per_mm": 6.3451,
+        "pixels_per_mm": 6.39,
         "roi": {
             "enabled": true,
             "polygon": [
                 [
                     544,
-                    129
+                    162
                 ],
                 [
-                    1341,
-                    129
+                    1328,
+                    154
                 ],
                 [
-                    1341,
-                    903
+                    1314,
+                    904
                 ],
                 [
                     544,
-                    903
+                    908
                 ]
             ]
         },
@@ -162,8 +162,8 @@
         ],
         "clearance_height": -260.0,
         "slope_transition_height": -275.0,
-        "pickup_height": -300.0,
-        "pre_pick_height": -295.0,
+        "pickup_height": -303.0,
+        "pre_pick_height": -290.0,
         "place_height": -280.0,
         "corner_blend_xy": 25.0,
         "intercept_lead_time_s": 0.8,
@@ -184,16 +184,27 @@
             30.0,
             0.0
         ],
-        "robot_movement_delay_s": 0.1,
-        "ethernet_delay_s": 0.025,
+        "robot_movement_delay_s": 0.01,
+        "ethernet_delay_s": 0.00,
         "rotate_offset_deg": 0.0,
         "test_acceptance_cycles": 9,
         "accuracy_spawn_uv": [
-            [298.0, 66.0],
-            [330.0, 80.0],
-            [220.0, 100.0]
+            [
+                298.0,
+                66.0
+            ],
+            [
+                330.0,
+                80.0
+            ],
+            [
+                220.0,
+                100.0
+            ]
         ],
-        "accuracy_object_types": ["TQFP"],
+        "accuracy_object_types": [
+            "TQFP"
+        ],
         "adaptive_speed_enabled": true,
         "pick_cycle_s": 2,
         "pick_transit_min_s": 1.6,

@@ -1039,15 +1039,34 @@ def _prune_unclaimed_tracker(
     now: float,
 ) -> int:
     removed = 0
-    u_max = tracker.workspace_window_uv[1]
     for obj in list(tracker.objects()):
         if obj.object_id in claimed_object_ids:
             continue
-        u_now, _ = obj.current_uv(p_now)
-        if u_now > u_max or (now - obj.last_seen_at) > tracker.stale_timeout_s:
+        # Keep objects that have only left the camera FOV (still on the belt
+        # within the workspace) so the dashboard lists them across the whole
+        # ROI-to-workspace span; drop only those truly off the belt or lost
+        # while still under the camera. See BeltTracker.should_prune.
+        if tracker.should_prune(obj, p_now, now):
             tracker.remove(obj.object_id)
             removed += 1
     return removed
+
+
+def _belt_zone_label(u: float, settings: SchedulerSettings) -> str:
+    """Classify a belt position u into a human-readable zone for the dashboard:
+    ROI (under camera), transit (between camera and workspace), or workspace.
+    """
+    cam_min, cam_max = settings.camera_window_uv[0], settings.camera_window_uv[1]
+    ws_min, ws_max = settings.workspace_window_uv[0], settings.workspace_window_uv[1]
+    if u < cam_min:
+        return "upstream"
+    if u <= cam_max:
+        return "ROI"
+    if u < ws_min:
+        return "transit"
+    if u <= ws_max:
+        return "workspace"
+    return "past"
 
 
 class EvaluateExecutor:
@@ -2427,16 +2446,23 @@ def _run_realtime_pick_loop(
             state.end_effector = end_effector
             scheduler.update_speed(sample)
             scheduler.ingest_detections(detections, sample.position_mm)
-            snapshot = [
-                {
+            # Every object still on the belt — from the camera ROI, through the
+            # transit gap, all the way to the downstream edge of the workspace —
+            # with its live belt position u (mm) and zone so the dashboard can
+            # show the full ROI-to-workspace journey, not just what is under the
+            # camera right now.
+            snapshot = []
+            for obj in scheduler.tracker.objects():
+                u_now, _ = obj.current_uv(sample.position_mm)
+                x_r, y_r = scheduler.tracker.current_position_R(obj, sample.position_mm)
+                snapshot.append({
                     "id": obj.object_id,
                     "type": obj.object_type,
                     "x": round(x_r, 2),
                     "y": round(y_r, 2),
-                }
-                for obj in scheduler.tracker.objects()
-                for x_r, y_r in (scheduler.tracker.current_position_R(obj, sample.position_mm),)
-            ]
+                    "u": round(u_now, 1),
+                    "zone": _belt_zone_label(u_now, settings),
+                })
             removed = _prune_unclaimed_tracker(
                 scheduler.tracker,
                 state.claimed_object_ids,
@@ -2675,6 +2701,7 @@ def run_scheduler_scenario(
         frame,
         workspace_window_uv=settings.workspace_window_uv,
         stale_timeout_s=settings.stale_timeout_s,
+        camera_window_uv=settings.camera_window_uv,
     )
     decoder = BeltPositionTracker()
     if executor is None:
@@ -2778,12 +2805,15 @@ def run_scheduler_scenario(
         # past workspace u_max).
         tracked_objs = []
         for obj in scheduler.tracker.objects():
+            u_now, _ = obj.current_uv(sample.position_mm)
             x_r, y_r = scheduler.tracker.current_position_R(obj, sample.position_mm)
             tracked_objs.append({
                 "id": obj.object_id,
                 "type": obj.object_type,
                 "x": round(x_r, 2),
                 "y": round(y_r, 2),
+                "u": round(u_now, 1),
+                "zone": _belt_zone_label(u_now, settings),
             })
         if tracked_objs:
             detect_payload = {
@@ -2813,7 +2843,14 @@ def run_scheduler_scenario(
             # single-thread simulated/camera-only loop reaches this call.
             perceive_tick(now)
 
-            plan = scheduler.plan_next(now)
+            # test_vision_only is pure camera observation (no arm). plan_next()
+            # selects a pickable object and immediately removes it from the
+            # tracker; with the NullExecutor "picking" instantly, that drained the
+            # tracker the moment an object became pickable in the workspace, so the
+            # dashboard only ever listed the not-yet-pickable objects upstream in
+            # the ROI. Skip planning entirely so every object stays on the belt and
+            # the list spans the whole ROI → workspace journey.
+            plan = None if scenario_name == "test_vision_only" else scheduler.plan_next(now)
             if plan is not None:
                 plan_summary = plan.to_summary()
                 print("[PLAN]", json.dumps(plan_summary, ensure_ascii=True))

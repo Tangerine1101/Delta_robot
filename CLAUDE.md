@@ -1,7 +1,7 @@
 # CLAUDE.md — Delta Robot Project (Claude Guidelines)
 
 ## 0. Language
-Except the final report messages must be Vietnamese, you can freely use English for thinking and document writing for saving compute sake.
+Conversational report/status messages addressed to the user (chat replies, progress summaries) must be in Vietnamese. The academic thesis in `report/` is written in **English**. You may otherwise use English freely for thinking and for working documents to save compute.
 
 ## 1. Startup Protocol
 

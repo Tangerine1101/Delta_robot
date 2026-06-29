@@ -334,9 +334,15 @@ class BeltTracker:
         workspace_window_uv: UVWindow,
         match_radius_mm: float = 15.0,
         stale_timeout_s: float = 5.0,
+        camera_window_uv: UVWindow | None = None,
     ) -> None:
         self.frame = frame
         self.workspace_window_uv = workspace_window_uv
+        # Downstream edge of the camera field of view (u). Objects upstream of
+        # this still ought to be re-detected every frame, so the stale timeout
+        # applies to them; once an object dead-reckons past it the camera can no
+        # longer see it, so we keep it on the belt until it leaves the workspace.
+        self.camera_window_uv = camera_window_uv
         self.match_radius_mm = float(match_radius_mm)
         self.stale_timeout_s = float(stale_timeout_s)
         self._objects: dict[str, TrackedObject] = {}
@@ -410,13 +416,32 @@ class BeltTracker:
         u_future = u_now + belt_velocity_mm_per_s * dt_future_s
         return self.frame.to_robot(u_future, v_now)
 
+    def should_prune(self, obj: TrackedObject, p_now: float, now: float) -> bool:
+        """Whether an object has left the belt span we care about.
+
+        Drop it once it dead-reckons past the downstream workspace edge
+        (``u_max``). The stale timeout only fires while the object is still
+        within the camera field of view: there the camera ought to re-detect it
+        every frame, so a gap means it is gone (picked by hand / false
+        positive). Downstream of the camera the camera is blind, so a tracked
+        object is kept (dead-reckoned on the encoder) all the way through the
+        workspace — that is what keeps it visible from the ROI to the end of
+        the workspace. When ``camera_window_uv`` is unset, the stale timeout
+        applies everywhere (legacy behaviour).
+        """
+        u_now, _ = obj.current_uv(p_now)
+        if u_now > self.workspace_window_uv[1]:
+            return True
+        in_camera_fov = (
+            self.camera_window_uv is None or u_now <= self.camera_window_uv[1]
+        )
+        return in_camera_fov and (now - obj.last_seen_at) > self.stale_timeout_s
+
     def prune(self, p_now: float, now: float) -> int:
-        """Drop objects past downstream u_max or older than stale_timeout."""
+        """Drop objects that have left the tracked belt span (see should_prune)."""
         removed = 0
-        u_max = self.workspace_window_uv[1]
         for obj_id, obj in list(self._objects.items()):
-            u_now, _ = obj.current_uv(p_now)
-            if u_now > u_max or (now - obj.last_seen_at) > self.stale_timeout_s:
+            if self.should_prune(obj, p_now, now):
                 self._objects.pop(obj_id, None)
                 removed += 1
         return removed
