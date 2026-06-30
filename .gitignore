@@ -6,8 +6,7 @@ __pycache__/
 calib_result.jpg
 .venv/
 YOLO_OBB/
-report/ref
-*.pdf
+.pdf
 
 # LaTeX build artifacts (latexmk/pdflatex)
 *.aux

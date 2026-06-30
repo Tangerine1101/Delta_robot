@@ -205,7 +205,7 @@
         "accuracy_object_types": [
             "TQFP"
         ],
-        "adaptive_speed_enabled": true,
+        "adaptive_speed_enabled": false,
         "pick_cycle_s": 2,
         "pick_transit_min_s": 1.6,
         "belt_speed_headroom": 0.6,
