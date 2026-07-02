@@ -10,7 +10,7 @@ sau 300 cycle:
 - pick cycle 1.6s 
 
 # test lệch vị trí cơ cấu theo phương dọc/ngang
-phương pháp: đặt thước lên băng tải song song với trục u hoặc v và cho cơ cấu di chuyển đến từng điểm trên thước để quan sát độ chính xác (sai số 1mm)
+phương pháp: đặt thước lên băng tải song song với trục u hoặc v và cho cơ cấu di chuyển đến từng điểm trên thước để quan sát độ chính xác (sai số 1mm) -> chỉ đo được error_x hoặc error_y trong 1 lần đo.
 
 |R-frame|C-frame| e_x | e_y|
 |---|---|---|---|
