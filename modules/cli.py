@@ -500,7 +500,7 @@ def _print_help() -> None:
         "  go <theta1> <theta2> <theta3>        # relative joint move\n"
         "  goto <x> <y> <z>                     # absolute Cartesian move\n"
         "  go_trajectory <demo|square|home>\n"
-        "  rotate <angle>                       # Siemens EE suction cup rotation\n"
+        "  rotate <angle>                       # Siemens EE suction rotation (logical deg, [-180,180))\n"
         "  setspeed <speed>                     # Siemens conveyor speed\n"
         "  plan_siemen <rotate> <speed>         # Siemens plan\n"
         "  grab <object> <x> <y> <z> [rotate]   # manual grab sequence\n"

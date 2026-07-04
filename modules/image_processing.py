@@ -675,6 +675,19 @@ class VisionImageProcessing:
                         "auto_exposure": 1, "exposure_time_absolute": 150}
         _apply_v4l2_controls(device_path, controls)
 
+        # Camera-latency compensation: a detection's true capture instant is the
+        # MIDDLE of the exposure window, but the frame is only handed over after
+        # the exposure completes. V4L2 exposure_time_absolute is in units of
+        # 100 µs, so half the exposure (seconds) backdates the emitted timestamp
+        # toward the true capture time. The rest of the latency (decode + YOLO +
+        # poll) is absorbed downstream by anchoring to the belt position AT this
+        # backdated timestamp (see BeltPositionTracker.position_at).
+        try:
+            exposure_units = float(controls.get("exposure_time_absolute", 0) or 0)
+        except (TypeError, ValueError):
+            exposure_units = 0.0
+        self._half_exposure_s = exposure_units * 100e-6 / 2.0
+
         self._cv2 = cv2
         self._np = np
         self._counter = 0
@@ -702,6 +715,7 @@ class VisionImageProcessing:
         # Latest captured frame, published by the capture thread.
         self._latest_frame = None
         self._latest_frame_id = 0
+        self._latest_frame_ts = 0.0   # monotonic time the frame was decoded
         self._frame_lock = threading.Lock()
 
         # Annotated frame for the main-thread GUI.
@@ -755,6 +769,7 @@ class VisionImageProcessing:
                 last_t = t
                 with self._frame_lock:
                     self._latest_frame = img
+                    self._latest_frame_ts = t
                     self._latest_frame_id += 1
         except Exception as exc:
             print(f"[VISION] Capture error: {exc}")
@@ -802,6 +817,7 @@ class VisionImageProcessing:
                 with self._frame_lock:
                     frame = self._latest_frame
                     fid = self._latest_frame_id
+                    frame_ts = self._latest_frame_ts
                 if frame is None or fid == last_id:
                     time.sleep(0.001)
                     continue
@@ -828,7 +844,7 @@ class VisionImageProcessing:
                 if self._belt_estimator_enabled:
                     self._belt_estimator.update(active)
 
-                self._emit_detections(active, pcb_dets, marker_dets)
+                self._emit_detections(active, pcb_dets, marker_dets, frame_ts)
 
                 dt_proc = time.monotonic() - t0
                 if dt_proc > 0.0:
@@ -865,7 +881,7 @@ class VisionImageProcessing:
             return angle, type_name, marker
         return normalize_angle_deg(board[4]), self._names[cls_id], None
 
-    def _emit_detections(self, active, pcb_dets, marker_dets) -> None:
+    def _emit_detections(self, active, pcb_dets, marker_dets, capture_ts=None) -> None:
         """Emit an ObjectDetection for every tracked board, every frame it is seen.
 
         Replaces the old one-shot trigger-line crossing. A board is created/updated
@@ -875,7 +891,15 @@ class VisionImageProcessing:
         (`yolo-{trk.id}`) is stable across frames (see CentroidTracker), so the
         scheduler re-anchors the same object from the camera while it is visible
         and dead-reckons from belt position once it leaves the camera zone.
+
+        `capture_ts` is the monotonic time the frame was decoded; the emitted
+        timestamp is backdated by half the exposure so the scheduler can anchor
+        the object to the belt position at its true capture instant.
         """
+        detect_ts = (
+            (capture_ts - self._half_exposure_s)
+            if capture_ts is not None else time.monotonic()
+        )
         for trk in active.values():
             if not pcb_dets:
                 continue
@@ -900,7 +924,7 @@ class VisionImageProcessing:
             det = ObjectDetection(
                 object_id=f"yolo-{trk.id:06d}",
                 x=u, y=v, object_type=mapped,
-                timestamp=time.monotonic(),
+                timestamp=detect_ts,
                 confidence=float(conf), angle_deg=float(angle),
             )
             with self._lock:

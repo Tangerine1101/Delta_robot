@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 import threading
 import time
 from collections import deque
@@ -9,13 +10,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config
+from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config, wrap_angle_180
 from modules.conveyor import (
     BeltPositionTracker,
     BeltTracker,
     ConveyorFrame,
     TrackedObject,
     UVWindow,
+    is_within_xy_limit,
 )
 from modules.image_processing import ObjectDetection, SimulatedImageProcessing, VisionImageProcessing
 
@@ -85,6 +87,10 @@ class PickPlan:
     belt_pos_anchor: float = 0.0
     # Rotation angle for the 4th-DOF Siemens suction cup (degrees).
     rotate_deg: float = 0.0
+    # Modeled park->contact descent time (s). The pick gate must fire this much
+    # earlier (on top of the dispatch delay) so the oblique descent lands on the
+    # object; also logged for T_delay calibration.
+    descend_time_s: float = 0.0
 
     def total_duration(self) -> float:
         return sum(point.time_s for point in self.trajectory_goto + self.trajectory_pick)
@@ -161,11 +167,28 @@ class RealtimeState:
     # Last belt speed setpoint committed by the adaptive controller (deadband state).
     belt_speed_setpoint_mm_s: float = 0.0
     # Adaptive belt speed (doc/theory_basis.md §6.6): continuously refreshed by the
-    # perception thread every tick from live density; committed by the executor at
-    # the grip instant via _commit_adaptive_speed. Constant config below, set once.
+    # perception thread every tick from live density; committed opportunistically by
+    # _commit_adaptive_speed whenever the pick gate is not imminent. Constant config
+    # below, set once.
     belt_speed_target_mm_s: float = 0.0
     belt_speed_deadband_mm_s: float = 0.0
     adaptive_speed_enabled: bool = False
+    # Max |Δv| per change_speed commit (mm/s); each ramp then settles within
+    # max_step / belt_accel_mm_s2 seconds. 0 disables the rate limit.
+    belt_speed_max_step_mm_s: float = 0.0
+    # Live PLC speed_current feedback (mm/s), refreshed by the perception thread.
+    # Used to close the loop: if the commanded setpoint and the measured speed
+    # diverge long after the ramp should have settled, the setpoint is re-sent.
+    belt_speed_measured_mm_s: float | None = None
+    # monotonic time of the last dispatched change_speed (throttle + resync timing).
+    last_speed_commit_monotonic: float = 0.0
+    # True while the pick gate is imminent (object within the critical distance of
+    # the fire threshold): speed commits are suppressed so the belt is steady when
+    # the gate fires. Set/cleared by RealtimePickExecutor.
+    gate_critical: bool = False
+    # Static compensation for gate sampling latency (gate poll /2 + perception
+    # tick /2), added to command_delay_s when sizing the pick-gate lead offset.
+    gate_sampling_latency_s: float = 0.0
     # Rolling average pick-cycle wall time (s), for the web dashboard's Performance
     # card. Written by the main thread after each executor.execute() call, read by
     # the perception thread when building the "status" event — hence state_lock.
@@ -192,8 +215,43 @@ class EvaluateMetrics:
     total_phase_wall_time_s: float = 0.0
     phase_wall_times: list[float] = field(default_factory=list)
     phase_distances: list[float] = field(default_factory=list)
+    # Interpolator-modeled duration of each phase (parallel to phase_wall_times),
+    # so the CONFIG-SUGGEST tool can back out the fixed dispatch/servo overhead.
+    phase_modeled_times: list[float] = field(default_factory=list)
     position_wait_timeouts: int = 0
     position_stability_accepts: int = 0
+
+    def config_suggestions(
+        self,
+        round_trip_avg_s: float,
+        nominal_xy_speed: float,
+        simulated: bool,
+    ) -> dict[str, Any]:
+        """Config values computed from this run's runtime measurements, so the
+        oversized config can be re-tuned from data instead of by hand. On real
+        hardware prefer the latency-probe Omron figure for ethernet_delay_s."""
+        overheads = [
+            w - m
+            for w, m in zip(self.phase_wall_times, self.phase_modeled_times)
+        ]
+        overhead_mean = statistics.fmean(overheads) if overheads else 0.0
+        speeds = [
+            d / t for d, t in zip(self.phase_distances, self.phase_wall_times) if t > 0.0
+        ]
+        eff_speed = statistics.fmean(speeds) if speeds else 0.0
+        return {
+            "simulated": simulated,
+            "samples": len(self.phase_wall_times),
+            "scheduler.robot_movement_delay_s": round(max(0.0, overhead_mean), 4),
+            "scheduler.ethernet_delay_s": round(round_trip_avg_s, 4),
+            "measured_effective_xy_speed_mm_s": round(eff_speed, 1),
+            "configured_nominal_xy_speed": round(nominal_xy_speed, 1),
+            "note": (
+                "SIMULATED run — do NOT paste into a hardware config"
+                if simulated else
+                "prefer modules.latency_probe Omron mean for ethernet_delay_s"
+            ),
+        }
 
     def as_dict(self) -> dict[str, Any]:
         total_t = self.total_phase_wall_time_s
@@ -253,7 +311,7 @@ class SchedulerSettings:
     workspace_window_uv: UVWindow            # (u_min, u_max, v_min, v_max) on belt
     camera_window_uv: UVWindow
     conveyor_length_mm: float
-    conveyor_position_scale_mm: float   # multiply incoming conveyor_position (cm) by this to get mm
+    conveyor_position_scale_mm: float   # multiply incoming conveyor_position by this to get mm (1.0: PLC reports mm)
     object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
     # Optional C-frame (u, v, z) test points inside workspace_window_uv. When
@@ -313,11 +371,23 @@ class SchedulerSettings:
     pick_transit_min_s: float = 2.0        # t_transit -> v_cap = L / pick_transit_min_s
     belt_speed_headroom: float = 0.75      # k -> lambda_nom = k * mu_max
     belt_speed_min_mm_s: float = 30.0      # v_min hardware floor
-    belt_speed_hw_max_mm_s: float = 200.0  # hard clamp on the derived v_cap
+    belt_speed_max_mm_s: float = 0.0       # operational cap (<=0 = use v_cap from geometry)
+    belt_speed_hw_max_mm_s: float = 200.0  # absolute hardware safety limit
     belt_speed_deadband_mm_s: float = 8.0  # Delta_min anti-thrash
     belt_density_length_mm: float = 0.0    # L_meas override; <=0 -> derive = u_max
     belt_accel_mm_s2: float = 22.31        # a_nom (informational ramp-settle log only)
     belt_ramp_s: float = 0.25              # T_ramp (informational only)
+    # Max |Δv| per change_speed commit: each ramp then settles within
+    # max_step / a_nom (≈0.9 s at 20 mm/s) instead of the multi-second ramps the
+    # raw hyperbolic law produces at small N (54 mm/s N=1↔2 jump). 0 disables.
+    belt_speed_max_step_mm_s: float = 20.0
+    # BeltPositionTracker velocity EMA alpha (conveyor.velocity_ema_alpha) —
+    # lower = smoother belt-speed estimate against encoder quantisation noise.
+    belt_velocity_ema_alpha: float = 0.4
+    # Physical XY reach radius (mm) around the robot origin, mirrored from the
+    # top-level limit_radius_xy. Used to reject an oblique-descent park point
+    # that would fall outside the mechanism's reach before it is dispatched.
+    limit_radius_xy: float = 180.0
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -491,6 +561,7 @@ class SchedulerSettings:
             pick_transit_min_s=float(scheduler_raw.get("pick_transit_min_s", 2.0)),
             belt_speed_headroom=float(scheduler_raw.get("belt_speed_headroom", 0.75)),
             belt_speed_min_mm_s=float(scheduler_raw.get("belt_speed_min_mm_s", 30.0)),
+            belt_speed_max_mm_s=float(scheduler_raw.get("belt_speed_max_mm_s", 0.0)),
             belt_speed_hw_max_mm_s=float(
                 scheduler_raw.get("belt_speed_hw_max_mm_s", 200.0)
             ),
@@ -502,6 +573,13 @@ class SchedulerSettings:
             ),
             belt_accel_mm_s2=float(scheduler_raw.get("belt_accel_mm_s2", 22.31)),
             belt_ramp_s=float(scheduler_raw.get("belt_ramp_s", 0.25)),
+            belt_speed_max_step_mm_s=float(
+                scheduler_raw.get("belt_speed_max_step_mm_s", 20.0)
+            ),
+            belt_velocity_ema_alpha=float(
+                conveyor_raw.get("velocity_ema_alpha", 0.4)
+            ),
+            limit_radius_xy=float(getattr(config, "limit_radius_xy", 180.0)),
         )
         settings.validate()
         return settings
@@ -558,9 +636,19 @@ class SimulatedSpeedSource:
             position_mm=self._integrated_position_mm, speed_uv=scalar,
         )
 
+    def position_at(self, t: float) -> float | None:
+        """No belt-position history in the synthetic source — the scheduler falls
+        back to the current position (camera-latency compensation is a no-op for
+        the static/simulated belt)."""
+        return None
+
 
 class ConveyorSpeedSource:
-    """Derive belt speed and position from the Siemens `conveyor_position` field (cm)."""
+    """Derive belt speed and position from the Siemens `conveyor_position` field
+    (mm as of June 2026, `conveyor_position_scale_mm = 1.0`).
+
+    Only wired for scenarios with live PLC feedback (production /
+    test_vision_only); the accuracy scenarios use SimulatedSpeedSource."""
 
     def __init__(
         self,
@@ -568,7 +656,7 @@ class ConveyorSpeedSource:
         frame: ConveyorFrame,
         decoder: BeltPositionTracker,
         scenario_name: str = "",
-        position_scale_mm: float = 10.0,
+        position_scale_mm: float = 1.0,
     ) -> None:
         self.request_status = request_status
         self.frame = frame
@@ -581,12 +669,6 @@ class ConveyorSpeedSource:
         self.last_status: dict[str, Any] | None = None
 
     def sample(self, now: float) -> SpeedSample:
-        if self.scenario_name == "test_accuracy":
-            return SpeedSample(
-                vx=0.0, vy=0.0, timestamp=now,
-                position_mm=self.decoder.position_mm, speed_uv=0.0,
-            )
-
         try:
             status = self.request_status()
         except Exception as exc:
@@ -605,6 +687,12 @@ class ConveyorSpeedSource:
             vx=vx, vy=vy, timestamp=now,
             position_mm=self.decoder.position_mm, speed_uv=scalar,
         )
+
+    def position_at(self, t: float) -> float | None:
+        """Belt position at a past capture time via the decoder's history buffer
+        (camera-latency compensation). Returns None if too stale, so the caller
+        falls back to the current position."""
+        return self.decoder.position_at(t)
 
 
 class SimulatedExecutor:
@@ -683,11 +771,11 @@ class NullExecutor:
     robot trajectory commands.
 
     It still carries optional `dispatch` / `request_status` callables wired to a
-    live PLC worker so the scheduler can (a) read the real Siemens
-    `conveyor_position` via ConveyorSpeedSource and (b) send the belt speed
-    command — all without moving the Omron robot. The presence of a
-    `request_status` attribute is what makes `run_scheduler_scenario` pick
-    ConveyorSpeedSource (real feedback) instead of SimulatedSpeedSource.
+    live PLC worker so the scheduler can read the real Siemens
+    `conveyor_position` via ConveyorSpeedSource without moving the Omron robot.
+    The presence of a `request_status` attribute is what makes
+    `run_scheduler_scenario` pick ConveyorSpeedSource (real feedback) instead of
+    SimulatedSpeedSource. No belt speed command is sent in test_vision_only.
     """
 
     def __init__(self, dispatch=None, request_status=None) -> None:
@@ -779,6 +867,20 @@ class RealtimePickExecutor:
         status = self.dispatch(goto_packet)
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
+        # Home the suction axis to logical 0 while the arm flies to the park
+        # point: the cup grips at 0 and the board is normalised to the bin
+        # orientation only AFTER grip (see the post-grip rotate below). Off the
+        # critical path — the target angle is known since plan build and the
+        # board does not rotate on the belt.
+        try:
+            self.dispatch({
+                "commandID": COMMAND_ID["rotate_absolute"],
+                "CommandID": COMMAND_ID["rotate_absolute"],
+                "rotate": 0.0,
+                "speed": 0.0,
+            })
+        except Exception as s_exc:
+            print(f"[WARN] Failed to home suction rotation: {s_exc}")
         if not self._wait_for_arm_arrival(plan, "goto", goto_packet, state):
             plan.status = "failed"
             return False
@@ -786,17 +888,7 @@ class RealtimePickExecutor:
         if not self._wait_for_object_arrival(plan, state):
             plan.status = "aborted"
             return False
-
-        try:
-            rotate_pkg = {
-                "commandID": COMMAND_ID["rotate_absolute"],
-                "CommandID": COMMAND_ID["rotate_absolute"],
-                "rotate": plan.rotate_deg,
-                "speed": 0.0,
-            }
-            self.dispatch(rotate_pkg)
-        except Exception as s_exc:
-            print(f"[WARN] Failed to dispatch Siemens rotation: {s_exc}")
+        gate_fired_at = time.monotonic()
 
         print(
             "[EXEC]",
@@ -808,15 +900,32 @@ class RealtimePickExecutor:
             ),
         )
         status = self.dispatch(pick_packet)
+        dispatched_at = time.monotonic()
+        # The pick is in flight: the object's fate is decided; pre-grip abort
+        # handling no longer applies (main loop keys exactly-once off this flag).
+        plan.debug_info["pick_dispatched"] = True
+        with state.state_lock:
+            state.gate_critical = False
+            belt_speed_at_grip = state.belt_speed_mm_s
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
         # Adaptive belt speed (doc/theory_basis.md §6.6): commit the live target at
         # the grip instant — the object is already past the gate, so the density
         # drop from this pick is reflected immediately rather than waiting for the
-        # next plan-build cycle. The ~0.25 s ramp settles during the pick's
-        # descend/grip/lift/return, well off the NEXT object's gate critical path.
+        # next opportunistic commit.
         _commit_adaptive_speed(self.dispatch, state)
-        if not self._wait_for_arm_arrival(plan, "pick", pick_packet, state):
+        if not self._wait_for_arm_arrival(
+            plan,
+            "pick",
+            pick_packet,
+            state,
+            contact_z=plan.trajectory_pick[0].z,
+            gate_fired_at=gate_fired_at,
+            dispatched_at=dispatched_at,
+            belt_speed_mm_s=belt_speed_at_grip,
+            post_grip_rotate_deg=plan.rotate_deg,
+            pre_pick_z=plan.trajectory_goto[-1].z,
+        ):
             plan.status = "failed"
             return False
         plan.status = "completed"
@@ -828,6 +937,12 @@ class RealtimePickExecutor:
         phase_name: str,
         packet: dict[str, Any],
         state: RealtimeState,
+        contact_z: float | None = None,
+        gate_fired_at: float | None = None,
+        dispatched_at: float | None = None,
+        belt_speed_mm_s: float | None = None,
+        post_grip_rotate_deg: float | None = None,
+        pre_pick_z: float | None = None,
     ) -> bool:
         target = _packet_final_target(packet)
         if target is None:
@@ -837,11 +952,64 @@ class RealtimePickExecutor:
         deadline = started_at + expected_duration_s + self.wait_margin_s
         departed = False
         static_accept_allowed: bool | None = None
+        contact_logged = contact_z is None
+        # Post-grip suction rotation: dispatched once the arm has gripped
+        # (descended to contact) AND lifted back up to the pre-pick height, so
+        # the board is clear of the belt before it is turned to the bin
+        # orientation. None => nothing to rotate (e.g. goto phase).
+        rotate_dispatched = post_grip_rotate_deg is None or pre_pick_z is None
 
         while True:
             now = time.monotonic()
+            # Opportunistic adaptive-speed commit: the gate is not imminent while
+            # the arm is flying (goto) or already past the grip (pick return).
+            _commit_adaptive_speed(
+                self.dispatch, state, min_interval_s=_OPPORTUNISTIC_COMMIT_INTERVAL_S
+            )
             with state.state_lock:
                 pose = state.robot_pose
+            if not contact_logged and pose is not None and pose[2] <= contact_z + 2.0:
+                # T_delay calibration datum (doc/theory_basis.md §6.4): true
+                # dispatch->contact latency vs the configured robot_movement_delay_s.
+                contact_logged = True
+                print(
+                    "[GATE]",
+                    json.dumps(
+                        {
+                            "plan_id": plan.plan_id,
+                            "gate_to_dispatch_s": round(
+                                (dispatched_at or now) - (gate_fired_at or now), 4
+                            ),
+                            "dispatch_to_contact_s": round(
+                                now - (dispatched_at or now), 4
+                            ),
+                            # Modeled descent time — subtract from dispatch_to_contact_s
+                            # to calibrate robot_movement_delay_s (the descent is no
+                            # longer lumped into the dispatch->grip delay).
+                            "t_d_model_s": round(plan.descend_time_s, 4),
+                            "belt_speed_mm_s": round(belt_speed_mm_s or 0.0, 2),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    flush=True,
+                )
+            if (
+                not rotate_dispatched
+                and contact_logged
+                and pose is not None
+                and pose[2] >= pre_pick_z
+            ):
+                # Board gripped and lifted clear — turn it to the bin orientation.
+                rotate_dispatched = True
+                try:
+                    self.dispatch({
+                        "commandID": COMMAND_ID["rotate_absolute"],
+                        "CommandID": COMMAND_ID["rotate_absolute"],
+                        "rotate": post_grip_rotate_deg,
+                        "speed": 0.0,
+                    })
+                except Exception as s_exc:
+                    print(f"[WARN] Failed to dispatch post-grip rotation: {s_exc}")
             if pose is not None:
                 distance = _distance_3d(pose, target)
                 if static_accept_allowed is None:
@@ -872,36 +1040,75 @@ class RealtimePickExecutor:
             time.sleep(self.status_poll_interval_s)
 
     def _wait_for_object_arrival(self, plan: PickPlan, state: RealtimeState) -> bool:
-        deadline = max(plan.predicted_pick_time, time.monotonic()) + self.wait_margin_s
-        while True:
-            now = time.monotonic()
-            gate = _object_pick_gate_status(state, plan)
-            if gate is None:
-                print(
-                    "[WARN]",
-                    json.dumps(
-                        {"plan_id": plan.plan_id, "event": "pick_object_missing"},
-                        ensure_ascii=True,
-                    ),
-                )
-                return False
-            if gate["reached"]:
-                return True
-            if now >= deadline:
-                print(
-                    "[WARN]",
-                    json.dumps(
-                        {
-                            "plan_id": plan.plan_id,
-                            "event": "pick_object_timeout",
-                            "object_u_mm": round(gate["object_u"], 2),
-                            "pick_u_mm": round(gate["pick_u"], 2),
-                        },
-                        ensure_ascii=True,
-                    ),
-                )
-                return False
-            time.sleep(self.status_poll_interval_s)
+        """Positional pick gate with a progress-based (not wall-clock) timeout.
+
+        The old fixed deadline (`predicted_pick_time + margin`) aborted picks —
+        permanently dropping still-pickable objects — whenever the belt slowed
+        after plan-build (e.g. mid adaptive ramp). The object's u is encoder-
+        anchored, so the only genuine failure modes are the track disappearing
+        or the belt stalling: abort only when the object has made no forward
+        progress for `stall_timeout_s`.
+        """
+        stall_timeout_s = max(3.0, 3.0 * self.wait_margin_s)
+        last_progress_u: float | None = None
+        last_progress_t = time.monotonic()
+        gate_reached = False
+        try:
+            while True:
+                now = time.monotonic()
+                gate = _object_pick_gate_status(state, plan)
+                if gate is None:
+                    print(
+                        "[WARN]",
+                        json.dumps(
+                            {"plan_id": plan.plan_id, "event": "pick_object_missing"},
+                            ensure_ascii=True,
+                        ),
+                    )
+                    return False
+                if gate["reached"]:
+                    gate_reached = True
+                    return True
+                if last_progress_u is None or gate["object_u"] > last_progress_u + 0.5:
+                    last_progress_u = gate["object_u"]
+                    last_progress_t = now
+                elif now - last_progress_t > stall_timeout_s:
+                    print(
+                        "[WARN]",
+                        json.dumps(
+                            {
+                                "plan_id": plan.plan_id,
+                                "event": "pick_object_stalled",
+                                "object_u_mm": round(gate["object_u"], 2),
+                                "pick_u_mm": round(gate["pick_u"], 2),
+                                "stall_timeout_s": stall_timeout_s,
+                            },
+                            ensure_ascii=True,
+                        ),
+                    )
+                    return False
+                # Suppress speed commits once the object is inside the critical
+                # window (belt displacement over ~_GATE_CRITICAL_LEAD_S) so any
+                # ramp has settled by gate-fire time; commit freely before that.
+                remaining_mm = gate["threshold_u"] - gate["object_u"]
+                with state.state_lock:
+                    speed = state.belt_speed_mm_s
+                    critical = remaining_mm <= max(speed, 0.0) * _GATE_CRITICAL_LEAD_S
+                    state.gate_critical = critical
+                if not critical:
+                    _commit_adaptive_speed(
+                        self.dispatch,
+                        state,
+                        min_interval_s=_OPPORTUNISTIC_COMMIT_INTERVAL_S,
+                    )
+                time.sleep(self.status_poll_interval_s)
+        finally:
+            # On the success path the flag stays set through the rotate + pick
+            # dispatch (execute() clears it right after); on abort clear it here
+            # so a failed gate never leaves speed commits blocked.
+            if not gate_reached:
+                with state.state_lock:
+                    state.gate_critical = False
 
 
 def _packet_final_target(packet: dict[str, Any]) -> Position3D | None:
@@ -950,6 +1157,49 @@ def _belt_lead_offset_mm(belt_speed_mm_s: float, command_delay_s: float) -> floa
     return max(0.0, belt_speed_mm_s * command_delay_s)
 
 
+def _descent_time_s(settings: SchedulerSettings, belt_speed_mm_s: float) -> float:
+    """Modeled time for the oblique park->contact descent (pre_pick -> pickup),
+    including the pick command's one-off soft start. The move slants along the
+    belt by v*t_d while dropping |Δz|, so one fixed-point pass folds the belt
+    slant into the segment length. Mirrors the PLC interpolator via
+    _segment_profile_time (doc/PLC_Program_description/MC_inter_curve_vel.md)."""
+    dz = abs(settings.pre_pick_height - settings.pickup_height)
+
+    def _seg(length: float) -> float:
+        return settings.interp_soft_start_s + _segment_profile_time(
+            length, 0.0, 0.0,
+            settings.interp_v_max, settings.interp_a_max, settings.interp_d_max,
+            settings.interp_scurve_shape_factor,
+        )
+
+    t0 = _seg(dz)
+    slant = max(0.0, belt_speed_mm_s) * t0
+    return _seg(math.hypot(dz, slant))
+
+
+def _park_position(
+    frame: ConveyorFrame,
+    settings: SchedulerSettings,
+    pick_position: Position3D,
+    belt_speed_mm_s: float,
+) -> tuple[Position3D, float]:
+    """Upstream park point for the oblique descent, and its descent time t_d.
+
+    The arm waits at ``park`` (pre_pick height, offset upstream along the belt by
+    v*t_d); when the pick fires it slants down-and-downstream to ``pick_position``
+    (contact), tracking the object so the cup and board share zero relative
+    velocity at contact. At belt speed 0 the offset is 0 (vertical descent)."""
+    t_d = _descent_time_s(settings, belt_speed_mm_s)
+    offset = max(0.0, belt_speed_mm_s) * t_d
+    u_x, u_y = frame.u_hat
+    park: Position3D = (
+        pick_position[0] - u_x * offset,
+        pick_position[1] - u_y * offset,
+        settings.pre_pick_height,
+    )
+    return park, t_d
+
+
 def _adaptive_belt_speed(n_objects: int, settings: SchedulerSettings) -> float:
     """Rate-regulation belt speed (doc/theory_basis.md §6.1/§6.5).
 
@@ -961,9 +1211,12 @@ def _adaptive_belt_speed(n_objects: int, settings: SchedulerSettings) -> float:
     u_min, u_max, _v_min_uv, _v_max_uv = settings.workspace_window_uv
     window_len = max(1e-6, u_max - u_min)
     v_min = settings.belt_speed_min_mm_s
-    # v_cap = pickability ceiling L / t_transit, hard-clamped to the hardware max.
-    v_cap = min(window_len / max(1e-6, settings.pick_transit_min_s),
-                settings.belt_speed_hw_max_mm_s)
+    # v_cap = pickability ceiling L / t_transit, clamped first to the soft operational
+    # max (belt_speed_max_mm_s, if set) then to the absolute hardware safety limit.
+    v_cap = window_len / max(1e-6, settings.pick_transit_min_s)
+    if settings.belt_speed_max_mm_s > 0.0:
+        v_cap = min(v_cap, settings.belt_speed_max_mm_s)
+    v_cap = min(v_cap, settings.belt_speed_hw_max_mm_s)
     v_cap = max(v_min, v_cap)
     # L_meas spans O_conveyor (C-frame origin = ROI origin) to u_max unless overridden.
     l_meas = settings.belt_density_length_mm if settings.belt_density_length_mm > 0.0 else u_max
@@ -975,39 +1228,110 @@ def _adaptive_belt_speed(n_objects: int, settings: SchedulerSettings) -> float:
     return max(v_min, min(v_cap, v))
 
 
+# Only the leading (closest-to-pick) objects constrain the belt via spacing: a
+# tight cluster still far upstream should not force a premature slow-down.
+_SPACING_LEAD_OBJECTS = 4
+
+
+def _spacing_speed_cap(object_u_mm: list[float], settings: SchedulerSettings) -> float:
+    """Belt-speed ceiling from inter-object spacing (queueing constraint).
+
+    The density law (_adaptive_belt_speed) regulates the *average* presentation
+    rate but ignores how objects are *spaced*: a tight pair (N=2, 40 mm apart)
+    is serviced at the same speed as a spread pair (N=2, 300 mm apart), yet the
+    robot needs pick_cycle_s between consecutive picks. Enforce
+    v <= gap / pick_cycle_s on the tightest adjacent gap among the leading
+    objects so a cluster slows the belt even when N is small. Returns +inf when
+    fewer than two objects lead (no spacing constraint). A caller clamps the
+    result to v_min, so a cluster tighter than v_min·pick_cycle_s just pins the
+    belt to its floor (best-effort; the trailing object may still be missed)."""
+    if len(object_u_mm) < 2:
+        return float("inf")
+    lead = sorted(object_u_mm, reverse=True)[:_SPACING_LEAD_OBJECTS]
+    gap_min = min(a - b for a, b in zip(lead, lead[1:]))
+    if gap_min <= 0.0:
+        return float("inf")  # overlapping detections — leave it to density/floor
+    return gap_min / max(1e-6, settings.pick_cycle_s)
+
+
+# Re-send the setpoint when the measured belt speed still diverges this long
+# after the last commit (any commanded ramp has settled by then).
+_SPEED_RESYNC_AFTER_S = 3.0
+
+# Suppress speed commits once the tracked object is within this much belt travel
+# time of the gate threshold, so the commit's ramp (max_step / belt_accel_mm_s2,
+# ≈0.9 s at the default 20 mm/s step) has settled before the gate fires.
+_GATE_CRITICAL_LEAD_S = 2.0
+
+# Throttle for the opportunistic commits issued from the executor wait loops and
+# the idle main loop (each commit costs one Siemens round-trip on ipc_lock).
+_OPPORTUNISTIC_COMMIT_INTERVAL_S = 0.75
+
+
 def _commit_adaptive_speed(
     dispatch_fn: Callable[[dict[str, Any]], dict[str, Any] | None],
     state: RealtimeState,
+    *,
+    min_interval_s: float = 0.0,
 ) -> None:
-    """Dispatch the live adaptive-speed target if it has drifted past the
-    deadband (doc/theory_basis.md §6.6). Called by the executor at the grip
-    instant (after the pick dispatch) and by the main loop when idle — never
-    on the pick-gate critical path. `dispatch_fn` takes `ipc_lock`; this
-    function never holds `state_lock` while calling it, so the two locks are
-    never nested."""
+    """Walk the belt setpoint toward the live adaptive target (doc/theory_basis.md
+    §6.6, revised). Called opportunistically from the executor wait loops, at the
+    grip instant, and from the idle main loop — commits are suppressed only while
+    `gate_critical` is set (pick gate imminent). Each commit is rate-limited to
+    `belt_speed_max_step_mm_s` so its ramp settles quickly, and throttled to at
+    most one dispatch per `min_interval_s`. When the target is already reached
+    but the PLC-measured speed diverges, the setpoint is re-sent (closed loop).
+    `dispatch_fn` takes `ipc_lock`; this function never holds `state_lock` while
+    calling it, so the two locks are never nested."""
+    now = time.monotonic()
     with state.state_lock:
-        if not state.adaptive_speed_enabled:
+        if not state.adaptive_speed_enabled or state.gate_critical:
             return
         target = state.belt_speed_target_mm_s
         setpoint = state.belt_speed_setpoint_mm_s
         deadband = state.belt_speed_deadband_mm_s
-    if target <= 0.0 or abs(target - setpoint) <= deadband:
+        max_step = state.belt_speed_max_step_mm_s
+        measured = state.belt_speed_measured_mm_s
+        last_commit = state.last_speed_commit_monotonic
+    if target <= 0.0:
         return
+    if min_interval_s > 0.0 and (now - last_commit) < min_interval_s:
+        return
+    step_target = target
+    if max_step > 0.0:
+        delta = max(-max_step, min(max_step, target - setpoint))
+        step_target = setpoint + delta
+    if abs(step_target - setpoint) <= deadband:
+        # Setpoint already at (the stepped) target. Closed-loop resync: if the
+        # measured speed still diverges well past the deadband long after the
+        # ramp should have settled, the PLC missed/clamped the command — re-send.
+        if (
+            measured is None
+            or abs(setpoint - measured) <= 2.0 * deadband
+            or (now - last_commit) < _SPEED_RESYNC_AFTER_S
+        ):
+            return
+        step_target = setpoint
+        print(
+            f"[WARN] belt speed diverged (setpoint {setpoint:.1f}, "
+            f"measured {measured:.1f} mm/s) — re-sending setpoint"
+        )
     try:
         dispatch_fn(
             {
                 "commandID": COMMAND_ID["change_speed"],
                 "CommandID": COMMAND_ID["change_speed"],
                 "rotate": 0.0,
-                "speed": float(target),
+                "speed": float(step_target),
             }
         )
-        print(f"[SPEED] belt -> {target:.1f} mm/s")
+        print(f"[SPEED] belt -> {step_target:.1f} mm/s (target {target:.1f})")
     except Exception as exc:
         print(f"[WARN] adaptive change_speed failed: {exc}")
         return
     with state.state_lock:
-        state.belt_speed_setpoint_mm_s = target
+        state.belt_speed_setpoint_mm_s = step_target
+        state.last_speed_commit_monotonic = now
 
 
 def _object_pick_gate_status(state: RealtimeState, plan: PickPlan) -> dict[str, float | bool] | None:
@@ -1022,7 +1346,15 @@ def _object_pick_gate_status(state: RealtimeState, plan: PickPlan) -> dict[str, 
             plan.predicted_pick_position_2d[0],
             plan.predicted_pick_position_2d[1],
         )
-        command_delay_s = state.command_delay_s
+        # Lead budget = dispatch->grip delay + gate sampling staleness (poll /2 +
+        # perception tick /2) + the modeled oblique-descent time. The object must
+        # travel from gate-fire all the way to contact, which now includes the
+        # park->contact descent, so the gate fires that much earlier.
+        command_delay_s = (
+            state.command_delay_s
+            + state.gate_sampling_latency_s
+            + plan.descend_time_s
+        )
     threshold = u_pick - _belt_lead_offset_mm(speed, command_delay_s)
     return {
         "reached": u_now >= threshold,
@@ -1177,7 +1509,7 @@ class EvaluateExecutor:
                     self._locked_dispatch({
                         "commandID": COMMAND_ID["rotate_absolute"],
                         "CommandID": COMMAND_ID["rotate_absolute"],
-                        "rotate": 90.0 if rotate_deg is None else rotate_deg,
+                        "rotate": 0.0 if rotate_deg is None else rotate_deg,
                         "speed": 0.0,
                     })
                 except Exception as exc:
@@ -1204,6 +1536,11 @@ class EvaluateExecutor:
             wall = time.monotonic() - t0
             metrics.phase_wall_times.append(wall)
             metrics.phase_distances.append(distance)
+            metrics.phase_modeled_times.append(
+                float(plan.debug_info.get(
+                    "modeled_goto_s" if phase_name == "goto" else "modeled_pick_s", 0.0
+                ))
+            )
             metrics.total_phase_wall_time_s += wall
 
         metrics.picks_completed += 1
@@ -1423,16 +1760,31 @@ class PickScheduler:
         self.current_position: Position3D = settings.home_position
         self.latest_speed: SpeedSample | None = None
         self.plan_counter = 0
+        self._last_speed_log_t = 0.0
 
-    def ingest_detections(self, detections: list[ObjectDetection], p_now: float) -> None:
+    def ingest_detections(
+        self,
+        detections: list[ObjectDetection],
+        p_now: float,
+        position_at: "Callable[[float], float | None] | None" = None,
+    ) -> None:
         for detection in detections:
             # Skip detections for objects already committed to a pick plan — the
             # vision pipeline re-emits the same id every frame while it is visible.
             if detection.object_id in self.planned_object_ids:
                 continue
             self.metrics.total_detections += 1
+            # Camera-latency compensation: anchor the object to the belt position
+            # AT the frame's capture time (detection.timestamp), not the current
+            # ingest position. Falls back to p_now when history is unavailable
+            # (simulated/static belt, or the sample is too stale to interpolate).
+            p_anchor = p_now
+            if position_at is not None:
+                past_p = position_at(detection.timestamp)
+                if past_p is not None:
+                    p_anchor = past_p
             self.tracker.ingest_detection(
-                detection, p_now, object_dimensions=self.settings.object_dimensions
+                detection, p_anchor, object_dimensions=self.settings.object_dimensions
             )
             self.seen_object_ids[detection.object_id] = detection.timestamp
         self.metrics.queue_peak = max(
@@ -1441,6 +1793,16 @@ class PickScheduler:
 
     def update_speed(self, sample: SpeedSample) -> None:
         self.latest_speed = sample
+        self.log_speed(sample)
+
+    def log_speed(self, sample: SpeedSample) -> None:
+        """Rate-limited [SPEED] console trace (~1 Hz). The realtime perception
+        thread calls this OUTSIDE state_lock — at the old per-tick (40 Hz) rate
+        the print's flush could stall the lock and delay the pick gate."""
+        now = time.monotonic()
+        if now - self._last_speed_log_t < 1.0:
+            return
+        self._last_speed_log_t = now
         print(
             f"[SPEED] vx={sample.vx:.4f} vy={sample.vy:.4f} "
             f"p={sample.position_mm:.3f} t={sample.timestamp:.4f}",
@@ -1526,9 +1888,18 @@ class PickScheduler:
             raise RuntimeError("Unable to build pick plan for an unreachable detection.")
 
         predicted_pick_time, pick_dispatch_time, pick_position = prediction
+        # Oblique descent: the arm parks upstream (park_position) and slants down
+        # to pick_position (contact) so the cup tracks the moving object. The goto
+        # ends at the PARK point; the pick trajectory starts at CONTACT, so the
+        # goto-P7 -> pick-P1 segment is the belt-tracking descent. At belt speed 0
+        # (static scenarios) park == contact XY, degenerating to a vertical drop.
+        belt_speed_uv = self.latest_speed.speed_uv if self.latest_speed is not None else 0.0
+        park_position, descend_time_s = _park_position(
+            self.frame, self.settings, pick_position, belt_speed_uv
+        )
         goto_points = _build_goto_geometry(
             self.current_position,
-            pick_position,
+            park_position,
             self.settings,
         )
         goto_times = _build_goto_timing(
@@ -1578,7 +1949,14 @@ class PickScheduler:
         self.metrics.total_planning_latency += max(now - obj.last_seen_at, 0.0)
         self.metrics.planning_events += 1
 
-        rotate_deg = math.degrees(obj.rotation_rad) + self.settings.rotate_offset_deg
+        # Normalise-to-zero suction angle. The rotation now happens AFTER grip
+        # (board attached), so we drive the axis to cancel the board's R-frame
+        # heading (vision heading + frame theta), landing every board in the bin
+        # at a uniform orientation. Wrapped to [-180,180) so the axis takes the
+        # short way. NOTE: sign + rotate_offset_deg to be verified on the first
+        # hardware run (a board at a known angle) — see doc/theory_basis.md.
+        board_heading_deg = math.degrees(obj.rotation_rad) + math.degrees(self.frame.theta_rad)
+        rotate_deg = wrap_angle_180(self.settings.rotate_offset_deg - board_heading_deg)
 
         return PickPlan(
             plan_id=f"plan-{self.plan_counter:06d}",
@@ -1597,14 +1975,22 @@ class PickScheduler:
             object_uv_anchor=obj.conveyor_uv,
             belt_pos_anchor=self.latest_speed.position_mm,
             rotate_deg=rotate_deg,
+            descend_time_s=descend_time_s,
             debug_info={
                 "pick_position_3d": pick_position,
+                "park_position_3d": park_position,
+                "descend_time_s": descend_time_s,
                 "timing_formula": {
                     "t_p_real": pick_dispatch_time,
                     "t_p_theory": predicted_pick_time,
                     "robot_movement_delay_s": self.settings.robot_movement_delay_s,
                     "ethernet_delay_s": self.settings.ethernet_delay_s,
                 },
+                # Interpolator-model phase times (mirror the PLC, unlike the crude
+                # nominal-speed argument_time). Used by the CONFIG-SUGGEST tool to
+                # estimate robot_movement_delay_s = measured_wall - modeled_motion.
+                "modeled_goto_s": _trajectory_total_time(goto_points, self.settings),
+                "modeled_pick_s": _trajectory_total_time(pick_points, self.settings),
                 "robot_packets": [
                     _trajectory_packet(trajectory_goto, self.interpolar_points),
                     _trajectory_packet(trajectory_pick, self.interpolar_points),
@@ -1742,7 +2128,13 @@ def _predict_realtime_pick_position(
 
     pick_xy = scheduler.frame.to_robot(u_pick, v_now)
     pick_position: Position3D = (pick_xy[0], pick_xy[1], settings.pickup_height)
-    goto_points = _build_goto_geometry(scheduler.current_position, pick_position, settings)
+    # Oblique-descent park point (upstream). Reject the candidate if the arm
+    # cannot physically reach the park XY — it is where the arm actually waits,
+    # and dispatching an out-of-reach goto would trip WorkspaceLimitError.
+    park_position, _ = _park_position(scheduler.frame, settings, pick_position, belt_speed)
+    if not is_within_xy_limit(park_position[0], park_position[1], settings.limit_radius_xy):
+        return None
+    goto_points = _build_goto_geometry(scheduler.current_position, park_position, settings)
     goto_total = _trajectory_total_time(goto_points, settings)
     arm_arrival_time = now + command_delay_s + goto_total
     if arm_arrival_time > final_pick_time:
@@ -2430,6 +2822,10 @@ def _run_realtime_pick_loop(
         belt_speed_setpoint_mm_s=settings.test_conveyor_belt_speed_mm_s,
         belt_speed_deadband_mm_s=settings.belt_speed_deadband_mm_s,
         adaptive_speed_enabled=settings.adaptive_speed_enabled,
+        belt_speed_max_step_mm_s=settings.belt_speed_max_step_mm_s,
+        # Average staleness of the object's u as seen by the gate: half the gate
+        # poll interval + half the perception tick (25 ms).
+        gate_sampling_latency_s=settings.poll_interval_s / 2.0 + 0.0125,
     )
 
     def perceive_tick(now: float | None = None) -> SpeedSample:
@@ -2437,15 +2833,26 @@ def _run_realtime_pick_loop(
             now = time.monotonic()
         sample = speed_source.sample(now)
         detections = image_processing.poll(now)
+        last_status = getattr(speed_source, "last_status", None)
+        pose, end_effector = _extract_robot_pose(last_status)
+        measured_speed: float | None = None
+        if isinstance(last_status, dict) and last_status.get("speed_current") is not None:
+            try:
+                measured_speed = float(last_status["speed_current"])
+            except (TypeError, ValueError):
+                measured_speed = None
         with state.state_lock:
             state.latest_speed = sample
             state.belt_position_mm = sample.position_mm
             state.belt_speed_mm_s = sample.speed_uv
-            pose, end_effector = _extract_robot_pose(getattr(speed_source, "last_status", None))
             state.robot_pose = pose
             state.end_effector = end_effector
-            scheduler.update_speed(sample)
-            scheduler.ingest_detections(detections, sample.position_mm)
+            state.belt_speed_measured_mm_s = measured_speed
+            scheduler.latest_speed = sample
+            scheduler.ingest_detections(
+                detections, sample.position_mm,
+                position_at=getattr(speed_source, "position_at", None),
+            )
             # Every object still on the belt — from the camera ROI, through the
             # transit gap, all the way to the downstream edge of the workspace —
             # with its live belt position u (mm) and zone so the dashboard can
@@ -2483,15 +2890,28 @@ def _run_realtime_pick_loop(
             # (doc/theory_basis.md §6.6) reuses the same count when it's on; the
             # executor commits the target at the grip instant via _commit_adaptive_speed.
             u_max = settings.workspace_window_uv[1]
-            n_density = sum(
-                1
-                for obj in scheduler.tracker.objects()
-                if obj.object_id not in state.claimed_object_ids
-                and 0.0 <= obj.current_uv(sample.position_mm)[0] <= u_max
-            )
+            density_u = []
+            for obj in scheduler.tracker.objects():
+                if obj.object_id in state.claimed_object_ids:
+                    continue
+                u_obj = obj.current_uv(sample.position_mm)[0]
+                if 0.0 <= u_obj <= u_max:
+                    density_u.append(u_obj)
+            n_density = len(density_u)
             if state.adaptive_speed_enabled:
-                state.belt_speed_target_mm_s = _adaptive_belt_speed(n_density, settings)
+                # Average-rate term (density) and cluster term (spacing): a tight
+                # group forces a slow-down even at small N so consecutive picks
+                # stay >= pick_cycle_s apart. Clamp to the floor so a cluster too
+                # tight for v_min just pins the belt low (best-effort).
+                v_density = _adaptive_belt_speed(n_density, settings)
+                v_spacing = _spacing_speed_cap(density_u, settings)
+                state.belt_speed_target_mm_s = max(
+                    settings.belt_speed_min_mm_s, min(v_density, v_spacing)
+                )
             recent_pick_cycle_s = state.recent_pick_cycle_s
+        # Outside state_lock: stdout can stall (slow terminal/SSH) and must never
+        # block the gate poll or plan build, which contend on the same lock.
+        scheduler.log_speed(sample)
         if event_sink is not None:
             status_payload = {
                 "scenario": scenario_name,
@@ -2528,22 +2948,24 @@ def _run_realtime_pick_loop(
     )
     perception_thread.start()
 
-    # Seed an initial belt speed when running the adaptive controller, so production
-    # starts the belt before the first pick adjusts it. The per-cycle controller
-    # adapts from this setpoint.
-    if settings.adaptive_speed_enabled:
-        try:
-            executor.dispatch(
-                {
-                    "commandID": COMMAND_ID["change_speed"],
-                    "CommandID": COMMAND_ID["change_speed"],
-                    "rotate": 0.0,
-                    "speed": settings.test_conveyor_belt_speed_mm_s,
-                }
-            )
-            print(f"[INFO] Conveyor speed set to {settings.test_conveyor_belt_speed_mm_s} mm/s")
-        except Exception as exc:
-            print(f"[WARN] Could not set conveyor speed: {exc}")
+    # Seed the initial belt speed unconditionally: it is the static operating
+    # speed when adaptive control is off, and the starting setpoint the adaptive
+    # controller walks from when it is on. (Previously only sent when adaptive
+    # was enabled, leaving the belt uncommanded in static production runs.)
+    try:
+        executor.dispatch(
+            {
+                "commandID": COMMAND_ID["change_speed"],
+                "CommandID": COMMAND_ID["change_speed"],
+                "rotate": 0.0,
+                "speed": settings.test_conveyor_belt_speed_mm_s,
+            }
+        )
+        print(f"[INFO] Conveyor speed set to {settings.test_conveyor_belt_speed_mm_s} mm/s")
+        with state.state_lock:
+            state.last_speed_commit_monotonic = time.monotonic()
+    except Exception as exc:
+        print(f"[WARN] Could not set conveyor speed: {exc}")
 
     deadline = None if duration_s is None else start_time + duration_s
     cycle_time_samples: deque[float] = deque(maxlen=20)
@@ -2562,16 +2984,19 @@ def _run_realtime_pick_loop(
                 cycle_t0 = time.monotonic()
                 success = executor.execute(plan, state=state, scenario_name=scenario_name)
                 cycle_time_samples.append(time.monotonic() - cycle_t0)
+                # Exactly-once applies to DISPATCHED picks only (suction is never
+                # verified, so an attempted grip must not be retried — issue-2 /
+                # theory §6.8). A pre-grip abort (goto failure, gate stall, track
+                # lost) leaves the object physically on the belt: keep it in the
+                # tracker and only unclaim it, so the next plan build can re-target
+                # it instead of dropping a still-pickable object forever.
+                attempted = success or bool(plan.debug_info.get("pick_dispatched"))
                 with state.state_lock:
                     state.claimed_object_ids.discard(plan.object_id)
-                    scheduler.planned_object_ids[plan.object_id] = time.monotonic()
                     state.recent_pick_cycle_s = sum(cycle_time_samples) / len(cycle_time_samples)
-                    # Issue-2 fix: an attempted object (success or failure) is never
-                    # re-targeted. Without this, a completed pick lingered in the
-                    # tracker (only `claimed_object_ids` excluded it during execute)
-                    # until it drifted past u_max or went stale, so it could be
-                    # re-selected as a candidate for an object that no longer exists.
-                    scheduler.tracker.remove(plan.object_id)
+                    if attempted:
+                        scheduler.planned_object_ids[plan.object_id] = time.monotonic()
+                        scheduler.tracker.remove(plan.object_id)
                     if success:
                         scheduler.mark_completed(plan)
                     else:
@@ -2584,7 +3009,10 @@ def _run_realtime_pick_loop(
             elif settings.adaptive_speed_enabled:
                 # No pick in flight: let the belt ramp back toward v_cap (sparse
                 # density) so the next objects are fetched fast. Off the gate path.
-                _commit_adaptive_speed(executor.dispatch, state)
+                _commit_adaptive_speed(
+                    executor.dispatch, state,
+                    min_interval_s=_OPPORTUNISTIC_COMMIT_INTERVAL_S,
+                )
 
             if hasattr(image_processing, "render_window"):
                 if not image_processing.render_window():
@@ -2703,7 +3131,7 @@ def run_scheduler_scenario(
         stale_timeout_s=settings.stale_timeout_s,
         camera_window_uv=settings.camera_window_uv,
     )
-    decoder = BeltPositionTracker()
+    decoder = BeltPositionTracker(velocity_ema_alpha=settings.belt_velocity_ema_alpha)
     if executor is None:
         if scenario_name == "test_vision_only":
             executor: Any = NullExecutor()
@@ -2796,7 +3224,10 @@ def run_scheduler_scenario(
                     status_payload["e"] = int(last_status.get("end_effector") or 0)
             event_sink("status", status_payload)
         detections = image_processing.poll(now)
-        scheduler.ingest_detections(detections, sample.position_mm)
+        scheduler.ingest_detections(
+            detections, sample.position_mm,
+            position_at=getattr(speed_source, "position_at", None),
+        )
 
         # Emit a snapshot of every tracked object's real R-frame position so the
         # web dashboard (--interface) can show objects moving live on the belt.
@@ -2931,5 +3362,20 @@ def run_scheduler_scenario(
             image_processing.stop()
         if hasattr(image_processing, "close_window"):
             image_processing.close_window()
+
+    # Computed-config suggestion: fires for the EvaluateExecutor-backed accuracy/
+    # acceptance runs (real hardware), turning this run's per-phase timing into
+    # calibrated config values so the oversized config can be re-tuned from data.
+    eval_metrics = getattr(executor, "metrics", None)
+    if isinstance(eval_metrics, EvaluateMetrics) and eval_metrics.phase_wall_times:
+        round_trip = getattr(executor, "round_trip", None)
+        suggest = eval_metrics.config_suggestions(
+            round_trip.average_s if round_trip is not None else 0.0,
+            settings.nominal_xy_speed,
+            simulated=False,
+        )
+        print("[CONFIG-SUGGEST]", json.dumps(suggest, ensure_ascii=True))
+        if event_sink is not None:
+            event_sink("config_suggest", suggest)
 
     print("[INFO] Scheduler metrics:", json.dumps(scheduler.metrics.as_dict(), ensure_ascii=True))

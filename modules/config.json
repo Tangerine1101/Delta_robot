@@ -22,6 +22,7 @@
     },
     "conveyor": {
         "conveyor_position_scale_mm": 1.0,
+        "velocity_ema_alpha": 0.4,
         "length_mm": 800.0,
         "frame": {
             "theta_deg": 28.0,
@@ -205,13 +206,16 @@
         "accuracy_object_types": [
             "TQFP"
         ],
-        "adaptive_speed_enabled": false,
+        "adaptive_speed_enabled": true,
+        "test_conveyor_belt_speed_mm_s": 50.0,
         "pick_cycle_s": 2,
         "pick_transit_min_s": 1.6,
-        "belt_speed_headroom": 0.6,
-        "belt_speed_min_mm_s": 30.0,
+        "belt_speed_headroom": 0.5,
+        "belt_speed_min_mm_s": 20.0,
+        "belt_speed_max_mm_s": 160.0,
         "belt_speed_hw_max_mm_s": 200.0,
-        "belt_speed_deadband_mm_s": 8.0,
+        "belt_speed_deadband_mm_s": 5.0,
+        "belt_speed_max_step_mm_s": 20.0,
         "belt_density_length_mm": 0.0,
         "belt_accel_mm_s2": 22.31,
         "belt_ramp_s": 0.25,

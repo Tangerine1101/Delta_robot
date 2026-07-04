@@ -6,7 +6,7 @@ This module bundles:
 - The homogeneous transform M_cam from camera pixels (px, py) directly to robot
   frame (X, Y). M_cam already absorbs the homography H (pixel -> conveyor) and F.
 - BeltPositionTracker: stores the pre-decoded belt position (mm) reported by
-  the PLC (`conveyor_position`, cm) and derives velocity (mm/s).
+  the PLC (`conveyor_position`, mm since June 2026) and derives velocity (mm/s).
 - BeltTracker: maintains the live list of objects sitting on the belt and
   computes their current robot-frame position from the encoder reading.
 
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -187,6 +188,10 @@ class ConveyorFrame:
         # u_hat = R * (1, 0); v_hat = R * (0, 1). The translation column is dropped.
         self.u_hat: tuple[float, float] = (F[0][0], F[1][0])
         self.v_hat: tuple[float, float] = (F[0][1], F[1][1])
+        # Frame rotation theta recovered from u_hat = (-sin θ, cos θ). The
+        # camera->C->R chain is a pure +θ rotation, so a board's R-frame heading
+        # is its vision heading + θ (used to normalise the suction angle).
+        self.theta_rad: float = math.atan2(-self.u_hat[0], self.u_hat[1])
 
     def to_robot(self, u: float, v: float) -> tuple[float, float]:
         return _mat_apply(self.F, u, v)
@@ -242,7 +247,7 @@ class BeltPositionTracker:
     """Track belt position (mm) and derive velocity from a pre-decoded position.
 
     The Siemens program now sends the belt position directly (field
-    `conveyor_position`, in cm), so no quadrature decoding is needed here. Feed
+    `conveyor_position`, in mm), so no quadrature decoding is needed here. Feed
     `update(position_mm, now)` with the position already converted to mm; the
     tracker stores it and computes velocity as the time derivative with a small
     EMA filter to smooth polling jitter.
@@ -251,6 +256,7 @@ class BeltPositionTracker:
     def __init__(
         self,
         velocity_ema_alpha: float = 0.4,
+        history_len: int = 200,
     ) -> None:
         self.velocity_ema_alpha = float(velocity_ema_alpha)
         self._last_position_mm: float | None = None
@@ -258,6 +264,11 @@ class BeltPositionTracker:
         self._position_mm: float = 0.0
         self._velocity_mm_per_s: float = 0.0
         self._initialised: bool = False
+        # Ring buffer of (timestamp, position_mm) so a detection captured a few
+        # tens of ms ago can be anchored to the belt position AT its capture
+        # time (camera-latency compensation), not at ingest time. ~200 samples
+        # at the 25 ms perception tick ≈ 5 s of history.
+        self._history: deque[tuple[float, float]] = deque(maxlen=history_len)
 
     def update(self, position_mm: float, now: float) -> None:
         new_position = float(position_mm)
@@ -267,6 +278,7 @@ class BeltPositionTracker:
             self._last_position_mm = new_position
             self._last_timestamp = now
             self._initialised = True
+            self._history.append((now, new_position))
             return
 
         last_ts = self._last_timestamp if self._last_timestamp is not None else now
@@ -280,6 +292,32 @@ class BeltPositionTracker:
         self._position_mm = new_position
         self._last_position_mm = new_position
         self._last_timestamp = now
+        self._history.append((now, new_position))
+
+    def position_at(self, t: float, max_age_s: float = 1.0) -> float | None:
+        """Belt position (mm) at past time ``t`` by linear interpolation over the
+        history buffer. Returns None if the buffer is empty or ``t`` is older than
+        ``max_age_s`` before the oldest sample (too stale to trust)."""
+        if not self._history:
+            return None
+        oldest_t, oldest_p = self._history[0]
+        newest_t, newest_p = self._history[-1]
+        if t >= newest_t:
+            return newest_p
+        if t <= oldest_t:
+            # Only extrapolate a little past the oldest sample; else give up.
+            return oldest_p if (oldest_t - t) <= max_age_s else None
+        # Binary/linear scan for the bracketing pair (history is time-ordered).
+        prev_t, prev_p = oldest_t, oldest_p
+        for sample_t, sample_p in self._history:
+            if sample_t >= t:
+                span = sample_t - prev_t
+                if span <= 0.0:
+                    return sample_p
+                frac = (t - prev_t) / span
+                return prev_p + (sample_p - prev_p) * frac
+            prev_t, prev_p = sample_t, sample_p
+        return newest_p
 
     @property
     def position_mm(self) -> float:

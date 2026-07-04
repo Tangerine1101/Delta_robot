@@ -41,7 +41,7 @@ class SiemensReceivePacket(ctypes.BigEndianStructure):
         ("speed_current", ctypes.c_float),  # float (4 bytes)
         ("task_doing", ctypes.c_int32),     # int (4 bytes)
         ("task_state", ctypes.c_int32),     # int (4 bytes)
-        ("conveyor_position", ctypes.c_float),  # float (4 bytes) — belt position in cm (REAL), pre-decoded by PLC
+        ("conveyor_position", ctypes.c_float),  # float (4 bytes) — belt position in mm (REAL), pre-decoded by PLC (scale = 1.0)
     ]
 # =============================================================
 
@@ -72,6 +72,30 @@ COMMAND_ID = {
 
 COMMAND_NAME = {value: key for key, value in COMMAND_ID.items()}
 ARRAY_FIELDS = ("argument_x", "argument_y", "argument_z", "argument_e", "argument_time")
+
+
+# --- Suction rotation angle convention -------------------------------------
+# The PC/scheduler works in a LOGICAL angle in [-180, 180) so the 4th-DOF axis
+# only ever turns the short way (a board at logical +170 is +170, never -190).
+# The Siemens ST program, however, has its rotation limit HARDCODED to [0, 360),
+# so the IPC boundary remaps logical -> physical by a +180 shift (-180 -> 0,
+# 0 -> 180, ~180 -> ~360) and status feedback is mapped back the other way. Do
+# the remap ONLY for rotate_absolute (command 7); change_speed (8) also carries
+# a rotate field but the PLC ignores it, and shifting it would spin the cup.
+
+def wrap_angle_180(angle_deg: float) -> float:
+    """Wrap an angle (degrees) into the half-open interval [-180, 180)."""
+    return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+
+def logical_to_physical_rotate(logical_deg: float) -> float:
+    """Logical [-180, 180) suction angle -> Siemens physical [0, 360)."""
+    return wrap_angle_180(logical_deg) + 180.0
+
+
+def physical_to_logical_rotate(physical_deg: float) -> float:
+    """Siemens physical [0, 360) rotate feedback -> logical [-180, 180)."""
+    return wrap_angle_180(float(physical_deg) - 180.0)
 
 # Commands whose argument_x/argument_y carry ABSOLUTE robot-frame coordinates and
 # must therefore be checked against the physical reach limit. goto_relative (1)

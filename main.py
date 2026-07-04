@@ -6,7 +6,13 @@ import multiprocessing as mp
 from queue import Empty
 from typing import Any
 
-from modules.EthernetCom import PLCGateway, SiemensGateway, load_config
+from modules.EthernetCom import (
+    PLCGateway,
+    SiemensGateway,
+    load_config,
+    logical_to_physical_rotate,
+    physical_to_logical_rotate,
+)
 from modules.cli import run_interactive
 from modules.interface import DashboardServer
 from modules.scheduler import (
@@ -81,8 +87,14 @@ def _worker(
                         try:
                             s_status = siemens_gateway.get_status()
                             if s_status is not None:
+                                rotate_phys = s_status.get("rotate_current")
                                 status.update({
-                                    "rotate_current": s_status.get("rotate_current"),
+                                    # Physical [0,360) feedback -> logical [-180,180)
+                                    # so logs/dashboard match the scheduler's units.
+                                    "rotate_current": (
+                                        physical_to_logical_rotate(rotate_phys)
+                                        if rotate_phys is not None else None
+                                    ),
                                     "speed_current": s_status.get("speed_current"),
                                     "siemens_task_doing": s_status.get("task_doing"),
                                     "siemens_task_state": s_status.get("task_state"),
@@ -100,8 +112,17 @@ def _worker(
                     pkg = message["package"]
                     cmd_id = pkg.get("commandID")
                     if cmd_id in (7, 8, 9):
-                        # Siemens command
-                        s_status = siemens_gateway.send_package(pkg)
+                        # Siemens command. rotate_absolute (7) carries a LOGICAL
+                        # angle: remap to the PLC's physical [0,360) on the wire
+                        # only (echo the original logical pkg back to the caller).
+                        if cmd_id == 7:
+                            wire_pkg = dict(pkg)
+                            wire_pkg["rotate"] = logical_to_physical_rotate(
+                                pkg.get("rotate", 0.0)
+                            )
+                        else:
+                            wire_pkg = pkg
+                        s_status = siemens_gateway.send_package(wire_pkg)
                         response_queue.put(
                             {
                                 "ok": True,

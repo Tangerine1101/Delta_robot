@@ -157,6 +157,24 @@ $$u(t) = u_{\text{anchor}} + \Delta p(t)$$
 
 This method is **drift-free** because position is determined directly by physical belt movement rather than time integration.
 
+### 3.3. Backdated Anchoring (Camera-Latency Compensation)
+
+The anchor above is only drift-free if $p_{\text{anchor}}$ is the belt position **at the instant the frame was captured**, not when the detection is ingested. A frame travels through exposure, decode, YOLO inference and the perception poll before it reaches the scheduler — on the order of 80–150 ms — during which the belt advances $v_{\text{belt}}\cdot\Delta t_{\text{lat}}$ (≈4 mm at 50 mm/s, up to ≈24 mm at the adaptive cap). Anchoring a stale $u$ to the *current* belt position injects that as a fixed upstream error that freezes into the last camera fix once the object leaves the field of view.
+
+**Solution**: stamp each frame with its decode time $t_{\text{cap}}$ (backdated by half the exposure, since photons integrate over the exposure window), keep a short history of $(t, p(t))$ samples from the perception thread, and anchor with the interpolated position at capture time:
+
+$$p_{\text{anchor}} = p(t_{\text{cap}}), \qquad t_{\text{cap}} = t_{\text{decode}} - \tfrac{1}{2}t_{\text{exposure}}$$
+
+The rest of the latency chain needs no separate term — the encoder already recorded where the belt was, so we simply look it up. Falls back to the current position when history is unavailable (static/simulated belt).
+
+### 3.4. Oblique Intercept (Belt-Tracking Descent)
+
+A vertical descent at a fixed R-frame point makes contact with the cup and board at a horizontal *relative* velocity equal to the belt speed, dragging the board during suction settling. Instead the arm **parks upstream** and slants down to the contact point so it moves with the board:
+
+$$\mathbf{park} = \mathbf{p}_{\text{contact}} - \hat{u}\,\big(v_{\text{belt}}\cdot t_d\big), \qquad z_{\text{park}} = z_{\text{pre\_pick}}$$
+
+where $\hat{u}$ is the belt-flow unit vector in the R-frame and $t_d$ is the modeled park→contact descent time (interpolator model, one fixed-point pass folding the belt slant into the segment length). Over $t_d$ the board advances $v_{\text{belt}}\cdot t_d$ and the cup covers the same displacement along $\hat{u}$, so they meet at $\mathbf{p}_{\text{contact}}$ with zero relative velocity. At $v_{\text{belt}}=0$ the offset vanishes and the descent is vertical. The pick gate therefore fires a lead of $v_{\text{belt}}\cdot(T_{\text{delay}} + t_{\text{sampling}} + t_d)$ ahead of the contact $u$.
+
 ---
 
 ## 4. Yaw Orientation Resolution (360° Angle)
@@ -168,6 +186,20 @@ QFP/TQFP components have 180° rotational symmetry. YOLO-OBB only detects the ti
    $$\vec{\mathbf{v}} = (x_m - x_b, y_m - y_b)$$
 3. **Heading Angle**:
    $$\theta_{\text{heading}} = \left(\text{atan2}(v_y, v_x) \cdot \frac{180}{\pi} + \theta_{\text{offset}}\right) \pmod{360}$$
+
+### 4.1. Rotation Timeline & Logical/Physical Angle Convention
+
+The suction rotation is **not** applied before the grip to pre-orient the cup; it is applied **after** the grip to normalise the *attached* board to a uniform bin orientation. Timeline: home the axis to logical 0 while the arm flies to the park point → gate fires → pick descends → once the arm lifts back to $z \ge z_{\text{pre\_pick}}$, rotate the board by
+
+$$\theta_{\text{cmd}} = \text{wrap}_{180}\!\big(\theta_{\text{offset}} - (\theta_{\text{heading}} + \theta_{\text{frame}})\big)$$
+
+where $\theta_{\text{frame}}$ is the camera→R-frame rotation (`ConveyorFrame.theta_rad`) and $\text{wrap}_{180}$ maps to $[-180,180)$ so the axis always turns the short way. This keeps the rotation command off the gate→contact critical path (it no longer sits between gate-fire and pick dispatch).
+
+The PC works in this **logical** $[-180,180)$ angle, but the Siemens ST program has its rotation range hardcoded to $[0,360)$. The IPC boundary therefore remaps only `rotate_absolute`:
+
+$$\theta_{\text{physical}} = \text{wrap}_{180}(\theta_{\text{logical}}) + 180 \in [0,360), \qquad \theta_{\text{logical}} = \text{wrap}_{180}(\theta_{\text{physical}} - 180)$$
+
+(status feedback is mapped back so logs/dashboard stay logical). **The sign and $\theta_{\text{offset}}$ are unverified and must be calibrated on the first hardware run** with a board at a known angle.
 
 ---
 
@@ -410,9 +442,36 @@ the band edges, not a separate brake, do the protective work.
 This resolves the dense-feeder counter-argument directly: utilisation climbs from the nominal
 70–80 % to 100 % on its own, with no second control term fighting the first.
 
+**Spacing cap (cluster constraint), added 2026-07-02.** The three-regime law above regulates
+the *average* presentation rate $\lambda = \rho v$ but is blind to how objects are *spaced*: a
+count $N$ over the fixed length $L_{\text{meas}}$ treats a tight pair (40 mm apart) and a spread
+pair (300 mm apart) identically — same $\rho = N/L$, same commanded $v$. Yet the serial arm needs
+$t_{\text{pick}}$ between consecutive picks, so the binding constraint for a *burst* is the
+inter-arrival time of adjacent objects, $s_i / v \ge t_{\text{pick}}$, i.e.
+$v \le s_i / t_{\text{pick}}$. The averaged law under-slows here: at $N{=}2$ it commands
+$\lambda_{\text{nom}} L / 2$ regardless of whether those two objects are 40 mm or 300 mm apart,
+and by the time the backlog grows $N$ enough to drop $v$ to the floor, the tight trailing object
+has already passed $u_{\max}$ unpicked (a *dropped* pick, not just lost throughput). We therefore
+layer a **spacing ceiling** on top of the density law:
+$$v_{\text{target}} = \max\!\big(v_{\min},\; \min(\,v_{\rho},\; g_{\min}/t_{\text{pick}}\,)\big),\qquad
+g_{\min} = \min_i (u_i - u_{i+1})$$
+over the leading `_SPACING_LEAD_OBJECTS` (default 4) objects sorted toward the pick point — only
+the *imminent* cluster constrains the belt, so a tight group still far upstream does not force a
+premature slow-down. A cluster tighter than $v_{\min}\!\cdot t_{\text{pick}}$ pins the belt to its
+floor (best-effort; the trailing object may still be missed — the cell is locally over-dense and
+no belt speed catches both). This changes the *average*-rate regulator into a **rate-and-spacing**
+regulator: throughput regulation when objects are spread, burst protection when they cluster —
+the failure mode the count-only law could not see.
+
 **Anti-thrash** (each avoided speed change is one fewer acceleration ramp):
 * **Deadband** — only issue `change_speed` if $|v_{\text{target}} - v_{\text{setpoint}}| > \Delta_{\min}$ (≈ 5–10 mm/s).
-* **Rate limit** — at most one speed change per pick cycle, only at the §6.6 dispatch instant.
+* **Step limit** — each commit moves the setpoint at most `belt_speed_max_step_mm_s`
+  (default 20 mm/s) toward the target, so every individual ramp settles within
+  $\Delta v_{\max} / a_{\text{nom}} \approx 0.9$ s. This tames the raw hyperbolic law,
+  which at small integer $N$ is near bang-bang (the $N{=}1 \leftrightarrow 2$ jump is
+  ≈ 54 mm/s ⇒ a 2.4 s ramp at $a_{\text{nom}} = 22.31$ mm/s² — longer than a pick).
+* **Throttle** — commits are dispatched at most every ≈ 0.75 s (each costs a Siemens
+  round-trip), except the immediate grip-instant commit.
 
 ### 6.6. Jerk evaluation & timing avoidance
 **Cost of modeling jerk explicitly:** the $\tfrac{1}{2}a t^2$ term would be replaced by the
@@ -444,6 +503,29 @@ post-ramp $v_{\text{target}}$ inside the same plan-build call that committed the
 that the commit is decoupled from plan-build (it happens at the *previous* pick's grip instant),
 the live encoder sample (`state.belt_speed_mm_s`) already reflects the settled post-ramp speed by
 the time the next plan is built — no explicit coupling term is needed.
+
+**Revision 2026-07-02 — opportunistic commits (grip-instant-only was too narrow):** the
+grip-instant + idle policy above produced at most **one commit per pick cycle (2–10 s)** —
+`execute()` blocks the main loop through goto/park/gate-wait, so density changes sensed by the
+25 ms perception tick sat uncommitted for seconds (belt felt laggy and uneven on hardware). It
+also failed quantitatively: the $N{=}1\leftrightarrow2$ jump of ≈ 54 mm/s needs
+$T_{\text{accel}} = \Delta v / a_{\text{nom}} \approx 2.4$ s, longer than the
+descend/grip/lift/return window the old text claimed would absorb the ramp. The policy is now
+**inverted**: commits are allowed *any time* — from the executor wait loops (goto flight, far
+gate wait, post-grip return) and the idle loop, throttled to ≥ 0.75 s apart — **except** inside
+the *gate-critical window*, i.e. once the tracked object is within ≈ 2 s of belt travel of the
+fire threshold (`RealtimeState.gate_critical`). Combined with the §6.5 step limit (ramps ≤ 0.9 s)
+the belt is genuinely steady whenever a gate fires, restoring the §6.4 steady-belt assumption by
+construction rather than by hope. Two supporting changes: (a) **closed loop** — the perception
+thread stores the PLC's `speed_current`; if the measured speed still diverges from the setpoint
+> 3 s after the last commit, the setpoint is re-sent (catches lost/clamped commands; the old
+controller compared against a phantom setpoint it had only assumed was applied); (b) the pick-gate
+lead offset now also covers the **sampling latency** (gate poll /2 + perception tick /2 ≈ 37 ms)
+on top of $T_{\text{delay}}$, and each pick logs a `[GATE]` line
+(`gate_to_dispatch_s` / `dispatch_to_contact_s`) so `robot_movement_delay_s` can be calibrated
+from measured data instead of assumed (the configured 10 ms is far below the physical
+dispatch→contact chain of soft-start + 13 mm descent ≈ 0.3–0.5 s; at 50–110 mm/s belt that is a
+15–50 mm downstream contact offset if left uncalibrated).
 
 ### 6.7. Operational logic flow
 Two threads (§5.2): the **perception thread** ticks every ~25 ms, refreshing the live belt
@@ -493,10 +575,22 @@ implementation gap meant a completed pick's object stayed in the tracker (only e
 candidate selection by `claimed_object_ids`, which is cleared right after `execute()` returns),
 so it could be re-selected on the very next plan build — a "pick plan for a board that no longer
 exists." Fixed by removing the object from the tracker as part of the same post-`execute()`
-bookkeeping (`Done` in §6.7), for both success and failure, plus a defensive
-`planned_object_ids` skip in the candidate loop. **Consequence (intended):** each detected object
-is pick-attempted **exactly once** — a genuine suction miss is no longer retried; the object
-simply rides past $u_{\max}$ uncaught instead of triggering a noisy phantom re-pick.
+bookkeeping (`Done` in §6.7), plus a defensive `planned_object_ids` skip in the candidate loop.
+
+**Scope (revised 2026-07-02): exactly-once applies to *dispatched* picks only.** The original fix
+removed the object for *every* failure, including pre-grip aborts (goto timeout, gate stall,
+track lost) — permanently dropping an object that was still on the belt and pickable, and, worse,
+deleting it from the density count $N$ so the belt was commanded *faster* right when a pick had
+just failed. Now the post-`execute()` bookkeeping keys off `plan.debug_info["pick_dispatched"]`:
+* **Pick dispatched** (success, or failure after the grip was commanded): remove from tracker +
+  `planned_object_ids` — a possible suction miss is never retried (suction is not verified).
+* **Aborted before the grip**: only unclaim; the object stays tracked and is eligible for
+  re-planning on the next build.
+
+Relatedly, the pick gate's abort condition itself changed from a fixed wall-clock deadline
+(`predicted_pick_time + margin` — which fired whenever the belt slowed after plan-build, e.g.
+mid adaptive ramp) to a **progress-based stall check**: abort only if the object's
+encoder-anchored $u$ advances < 0.5 mm for several seconds, or its track disappears.
 
 ---
 
