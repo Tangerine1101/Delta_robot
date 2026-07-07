@@ -621,6 +621,15 @@ class VisionImageProcessing:
         # yet — the model loads in the inference thread).
         self._pcb_classes = set(ori.get("pcb_classes") or vision_config.get("class_map", {}).keys())
         self._heading_offset = float(ori.get("offset_deg", 0.0))
+        # Per-class heading offset (degrees): the board->marker vector includes
+        # the marker's diagonal placement on the board (e.g. a corner marker on
+        # a square QFP sits ~45 deg off the edges), and that constant differs
+        # per board type. Calibrated per class; falls back to the global
+        # offset_deg when a class is absent.
+        self._heading_offset_by_class = {
+            str(k): float(v)
+            for k, v in (ori.get("offset_by_class", {}) or {}).items()
+        }
         self._symmetry_default = float(ori.get("symmetry_deg", 180.0))
         self._symmetry_by_class = ori.get("symmetry_by_class", {})
         # Distance gate for the fallback (no marker inside the board OBB) case.
@@ -706,6 +715,13 @@ class VisionImageProcessing:
         # Track ids already emitted at least once, so we log "NEW" only on first
         # sighting (emission is now continuous, every frame, not one-shot).
         self._emitted_ids: set[int] = set()
+
+        # Last marker-vector heading resolved per track id. A board's marker can
+        # drop out of detection near the ROI edge (crop/occlusion) even though
+        # the board itself is still tracked; reusing the last good marker angle
+        # avoids falling back to the OBB symmetry fold (which can jump ~90/180
+        # deg and looked like random post-pick misorientation downstream).
+        self._marker_angle_by_track: dict[int, float] = {}
 
         # Thread-safe detection queue.
         self._deque: collections.deque[ObjectDetection] = collections.deque()
@@ -840,6 +856,10 @@ class VisionImageProcessing:
                 now = time.monotonic()
                 centroids = [(d[0], d[1]) for d in pcb_dets]
                 active = self._tracker.update(centroids, now)
+                self._marker_angle_by_track = {
+                    tid: angle for tid, angle in self._marker_angle_by_track.items()
+                    if tid in active
+                }
 
                 if self._belt_estimator_enabled:
                     self._belt_estimator.update(active)
@@ -874,10 +894,11 @@ class VisionImageProcessing:
                 self._cv2, self._np, max_dist_px=self._marker_max_dist_px,
             )
             type_name = inferred if (self._cross_check and inferred) else self._names[cls_id]
-            angle = heading_from_marker_vector(board, marker, self._heading_offset)
+            offset = self._heading_offset_by_class.get(type_name, self._heading_offset)
+            angle = heading_from_marker_vector(board, marker, offset)
             if angle is None:
                 sym = float(self._symmetry_by_class.get(type_name, self._symmetry_default))
-                angle = resolve_heading_360(board, None, self._heading_offset, sym)
+                angle = resolve_heading_360(board, None, offset, sym)
             return angle, type_name, marker
         return normalize_angle_deg(board[4]), self._names[cls_id], None
 
@@ -885,9 +906,12 @@ class VisionImageProcessing:
         """Emit an ObjectDetection for every tracked board, every frame it is seen.
 
         Replaces the old one-shot trigger-line crossing. A board is created/updated
-        as soon as it is detected — but only when it has a full OBB *and* a matched
-        marker (orientation enabled): the marker is what resolves the 360° heading,
-        so without it we neither create the object nor update its angle. The id
+        as soon as it has a full OBB (orientation enabled or not). With orientation
+        enabled the heading comes from the marker vector when a marker is matched
+        this frame; if the marker is missed for a frame (e.g. cropped/occluded near
+        the ROI edge) the track's last marker-resolved heading is reused instead of
+        the OBB symmetry-fold fallback (see `_marker_angle_by_track`); only a track
+        that has never once resolved a marker uses the OBB fallback angle. The id
         (`yolo-{trk.id}`) is stable across frames (see CentroidTracker), so the
         scheduler re-anchors the same object from the camera while it is visible
         and dead-reckons from belt position once it leaves the camera zone.
@@ -909,9 +933,16 @@ class VisionImageProcessing:
                 continue
 
             angle, type_name, marker = self._compute_angle(board, marker_dets)
-            # Full OBB + marker gate: only create/update when the marker is present.
-            if self._ori_enabled and marker is None:
-                continue
+            if marker is not None:
+                self._marker_angle_by_track[trk.id] = angle
+            elif trk.id in self._marker_angle_by_track:
+                # Marker missed this frame only (e.g. board exiting the ROI) —
+                # reuse the last marker-resolved heading instead of the OBB
+                # symmetry-fold fallback _compute_angle already computed.
+                angle = self._marker_angle_by_track[trk.id]
+            # else: this track has never resolved a marker — keep the OBB
+            # fallback angle from _compute_angle (best available, still emitted
+            # so the object isn't silently dropped).
 
             mapped = self._class_map.get(type_name)
             if mapped is None:

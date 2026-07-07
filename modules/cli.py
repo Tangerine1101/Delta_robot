@@ -205,8 +205,11 @@ def _parse_plan(
     if command == "rotate":
         if len(tokens) != 2:
             raise ValueError("rotate expects 1 angle value: rotate <angle>")
+        # Human types R-frame DEGREES; the packet carries radians (sent verbatim
+        # to the PLC as wire degrees [-359,359] at the IPC boundary in
+        # main._worker — no wrap, so 270 stays 270).
         return CommandPlan(
-            packages=[{"commandID": COMMAND_ID["rotate_absolute"], "CommandID": COMMAND_ID["rotate_absolute"], "rotate": float(tokens[1]), "speed": 0.0}]
+            packages=[{"commandID": COMMAND_ID["rotate_absolute"], "CommandID": COMMAND_ID["rotate_absolute"], "rotate": math.radians(float(tokens[1])), "speed": 0.0}]
         )
     if command == "setspeed":
         if len(tokens) != 2:
@@ -240,7 +243,8 @@ def _parse_plan(
             packages.append({
                 "commandID": COMMAND_ID["rotate_absolute"],
                 "CommandID": COMMAND_ID["rotate_absolute"],
-                "rotate": rotate_angle,
+                # human degrees -> packet radians (wire conversion in main._worker)
+                "rotate": math.radians(rotate_angle),
                 "speed": 0.0
             })
         packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
@@ -268,7 +272,8 @@ def _parse_plan(
             packages.append({
                 "commandID": COMMAND_ID["rotate_absolute"],
                 "CommandID": COMMAND_ID["rotate_absolute"],
-                "rotate": rotate_angle,
+                # human degrees -> packet radians (wire conversion in main._worker)
+                "rotate": math.radians(rotate_angle),
                 "speed": 0.0
             })
         packages.append(_cartesian_command("goto_absolute", x, y, clearance, interpolar_points))
@@ -500,7 +505,7 @@ def _print_help() -> None:
         "  go <theta1> <theta2> <theta3>        # relative joint move\n"
         "  goto <x> <y> <z>                     # absolute Cartesian move\n"
         "  go_trajectory <demo|square|home>\n"
-        "  rotate <angle>                       # Siemens EE suction rotation (logical deg, [-180,180))\n"
+        "  rotate <angle>                       # Siemens EE suction rotation (R-frame deg, verbatim [-359,359])\n"
         "  setspeed <speed>                     # Siemens conveyor speed\n"
         "  plan_siemen <rotate> <speed>         # Siemens plan\n"
         "  grab <object> <x> <y> <z> [rotate]   # manual grab sequence\n"

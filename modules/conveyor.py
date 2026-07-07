@@ -26,7 +26,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from modules.EthernetCom import load_config
+from modules.EthernetCom import load_config, wrap_rad
 from modules.image_processing import ObjectDetection
 
 
@@ -193,6 +193,22 @@ class ConveyorFrame:
         # is its vision heading + θ (used to normalise the suction angle).
         self.theta_rad: float = math.atan2(-self.u_hat[0], self.u_hat[1])
 
+    def vision_heading_to_robot_rad(self, vision_heading_deg: float) -> float:
+        """Vision marker heading (image-pixel degrees) -> R-frame heading (radians).
+
+        The ONLY place the image-angle convention is translated; everything
+        downstream (tracker, scheduler) works in R-frame radians, 0 = robot +X
+        axis, positive = CCW seen from above, wrapped to [-pi, pi).
+
+        Derivation: `heading_from_marker_vector` measures atan2(dx, dy) on raw
+        pixels, i.e. from the image +y (DOWN) axis, while the ROI->C->R chain
+        (M_VISION_TO_CONVEYOR axis swap composed with F's reflection block) is a
+        pure +theta rotation of angles measured CCW from the ROI x axis. The two
+        references differ by exactly -90 deg, hence:
+            R_heading = radians(vision_heading - 90) + theta
+        """
+        return wrap_rad(math.radians(vision_heading_deg - 90.0) + self.theta_rad)
+
     def to_robot(self, u: float, v: float) -> tuple[float, float]:
         return _mat_apply(self.F, u, v)
 
@@ -345,7 +361,12 @@ class TrackedObject:
     object_type: str
     conveyor_uv: tuple[float, float]   # (u_i, v_i) — anchor in C-frame
     belt_pos_anchor: float             # encoder position p when first detected
+    # Board heading in the R-frame (radians, [-pi, pi), 0 = robot +X, CCW from
+    # above) — converted from the raw vision angle at ingest.
     rotation_rad: float = 0.0
+    # Raw vision heading (image-pixel degrees) as emitted — kept for [ROTATE]
+    # calibration logs only; never used in computations.
+    vision_angle_deg: float = 0.0
     w_mm: float = 0.0
     h_mm: float = 0.0
     last_seen_at: float = 0.0
@@ -411,7 +432,8 @@ class BeltTracker:
             obj.belt_pos_anchor = p_now
             obj.last_seen_at = detection.timestamp
             obj.confidence = detection.confidence
-            obj.rotation_rad = math.radians(detection.angle_deg)
+            obj.rotation_rad = self.frame.vision_heading_to_robot_rad(detection.angle_deg)
+            obj.vision_angle_deg = detection.angle_deg
             return obj
 
         obj = TrackedObject(
@@ -419,7 +441,8 @@ class BeltTracker:
             object_type=detection.object_type,
             conveyor_uv=(detection.x, detection.y),
             belt_pos_anchor=p_now,
-            rotation_rad=math.radians(detection.angle_deg),
+            rotation_rad=self.frame.vision_heading_to_robot_rad(detection.angle_deg),
+            vision_angle_deg=detection.angle_deg,
             w_mm=dims[0],
             h_mm=dims[1],
             last_seen_at=detection.timestamp,

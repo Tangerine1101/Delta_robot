@@ -10,14 +10,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config, wrap_angle_180
+from modules.EthernetCom import COMMAND_ID, RobotPacket, load_config, wrap_rad
 from modules.conveyor import (
     BeltPositionTracker,
     BeltTracker,
     ConveyorFrame,
     TrackedObject,
     UVWindow,
-    is_within_xy_limit,
 )
 from modules.image_processing import ObjectDetection, SimulatedImageProcessing, VisionImageProcessing
 
@@ -85,8 +84,10 @@ class PickPlan:
     # C-frame anchor used by the live pick-position gate.
     object_uv_anchor: tuple[float, float] = (0.0, 0.0)
     belt_pos_anchor: float = 0.0
-    # Rotation angle for the 4th-DOF Siemens suction cup (degrees).
-    rotate_deg: float = 0.0
+    # Post-grip target for the 4th-DOF Siemens suction cup: R-frame RADIANS,
+    # [-pi, pi) (the wrap itself gives the shortest-way rotation). Converted to
+    # wire degrees only at the IPC boundary (main.py _worker).
+    rotate_rad: float = 0.0
     # Modeled park->contact descent time (s). The pick gate must fire this much
     # earlier (on top of the dispatch delay) so the oblique descent lands on the
     # object; also logged for T_delay calibration.
@@ -115,7 +116,7 @@ class PickPlan:
             ],
             "sorting_position": [round(value, 3) for value in self.sorting_position],
             "duration_s": round(self.total_duration(), 3),
-            "rotate_deg": round(self.rotate_deg, 2),
+            "rotate_deg": round(math.degrees(self.rotate_rad), 2),
             "status": self.status,
         }
 
@@ -193,6 +194,11 @@ class RealtimeState:
     # card. Written by the main thread after each executor.execute() call, read by
     # the perception thread when building the "status" event — hence state_lock.
     recent_pick_cycle_s: float = 0.0
+    # Live Siemens suction-cup angle feedback (R-frame DEGREES, [-180,180)),
+    # refreshed by the perception thread from the status packet. None until the
+    # first Siemens status arrives (and always None in simulation). Read by the
+    # [ROTATE] calibration log and the rotate_home_tolerance_deg warning.
+    rotate_current_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -340,8 +346,18 @@ class SchedulerSettings:
     # fallback is armed.  Prevents accepting "stable" at the starting position
     # if the PLC servo start latency exceeds the stability window.
     evaluate_stability_arm_mm: float = 3.0
-    # Offset added to the vision angle_deg before sending rotate_absolute.
-    rotate_offset_deg: float = 0.0
+    # Bin orientation for the post-grip normalisation (R-frame RADIANS; the
+    # config key `rotate_offset_deg` stays in degrees for readability and is
+    # converted once in from_config).
+    rotate_offset_rad: float = 0.0
+    # Direction of the Siemens suction axis relative to the R-frame CCW
+    # convention: +1.0 = matches, -1.0 = inverted. Calibrate with
+    # `python3 -m modules.test_rotate` (config key `rotate_sign`).
+    rotate_sign: float = 1.0
+    # Warn when the cup is not back at 0 (within this many degrees) by the time
+    # the pick fires. 0 disables the check. Warn-only: the positional gate must
+    # never be delayed by the rotation axis.
+    rotate_home_tolerance_deg: float = 0.0
     # test_acceptance stops after exactly this many completed picks (ignores --duration).
     test_acceptance_cycles: int = 9
     # Initial/static belt speed (mm/s): used as production's startup setpoint before
@@ -388,6 +404,11 @@ class SchedulerSettings:
     # top-level limit_radius_xy. Used to reject an oblique-descent park point
     # that would fall outside the mechanism's reach before it is dispatched.
     limit_radius_xy: float = 180.0
+    # Oblique (belt-tracking) descent. When OFF (default) the pick descends
+    # straight down to the predicted point (known-good). When ON, only the pick-
+    # phase contact point is slanted DOWNSTREAM by v*t_d so the cup tracks the
+    # object during the short pre_pick->pickup drop; the goto/park is unchanged.
+    oblique_descent_enabled: bool = False
 
     def validate(self) -> None:
         # In physical delta coordinates (negative Z), values closer to 0 are higher (closer to base).
@@ -542,7 +563,15 @@ class SchedulerSettings:
             evaluate_stability_arm_mm=float(
                 scheduler_raw.get("evaluate_stability_arm_mm", 3.0)
             ),
-            rotate_offset_deg=float(scheduler_raw.get("rotate_offset_deg", 0.0)),
+            rotate_offset_rad=math.radians(
+                float(scheduler_raw.get("rotate_offset_deg", 0.0))
+            ),
+            rotate_sign=(
+                1.0 if float(scheduler_raw.get("rotate_sign", 1.0)) >= 0.0 else -1.0
+            ),
+            rotate_home_tolerance_deg=float(
+                scheduler_raw.get("rotate_home_tolerance_deg", 0.0)
+            ),
             test_conveyor_belt_speed_mm_s=float(
                 scheduler_raw.get("test_conveyor_belt_speed_mm_s", 50.0)
             ),
@@ -580,6 +609,9 @@ class SchedulerSettings:
                 conveyor_raw.get("velocity_ema_alpha", 0.4)
             ),
             limit_radius_xy=float(getattr(config, "limit_radius_xy", 180.0)),
+            oblique_descent_enabled=bool(
+                scheduler_raw.get("oblique_descent_enabled", False)
+            ),
         )
         settings.validate()
         return settings
@@ -816,6 +848,10 @@ class RealtimePickExecutor:
         status_poll_interval_s: float,
         position_tolerance_mm: float = 5.0,
         ipc_lock: threading.Lock | None = None,
+        rotate_home_tolerance_deg: float = 0.0,
+        rotate_offset_rad: float = 0.0,
+        rotate_sign: float = 1.0,
+        rotate_refresh_max_delta_deg: float = 15.0,
     ) -> None:
         self._dispatch_fn = dispatch
         self._request_status_fn = request_status
@@ -825,6 +861,18 @@ class RealtimePickExecutor:
         self.position_tolerance_mm = max(float(position_tolerance_mm), 0.0)
         self.ipc_lock = ipc_lock or threading.Lock()
         self.round_trip = _RoundTripTracker()
+        # 0 disables the pick-time "cup back at 0 yet?" warning (see execute()).
+        self.rotate_home_tolerance_deg = max(float(rotate_home_tolerance_deg), 0.0)
+        # Mirrors SchedulerSettings.rotate_offset_rad/rotate_sign (main.py wires
+        # these from the same `scheduler.rotate_offset_deg`/`rotate_sign` config
+        # keys) so the post-grip rotate can be refreshed from the object's latest
+        # tracked heading at the gate, not just the plan-build-time snapshot.
+        self.rotate_offset_rad = float(rotate_offset_rad)
+        self.rotate_sign = 1.0 if float(rotate_sign) >= 0.0 else -1.0
+        # Reject the gate-time refresh if it swings more than this many degrees
+        # from the plan-build heading (likely a vision glitch, not a real
+        # refinement). 0 disables the refresh entirely.
+        self.rotate_refresh_max_delta_deg = max(float(rotate_refresh_max_delta_deg), 0.0)
 
     def dispatch(self, packet: dict[str, Any]) -> dict[str, Any] | None:
         with self.ipc_lock:
@@ -867,7 +915,7 @@ class RealtimePickExecutor:
         status = self.dispatch(goto_packet)
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
-        # Home the suction axis to logical 0 while the arm flies to the park
+        # Home the suction axis to 0 rad while the arm flies to the park
         # point: the cup grips at 0 and the board is normalised to the bin
         # orientation only AFTER grip (see the post-grip rotate below). Off the
         # critical path — the target angle is known since plan build and the
@@ -889,6 +937,66 @@ class RealtimePickExecutor:
             plan.status = "aborted"
             return False
         gate_fired_at = time.monotonic()
+        # Refresh the post-grip rotate target from the object's latest tracked
+        # heading: the plan was built from the first sighting, but vision keeps
+        # refining the marker-vector angle for as long as the object stays in
+        # the camera ROI (observed drift up to a few degrees in practice).
+        # Reject the refresh if it swings further than rotate_refresh_max_delta_deg
+        # from the plan-build heading — that is a vision glitch (e.g. a dropped
+        # marker forcing the OBB symmetry-fold fallback), not a refinement.
+        if self.rotate_refresh_max_delta_deg > 0.0:
+            with state.state_lock:
+                tracked_obj = _find_tracked_object(state.tracker, plan.object_id)
+                rotation_rad_now = tracked_obj.rotation_rad if tracked_obj is not None else None
+            plan_heading_deg = plan.debug_info.get("board_heading_deg")
+            if rotation_rad_now is not None and plan_heading_deg is not None:
+                heading_now_deg = math.degrees(rotation_rad_now)
+                delta_deg = abs(((heading_now_deg - plan_heading_deg + 180.0) % 360.0) - 180.0)
+                if delta_deg <= self.rotate_refresh_max_delta_deg:
+                    plan.rotate_rad = wrap_rad(
+                        self.rotate_sign * (self.rotate_offset_rad - rotation_rad_now)
+                    )
+                    plan.debug_info["board_heading_at_gate_deg"] = round(heading_now_deg, 2)
+                else:
+                    print(
+                        "[WARN]",
+                        json.dumps(
+                            {
+                                "plan_id": plan.plan_id,
+                                "event": "rotate_refresh_outlier",
+                                "plan_board_heading_deg": plan_heading_deg,
+                                "latest_board_heading_deg": round(heading_now_deg, 2),
+                                "delta_deg": round(delta_deg, 2),
+                            },
+                            ensure_ascii=True,
+                        ),
+                        flush=True,
+                    )
+        # Cup-angle snapshot at the gate: shows the home-to-0 residual (grip
+        # while the axis is still travelling => random orientation error).
+        with state.state_lock:
+            rotate_at_gate = state.rotate_current_deg
+        home_tol = self.rotate_home_tolerance_deg
+        if (
+            home_tol > 0.0
+            and rotate_at_gate is not None
+            and abs(rotate_at_gate) > home_tol
+        ):
+            # Warn-only by design: delaying the positional gate would miss the
+            # object. If this fires often the axis is too slow for the cycle.
+            print(
+                "[WARN]",
+                json.dumps(
+                    {
+                        "plan_id": plan.plan_id,
+                        "event": "rotate_home_incomplete",
+                        "rotate_at_gate_deg": round(rotate_at_gate, 2),
+                        "tolerance_deg": home_tol,
+                    },
+                    ensure_ascii=True,
+                ),
+                flush=True,
+            )
 
         print(
             "[EXEC]",
@@ -923,11 +1031,36 @@ class RealtimePickExecutor:
             gate_fired_at=gate_fired_at,
             dispatched_at=dispatched_at,
             belt_speed_mm_s=belt_speed_at_grip,
-            post_grip_rotate_deg=plan.rotate_deg,
+            post_grip_rotate_rad=plan.rotate_rad,
             pre_pick_z=plan.trajectory_goto[-1].z,
         ):
             plan.status = "failed"
             return False
+        # Rotation-calibration datum (one line per pick): commanded angles from
+        # the plan vs measured cup angle at the gate (home-to-0 residual) and at
+        # the trajectory end (mid-rotation release check). All degrees.
+        with state.state_lock:
+            rotate_at_end = state.rotate_current_deg
+        print(
+            "[ROTATE]",
+            json.dumps(
+                {
+                    "plan_id": plan.plan_id,
+                    "vision_angle_deg": plan.debug_info.get("vision_angle_deg"),
+                    "board_heading_deg": plan.debug_info.get("board_heading_deg"),
+                    "board_heading_at_gate_deg": plan.debug_info.get("board_heading_at_gate_deg"),
+                    "rotate_cmd_deg": round(math.degrees(plan.rotate_rad), 2),
+                    "rotate_at_gate_deg": (
+                        round(rotate_at_gate, 2) if rotate_at_gate is not None else None
+                    ),
+                    "rotate_at_end_deg": (
+                        round(rotate_at_end, 2) if rotate_at_end is not None else None
+                    ),
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
         plan.status = "completed"
         return True
 
@@ -941,7 +1074,7 @@ class RealtimePickExecutor:
         gate_fired_at: float | None = None,
         dispatched_at: float | None = None,
         belt_speed_mm_s: float | None = None,
-        post_grip_rotate_deg: float | None = None,
+        post_grip_rotate_rad: float | None = None,
         pre_pick_z: float | None = None,
     ) -> bool:
         target = _packet_final_target(packet)
@@ -957,7 +1090,29 @@ class RealtimePickExecutor:
         # (descended to contact) AND lifted back up to the pre-pick height, so
         # the board is clear of the belt before it is turned to the bin
         # orientation. None => nothing to rotate (e.g. goto phase).
-        rotate_dispatched = post_grip_rotate_deg is None or pre_pick_z is None
+        rotate_dispatched = post_grip_rotate_rad is None or pre_pick_z is None
+        # Wider (not the +2mm contact_z band _contact_logged_ uses for [GATE]
+        # calibration) descent marker: the whole pick-height dip is only ~13mm
+        # and the interpolator doesn't dwell at the bottom, so the 50ms pose
+        # poll was missing the narrow contact_z+2mm band on roughly half of
+        # real picks (confirmed against a production log: those picks' [GATE]
+        # line never printed AND the post-grip rotate never fired, leaving the
+        # cup at its home angle — not a PLC/ST retrigger issue). Using the
+        # midpoint between pre_pick_z and contact_z gives the poll a much wider
+        # window to catch, and the time-based fallback below is the backstop
+        # that makes a miss impossible regardless of sampling luck.
+        descent_seen = rotate_dispatched
+        descent_mid_z: float | None = None
+        rotate_fallback_deadline: float | None = None
+        if not rotate_dispatched:
+            descent_mid_z = (
+                (pre_pick_z + contact_z) / 2.0 if contact_z is not None else pre_pick_z
+            )
+            if dispatched_at is not None:
+                modeled_s = plan.descend_time_s
+                if len(plan.trajectory_pick) >= 2:
+                    modeled_s += plan.trajectory_pick[1].time_s
+                rotate_fallback_deadline = dispatched_at + modeled_s + _ROTATE_FALLBACK_MARGIN_S
 
         while True:
             now = time.monotonic()
@@ -968,15 +1123,19 @@ class RealtimePickExecutor:
             )
             with state.state_lock:
                 pose = state.robot_pose
-            if not contact_logged and pose is not None and pose[2] <= contact_z + 2.0:
+
+            def _log_gate(contact_observed: bool) -> None:
                 # T_delay calibration datum (doc/theory_basis.md §6.4): true
                 # dispatch->contact latency vs the configured robot_movement_delay_s.
-                contact_logged = True
+                # contact_observed=False means the narrow contact_z+2mm band was
+                # missed by the poll — the timing below is a degraded estimate
+                # (later than the true contact instant), kept rather than lost.
                 print(
                     "[GATE]",
                     json.dumps(
                         {
                             "plan_id": plan.plan_id,
+                            "contact_observed": contact_observed,
                             "gate_to_dispatch_s": round(
                                 (dispatched_at or now) - (gate_fired_at or now), 4
                             ),
@@ -993,19 +1152,42 @@ class RealtimePickExecutor:
                     ),
                     flush=True,
                 )
-            if (
-                not rotate_dispatched
-                and contact_logged
-                and pose is not None
-                and pose[2] >= pre_pick_z
+
+            if not contact_logged and pose is not None and pose[2] <= contact_z + 2.0:
+                contact_logged = True
+                _log_gate(contact_observed=True)
+            if not descent_seen and pose is not None and pose[2] <= descent_mid_z:
+                descent_seen = True
+            if not rotate_dispatched and (
+                (descent_seen and pose is not None and pose[2] >= pre_pick_z)
+                or (rotate_fallback_deadline is not None and now >= rotate_fallback_deadline)
             ):
                 # Board gripped and lifted clear — turn it to the bin orientation.
+                # (Or the modeled-time fallback fired: the pose poll never caught
+                # a sample confirming it, but the trajectory has certainly moved
+                # past this point by now — dispatch anyway rather than never.)
+                if not contact_logged:
+                    # The narrow +2mm contact band was missed entirely; this is
+                    # the best evidence we have that contact happened, so log a
+                    # degraded [GATE] datum instead of losing the calibration
+                    # sample outright.
+                    contact_logged = True
+                    _log_gate(contact_observed=False)
+                if not descent_seen:
+                    print(
+                        "[WARN]",
+                        json.dumps(
+                            {"plan_id": plan.plan_id, "event": "rotate_dispatch_fallback"},
+                            ensure_ascii=True,
+                        ),
+                        flush=True,
+                    )
                 rotate_dispatched = True
                 try:
                     self.dispatch({
                         "commandID": COMMAND_ID["rotate_absolute"],
                         "CommandID": COMMAND_ID["rotate_absolute"],
-                        "rotate": post_grip_rotate_deg,
+                        "rotate": post_grip_rotate_rad,
                         "speed": 0.0,
                     })
                 except Exception as s_exc:
@@ -1177,27 +1359,32 @@ def _descent_time_s(settings: SchedulerSettings, belt_speed_mm_s: float) -> floa
     return _seg(math.hypot(dz, slant))
 
 
-def _park_position(
+def _contact_position(
     frame: ConveyorFrame,
     settings: SchedulerSettings,
     pick_position: Position3D,
     belt_speed_mm_s: float,
 ) -> tuple[Position3D, float]:
-    """Upstream park point for the oblique descent, and its descent time t_d.
+    """Downstream contact point for the oblique (belt-tracking) descent, and the
+    modeled descent time t_d.
 
-    The arm waits at ``park`` (pre_pick height, offset upstream along the belt by
-    v*t_d); when the pick fires it slants down-and-downstream to ``pick_position``
-    (contact), tracking the object so the cup and board share zero relative
-    velocity at contact. At belt speed 0 the offset is 0 (vertical descent)."""
+    The arm parks ABOVE ``pick_position`` (the predicted object-arrival point, at
+    pre_pick height — unchanged from the straight-down logic). During the short
+    pre_pick->pickup drop the object keeps moving, so the pick-phase contact is
+    shifted DOWNSTREAM along the belt (+u_hat) by v*t_d, letting the descent slant
+    to track it. When the oblique descent is disabled (or belt speed 0) the offset
+    is 0 and the contact coincides with ``pick_position`` (vertical descent)."""
     t_d = _descent_time_s(settings, belt_speed_mm_s)
+    if not settings.oblique_descent_enabled:
+        return (pick_position[0], pick_position[1], settings.pickup_height), t_d
     offset = max(0.0, belt_speed_mm_s) * t_d
     u_x, u_y = frame.u_hat
-    park: Position3D = (
-        pick_position[0] - u_x * offset,
-        pick_position[1] - u_y * offset,
-        settings.pre_pick_height,
+    contact: Position3D = (
+        pick_position[0] + u_x * offset,
+        pick_position[1] + u_y * offset,
+        settings.pickup_height,
     )
-    return park, t_d
+    return contact, t_d
 
 
 def _adaptive_belt_speed(n_objects: int, settings: SchedulerSettings) -> float:
@@ -1266,6 +1453,12 @@ _GATE_CRITICAL_LEAD_S = 2.0
 # Throttle for the opportunistic commits issued from the executor wait loops and
 # the idle main loop (each commit costs one Siemens round-trip on ipc_lock).
 _OPPORTUNISTIC_COMMIT_INTERVAL_S = 0.75
+
+# Safety margin added on top of the modeled dispatch->contact->lift-past-pre_pick
+# time before the post-grip rotate is force-dispatched even if the 50 ms pose
+# poll never sampled a point inside the (narrow, fast-transited) descent/lift
+# window (see _wait_for_arm_arrival's rotate_fallback_deadline).
+_ROTATE_FALLBACK_MARGIN_S = 0.3
 
 
 def _commit_adaptive_speed(
@@ -1347,14 +1540,11 @@ def _object_pick_gate_status(state: RealtimeState, plan: PickPlan) -> dict[str, 
             plan.predicted_pick_position_2d[1],
         )
         # Lead budget = dispatch->grip delay + gate sampling staleness (poll /2 +
-        # perception tick /2) + the modeled oblique-descent time. The object must
-        # travel from gate-fire all the way to contact, which now includes the
-        # park->contact descent, so the gate fires that much earlier.
-        command_delay_s = (
-            state.command_delay_s
-            + state.gate_sampling_latency_s
-            + plan.descend_time_s
-        )
+        # perception tick /2). The gate fires when the object reaches the park
+        # (pick_position); the oblique descent (if enabled) then SLANTS to follow
+        # the object during t_d, so the descent time must NOT be added here (doing
+        # so double-counted the object's travel and fired the gate far too early).
+        command_delay_s = state.command_delay_s + state.gate_sampling_latency_s
     threshold = u_pick - _belt_lead_offset_mm(speed, command_delay_s)
     return {
         "reached": u_now >= threshold,
@@ -1481,7 +1671,7 @@ class EvaluateExecutor:
         single-thread loop can use this class as a drop-in real-hardware backend
         without a belt-gate (their objects are static, not tracked on a moving belt)."""
         del log_samples, real_time, scenario_name
-        self.execute_evaluate(plan, self.metrics, rotate_deg=plan.rotate_deg)
+        self.execute_evaluate(plan, self.metrics, rotate_rad=plan.rotate_rad)
         return plan.status == "completed"
 
     def execute_evaluate(
@@ -1489,7 +1679,7 @@ class EvaluateExecutor:
         plan: "PickPlan",
         metrics: EvaluateMetrics,
         *,
-        rotate_deg: float | None = None,
+        rotate_rad: float | None = None,
     ) -> "Position3D | None":
         packets = plan.to_robot_packets(self.interpolar_points)
         goto_end = (
@@ -1509,7 +1699,7 @@ class EvaluateExecutor:
                     self._locked_dispatch({
                         "commandID": COMMAND_ID["rotate_absolute"],
                         "CommandID": COMMAND_ID["rotate_absolute"],
-                        "rotate": 0.0 if rotate_deg is None else rotate_deg,
+                        "rotate": 0.0 if rotate_rad is None else rotate_rad,
                         "speed": 0.0,
                     })
                 except Exception as exc:
@@ -1888,18 +2078,19 @@ class PickScheduler:
             raise RuntimeError("Unable to build pick plan for an unreachable detection.")
 
         predicted_pick_time, pick_dispatch_time, pick_position = prediction
-        # Oblique descent: the arm parks upstream (park_position) and slants down
-        # to pick_position (contact) so the cup tracks the moving object. The goto
-        # ends at the PARK point; the pick trajectory starts at CONTACT, so the
-        # goto-P7 -> pick-P1 segment is the belt-tracking descent. At belt speed 0
-        # (static scenarios) park == contact XY, degenerating to a vertical drop.
+        # The arm parks ABOVE pick_position (the predicted object-arrival point,
+        # pre_pick height) exactly as the straight-down logic — the goto is
+        # unchanged and stays inside the workspace. Only the pick-phase CONTACT is
+        # shifted downstream (+u_hat by v*t_d) when the oblique descent is enabled,
+        # so the short pre_pick->pickup drop slants to track the moving object. At
+        # belt speed 0 or with the flag off, contact == pick_position (vertical).
         belt_speed_uv = self.latest_speed.speed_uv if self.latest_speed is not None else 0.0
-        park_position, descend_time_s = _park_position(
+        contact_position, descend_time_s = _contact_position(
             self.frame, self.settings, pick_position, belt_speed_uv
         )
         goto_points = _build_goto_geometry(
             self.current_position,
-            park_position,
+            pick_position,
             self.settings,
         )
         goto_times = _build_goto_timing(
@@ -1917,13 +2108,13 @@ class PickScheduler:
         ]
 
         pick_points = _build_pick_geometry(
-            pick_position,
+            contact_position,
             sorting_position,
             self.settings,
             goto_points,
         )
         pick_times = _build_pick_timing(
-            pick_position,
+            contact_position,
             pick_points,
             self.settings,
             goto_points,
@@ -1949,14 +2140,17 @@ class PickScheduler:
         self.metrics.total_planning_latency += max(now - obj.last_seen_at, 0.0)
         self.metrics.planning_events += 1
 
-        # Normalise-to-zero suction angle. The rotation now happens AFTER grip
-        # (board attached), so we drive the axis to cancel the board's R-frame
-        # heading (vision heading + frame theta), landing every board in the bin
-        # at a uniform orientation. Wrapped to [-180,180) so the axis takes the
-        # short way. NOTE: sign + rotate_offset_deg to be verified on the first
-        # hardware run (a board at a known angle) — see doc/theory_basis.md.
-        board_heading_deg = math.degrees(obj.rotation_rad) + math.degrees(self.frame.theta_rad)
-        rotate_deg = wrap_angle_180(self.settings.rotate_offset_deg - board_heading_deg)
+        # Normalise-to-zero suction angle. The rotation happens AFTER grip
+        # (board attached): drive the axis to cancel the board's R-frame heading
+        # (obj.rotation_rad — already converted from the vision angle at ingest)
+        # so every board lands in the bin at the `rotate_offset_deg` orientation.
+        # rotate_sign flips the whole command if the physical axis turns opposite
+        # to the R-frame CCW convention (calibrate with modules/test_rotate).
+        # The wrap to [-pi, pi) is by itself the shortest-way rotation.
+        rotate_rad = wrap_rad(
+            self.settings.rotate_sign
+            * (self.settings.rotate_offset_rad - obj.rotation_rad)
+        )
 
         return PickPlan(
             plan_id=f"plan-{self.plan_counter:06d}",
@@ -1974,12 +2168,16 @@ class PickScheduler:
             trajectory_pick=trajectory_pick,
             object_uv_anchor=obj.conveyor_uv,
             belt_pos_anchor=self.latest_speed.position_mm,
-            rotate_deg=rotate_deg,
+            rotate_rad=rotate_rad,
             descend_time_s=descend_time_s,
             debug_info={
                 "pick_position_3d": pick_position,
-                "park_position_3d": park_position,
+                "contact_position_3d": contact_position,
                 "descend_time_s": descend_time_s,
+                # [ROTATE] calibration log inputs (degrees for readability).
+                "vision_angle_deg": round(obj.vision_angle_deg, 2),
+                "board_heading_deg": round(math.degrees(obj.rotation_rad), 2),
+                "rotate_cmd_deg": round(math.degrees(rotate_rad), 2),
                 "timing_formula": {
                     "t_p_real": pick_dispatch_time,
                     "t_p_theory": predicted_pick_time,
@@ -2128,13 +2326,10 @@ def _predict_realtime_pick_position(
 
     pick_xy = scheduler.frame.to_robot(u_pick, v_now)
     pick_position: Position3D = (pick_xy[0], pick_xy[1], settings.pickup_height)
-    # Oblique-descent park point (upstream). Reject the candidate if the arm
-    # cannot physically reach the park XY — it is where the arm actually waits,
-    # and dispatching an out-of-reach goto would trip WorkspaceLimitError.
-    park_position, _ = _park_position(scheduler.frame, settings, pick_position, belt_speed)
-    if not is_within_xy_limit(park_position[0], park_position[1], settings.limit_radius_xy):
-        return None
-    goto_points = _build_goto_geometry(scheduler.current_position, park_position, settings)
+    # The arm parks above pick_position (in-workspace); the oblique descent only
+    # slants the pick-phase contact, so the goto reachability is on pick_position
+    # itself, exactly as the straight-down logic.
+    goto_points = _build_goto_geometry(scheduler.current_position, pick_position, settings)
     goto_total = _trajectory_total_time(goto_points, settings)
     arm_arrival_time = now + command_delay_s + goto_total
     if arm_arrival_time > final_pick_time:
@@ -2841,6 +3036,12 @@ def _run_realtime_pick_loop(
                 measured_speed = float(last_status["speed_current"])
             except (TypeError, ValueError):
                 measured_speed = None
+        rotate_current: float | None = None
+        if isinstance(last_status, dict) and last_status.get("rotate_current") is not None:
+            try:
+                rotate_current = float(last_status["rotate_current"])
+            except (TypeError, ValueError):
+                rotate_current = None
         with state.state_lock:
             state.latest_speed = sample
             state.belt_position_mm = sample.position_mm
@@ -2848,6 +3049,8 @@ def _run_realtime_pick_loop(
             state.robot_pose = pose
             state.end_effector = end_effector
             state.belt_speed_measured_mm_s = measured_speed
+            if rotate_current is not None:
+                state.rotate_current_deg = rotate_current
             scheduler.latest_speed = sample
             scheduler.ingest_detections(
                 detections, sample.position_mm,
@@ -2869,6 +3072,7 @@ def _run_realtime_pick_loop(
                     "y": round(y_r, 2),
                     "u": round(u_now, 1),
                     "zone": _belt_zone_label(u_now, settings),
+                    "vision_angle_deg": round(obj.vision_angle_deg, 2),
                 })
             removed = _prune_unclaimed_tracker(
                 scheduler.tracker,
@@ -3245,6 +3449,7 @@ def run_scheduler_scenario(
                 "y": round(y_r, 2),
                 "u": round(u_now, 1),
                 "zone": _belt_zone_label(u_now, settings),
+                "vision_angle_deg": round(obj.vision_angle_deg, 2),
             })
         if tracked_objs:
             detect_payload = {

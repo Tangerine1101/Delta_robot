@@ -27,8 +27,8 @@
         "frame": {
             "theta_deg": 28.0,
             "robot_origin_uv": [
-                298.0,
-                66.0
+                287.0,
+                88.0
             ]
         },
         "camera_window_uv": [
@@ -62,14 +62,14 @@
         ]
     },
     "QFP": [
-        95.58,
-        41.76,
-        -260.0
+        148.18,
+        -40.0,
+        -280.0
     ],
     "TQFP": [
-        114.36,
-        6.44,
-        -260.0
+        117.3,
+        21.69,
+        -280.0
     ],
     "vision": {
         "model_weights": "models/nano@1920/weights/best.pt",
@@ -137,6 +137,10 @@
             },
             "cross_check": false,
             "offset_deg": 0.0,
+            "offset_by_class": {
+                "QFP": 0.0,
+                "TQFP": 0.0
+            },
             "symmetry_deg": 180,
             "symmetry_by_class": {
                 "TQFP": 180,
@@ -187,7 +191,10 @@
         ],
         "robot_movement_delay_s": 0.01,
         "ethernet_delay_s": 0.00,
-        "rotate_offset_deg": 0.0,
+        "rotate_offset_deg": -62.0,
+        "rotate_sign": 1,
+        "rotate_home_tolerance_deg": 0.0,
+        "rotate_refresh_max_delta_deg": 15.0,
         "test_acceptance_cycles": 9,
         "accuracy_spawn_uv": [
             [
@@ -207,12 +214,13 @@
             "TQFP"
         ],
         "adaptive_speed_enabled": true,
+        "oblique_descent_enabled": false,
         "test_conveyor_belt_speed_mm_s": 50.0,
-        "pick_cycle_s": 2,
-        "pick_transit_min_s": 1.6,
-        "belt_speed_headroom": 0.5,
-        "belt_speed_min_mm_s": 20.0,
-        "belt_speed_max_mm_s": 160.0,
+        "pick_cycle_s": 2.5,
+        "pick_transit_min_s": 0.8,
+        "belt_speed_headroom": 0.4,
+        "belt_speed_min_mm_s": 10.0,
+        "belt_speed_max_mm_s": 120.0,
         "belt_speed_hw_max_mm_s": 200.0,
         "belt_speed_deadband_mm_s": 5.0,
         "belt_speed_max_step_mm_s": 20.0,

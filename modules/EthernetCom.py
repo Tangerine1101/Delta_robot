@@ -75,27 +75,63 @@ ARRAY_FIELDS = ("argument_x", "argument_y", "argument_z", "argument_e", "argumen
 
 
 # --- Suction rotation angle convention -------------------------------------
-# The PC/scheduler works in a LOGICAL angle in [-180, 180) so the 4th-DOF axis
-# only ever turns the short way (a board at logical +170 is +170, never -190).
-# The Siemens ST program, however, has its rotation limit HARDCODED to [0, 360),
-# so the IPC boundary remaps logical -> physical by a +180 shift (-180 -> 0,
-# 0 -> 180, ~180 -> ~360) and status feedback is mapped back the other way. Do
-# the remap ONLY for rotate_absolute (command 7); change_speed (8) also carries
-# a rotate field but the PLC ignores it, and shifting it would spin the cup.
+# Three layers, one unit each, converted only at the boundaries:
+#   1. vision measures a marker heading on image pixels (degrees) and converts
+#      it ONCE into an R-frame heading in RADIANS (conveyor.py,
+#      vision_heading_to_robot_rad) — 0 = robot +X axis, positive = CCW seen
+#      from above, wrapped to [-pi, pi).
+#   2. the scheduler computes everything in R-frame radians; the wrap to
+#      [-pi, pi) is by itself the shortest-way rotation (<= 180 deg). The
+#      "rotate" field of a rotate_absolute (7) packet carries this radian value.
+#   3. the Siemens rotation axis accepts signed degrees in [-360, 360] and uses
+#      the SAME zero as the R-frame (0 deg = 0 rad). Crucially the PLC command
+#      encodes both the axis position AND the direction of travel in the numeric
+#      value, so the IPC boundary (main.py _worker) must be VERBATIM: plain
+#      radians->degrees with NO wrap, only clamped to [-359, 359] (the
+#      teammate's ST misbehaves at exactly +/-360 — it can flip direction).
+#      Do NOT wrap here: an earlier revision wrapped to [-180, 180), which turned
+#      180 -> -180 and 270 -> -90 on the wire; because the sign selects the spin
+#      direction, that made e.g. a 179->180 step drive the axis the long way
+#      round instead of +1 deg (the "random"/over-rotation symptom). The
+#      minimal-turn decision belongs upstream (scheduler wraps rotate_rad once,
+#      relative to the homed 0), not at this boundary. Convert ONLY for
+#      rotate_absolute (command 7); change_speed (8) also carries a rotate field
+#      but the PLC ignores it, and touching it would spin the cup.
+
+# Siemens rotation-axis limit (deg). Kept off the exact +/-360 edge on purpose.
+ROTATE_WIRE_LIMIT_DEG = 359.0
+
 
 def wrap_angle_180(angle_deg: float) -> float:
     """Wrap an angle (degrees) into the half-open interval [-180, 180)."""
     return (float(angle_deg) + 180.0) % 360.0 - 180.0
 
 
-def logical_to_physical_rotate(logical_deg: float) -> float:
-    """Logical [-180, 180) suction angle -> Siemens physical [0, 360)."""
-    return wrap_angle_180(logical_deg) + 180.0
+def wrap_rad(angle_rad: float) -> float:
+    """Wrap an angle (radians) into the half-open interval [-pi, pi)."""
+    return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def physical_to_logical_rotate(physical_deg: float) -> float:
-    """Siemens physical [0, 360) rotate feedback -> logical [-180, 180)."""
-    return wrap_angle_180(float(physical_deg) - 180.0)
+def robot_rad_to_wire_deg(angle_rad: float) -> float:
+    """R-frame suction angle (radians) -> Siemens wire degrees, VERBATIM.
+
+    Identity zero (0 rad = 0 deg), NO wrap: the caller's exact angle is sent so
+    the PLC — whose command value encodes spin direction as well as position —
+    turns the intended way. Only clamped to [-359, 359] to stay off the +/-360
+    edge. (Shortest-turn selection is done upstream in the scheduler, once,
+    relative to the homed 0 — not here, where wrapping would flip 180 -> -180.)
+    """
+    deg = math.degrees(angle_rad)
+    return max(-ROTATE_WIRE_LIMIT_DEG, min(ROTATE_WIRE_LIMIT_DEG, deg))
+
+
+def wire_deg_to_robot_rad(wire_deg: float) -> float:
+    """Siemens wire degrees feedback -> R-frame radians, VERBATIM (identity zero).
+
+    No wrap, so status feedback shows the PLC's true angle (270 stays 270, not
+    pulled back to -90).
+    """
+    return math.radians(float(wire_deg))
 
 # Commands whose argument_x/argument_y carry ABSOLUTE robot-frame coordinates and
 # must therefore be checked against the physical reach limit. goto_relative (1)

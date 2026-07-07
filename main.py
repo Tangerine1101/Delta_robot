@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import multiprocessing as mp
 from queue import Empty
 from typing import Any
@@ -10,8 +11,8 @@ from modules.EthernetCom import (
     PLCGateway,
     SiemensGateway,
     load_config,
-    logical_to_physical_rotate,
-    physical_to_logical_rotate,
+    robot_rad_to_wire_deg,
+    wire_deg_to_robot_rad,
 )
 from modules.cli import run_interactive
 from modules.interface import DashboardServer
@@ -87,13 +88,16 @@ def _worker(
                         try:
                             s_status = siemens_gateway.get_status()
                             if s_status is not None:
-                                rotate_phys = s_status.get("rotate_current")
+                                rotate_wire = s_status.get("rotate_current")
                                 status.update({
-                                    # Physical [0,360) feedback -> logical [-180,180)
-                                    # so logs/dashboard match the scheduler's units.
+                                    # Wire degrees [-359,359] feedback -> R-frame
+                                    # DEGREES, verbatim (identity zero, no wrap so
+                                    # the true PLC angle shows). Human-readable for
+                                    # logs/dashboard; radians live only inside the
+                                    # scheduler algorithm.
                                     "rotate_current": (
-                                        physical_to_logical_rotate(rotate_phys)
-                                        if rotate_phys is not None else None
+                                        math.degrees(wire_deg_to_robot_rad(rotate_wire))
+                                        if rotate_wire is not None else None
                                     ),
                                     "speed_current": s_status.get("speed_current"),
                                     "siemens_task_doing": s_status.get("task_doing"),
@@ -112,12 +116,13 @@ def _worker(
                     pkg = message["package"]
                     cmd_id = pkg.get("commandID")
                     if cmd_id in (7, 8, 9):
-                        # Siemens command. rotate_absolute (7) carries a LOGICAL
-                        # angle: remap to the PLC's physical [0,360) on the wire
-                        # only (echo the original logical pkg back to the caller).
+                        # Siemens command. rotate_absolute (7) carries an R-frame
+                        # angle in RADIANS: convert VERBATIM to wire degrees
+                        # [-359,359] (identity zero, no wrap) on the wire only
+                        # (echo the original radian pkg back to the caller).
                         if cmd_id == 7:
                             wire_pkg = dict(pkg)
-                            wire_pkg["rotate"] = logical_to_physical_rotate(
+                            wire_pkg["rotate"] = robot_rad_to_wire_deg(
                                 pkg.get("rotate", 0.0)
                             )
                         else:
@@ -378,6 +383,16 @@ def _run_scheduler(args: argparse.Namespace) -> None:
             wait_margin_s=wait_margin_s,
             status_poll_interval_s=status_poll_interval_s,
             position_tolerance_mm=pick_arrival_tolerance_mm,
+            rotate_home_tolerance_deg=float(
+                scheduler_config.get("rotate_home_tolerance_deg", 0.0)
+            ),
+            rotate_offset_rad=math.radians(
+                float(scheduler_config.get("rotate_offset_deg", 0.0))
+            ),
+            rotate_sign=float(scheduler_config.get("rotate_sign", 1.0)),
+            rotate_refresh_max_delta_deg=float(
+                scheduler_config.get("rotate_refresh_max_delta_deg", 15.0)
+            ),
         )
 
     server, iface_kwargs = _start_interface(args)

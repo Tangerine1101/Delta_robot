@@ -169,11 +169,13 @@ The rest of the latency chain needs no separate term — the encoder already rec
 
 ### 3.4. Oblique Intercept (Belt-Tracking Descent)
 
-A vertical descent at a fixed R-frame point makes contact with the cup and board at a horizontal *relative* velocity equal to the belt speed, dragging the board during suction settling. Instead the arm **parks upstream** and slants down to the contact point so it moves with the board:
+A vertical descent at a fixed R-frame point makes contact with the cup and board at a horizontal *relative* velocity equal to the belt speed, dragging the board during suction settling. The arm still **parks above the predicted arrival point** $\mathbf{p}_{\text{pick}}$ (unchanged from the straight-down logic, so the goto stays inside the workspace), but the pick-phase **contact point is shifted downstream** by the distance the board travels during the short descent:
 
-$$\mathbf{park} = \mathbf{p}_{\text{contact}} - \hat{u}\,\big(v_{\text{belt}}\cdot t_d\big), \qquad z_{\text{park}} = z_{\text{pre\_pick}}$$
+$$\mathbf{p}_{\text{contact}} = \mathbf{p}_{\text{pick}} + \hat{u}\,\big(v_{\text{belt}}\cdot t_d\big), \qquad z_{\text{park}} = z_{\text{pre\_pick}},\; z_{\text{contact}} = z_{\text{pickup}}$$
 
-where $\hat{u}$ is the belt-flow unit vector in the R-frame and $t_d$ is the modeled park→contact descent time (interpolator model, one fixed-point pass folding the belt slant into the segment length). Over $t_d$ the board advances $v_{\text{belt}}\cdot t_d$ and the cup covers the same displacement along $\hat{u}$, so they meet at $\mathbf{p}_{\text{contact}}$ with zero relative velocity. At $v_{\text{belt}}=0$ the offset vanishes and the descent is vertical. The pick gate therefore fires a lead of $v_{\text{belt}}\cdot(T_{\text{delay}} + t_{\text{sampling}} + t_d)$ ahead of the contact $u$.
+where $\hat{u}$ is the belt-flow unit vector in the R-frame ($+\hat{u}$ = downstream) and $t_d$ is the modeled descent time (interpolator model, one fixed-point pass folding the belt slant into the segment length). The pre\_pick→pickup drop therefore slants downstream, so the cup follows the board and meets it with near-zero relative velocity. At $v_{\text{belt}}=0$ (or when disabled) the offset vanishes and the descent is vertical. The gate is **unchanged**: it fires a lead of $v_{\text{belt}}\cdot(T_{\text{delay}} + t_{\text{sampling}})$ ahead of $\mathbf{p}_{\text{pick}}$ — the descent's own slant absorbs the $t_d$ travel, so $t_d$ is *not* added to the gate lead.
+
+> A superseded revision instead moved the *park/goto* upstream by $v_{\text{belt}}\cdot t_d$ and added $t_d$ to the gate lead; at operating belt speed that parked the arm upstream of $u_{\min}$ (outside the workspace, and past the reach circle at the adaptive cap). Only the **contact** is shifted, never the park. The feature is opt-in (`scheduler.oblique_descent_enabled`, default off); $t_d$ is over-estimated while `interp.a_max` (≈0.1 g) is uncalibrated, so at high belt speed the downstream contact can approach $u_{\max}$ — a calibration item, handled as a safe dispatch-reject rather than a clamp.
 
 ---
 
@@ -187,19 +189,31 @@ QFP/TQFP components have 180° rotational symmetry. YOLO-OBB only detects the ti
 3. **Heading Angle**:
    $$\theta_{\text{heading}} = \left(\text{atan2}(v_y, v_x) \cdot \frac{180}{\pi} + \theta_{\text{offset}}\right) \pmod{360}$$
 
-### 4.1. Rotation Timeline & Logical/Physical Angle Convention
+### 4.1. Rotation Timeline & Angle Convention (three layers, revised 2026-07-06)
 
-The suction rotation is **not** applied before the grip to pre-orient the cup; it is applied **after** the grip to normalise the *attached* board to a uniform bin orientation. Timeline: home the axis to logical 0 while the arm flies to the park point → gate fires → pick descends → once the arm lifts back to $z \ge z_{\text{pre\_pick}}$, rotate the board by
+The suction rotation is **not** applied before the grip to pre-orient the cup; it is applied **after** the grip to normalise the *attached* board to a uniform bin orientation. Timeline: home the axis to 0 while the arm flies to the park point → gate fires → pick descends → once the arm lifts back to $z \ge z_{\text{pre\_pick}}$, rotate the board.
 
-$$\theta_{\text{cmd}} = \text{wrap}_{180}\!\big(\theta_{\text{offset}} - (\theta_{\text{heading}} + \theta_{\text{frame}})\big)$$
+Angles live in exactly **three layers**, one unit each, converted only at the boundaries (the earlier "logical $[-180,180)$ degrees" middle layer was retired as confusing):
 
-where $\theta_{\text{frame}}$ is the camera→R-frame rotation (`ConveyorFrame.theta_rad`) and $\text{wrap}_{180}$ maps to $[-180,180)$ so the axis always turns the short way. This keeps the rotation command off the gate→contact critical path (it no longer sits between gate-fire and pick dispatch).
+**Layer 1 — measurement (image pixels → R-frame radians).** The vision heading $h$ (degrees) is the board→marker vector measured with `atan2(dx, dy)` on raw pixels, i.e. referenced to the image **+y (down)** axis. The ROI→C→R position chain (`M_VISION_TO_CONVEYOR` axis swap composed with $F$'s reflection block) is a pure $+\theta_{\text{frame}}$ rotation of angles measured CCW from the ROI x axis; the two references differ by exactly $-90°$. The single conversion point (`ConveyorFrame.vision_heading_to_robot_rad`) is therefore
 
-The PC works in this **logical** $[-180,180)$ angle, but the Siemens ST program has its rotation range hardcoded to $[0,360)$. The IPC boundary therefore remaps only `rotate_absolute`:
+$$\varphi_{\text{board}} = \text{wrap}_{\pi}\!\big(\text{rad}(h - 90°) + \theta_{\text{frame}}\big)$$
 
-$$\theta_{\text{physical}} = \text{wrap}_{180}(\theta_{\text{logical}}) + 180 \in [0,360), \qquad \theta_{\text{logical}} = \text{wrap}_{180}(\theta_{\text{physical}} - 180)$$
+with $\text{wrap}_{\pi}$ mapping to $[-\pi, \pi)$; $0$ = robot $+X$ axis, positive = CCW seen from above. Because the marker sits diagonally on the board (a corner dot on a square QFP is $\approx 45°$ off the edges), a **per-class constant** `vision.orientation.offset_by_class` is added to $h$ at measurement time (calibrated; falls back to the global `offset_deg`).
 
-(status feedback is mapped back so logs/dashboard stay logical). **The sign and $\theta_{\text{offset}}$ are unverified and must be calibrated on the first hardware run** with a board at a known angle.
+**Layer 2 — algorithm (R-frame radians only).** `TrackedObject.rotation_rad` stores $\varphi_{\text{board}}$; the plan's post-grip command is
+
+$$\theta_{\text{cmd}} = \text{wrap}_{\pi}\!\big(s \cdot (\theta_{\text{offset}} - \varphi_{\text{board}})\big)$$
+
+where $\theta_{\text{offset}}$ = `rotate_offset_deg` (config in degrees, converted once in `from_config`) is the bin orientation, and $s$ = `rotate_sign` $\in \{+1, -1\}$ flips the whole command if the physical axis turns opposite to the R-frame CCW convention (calibrated with `python3 -m modules.test_rotate`). The wrap to $[-\pi,\pi)$ is by itself the shortest-way rotation ($\le 180°$).
+
+**Layer 3 — wire (IPC boundary only).** The Siemens rotation axis accepts **signed degrees in $[-360, 360]$, shares the R-frame zero** ($0° = 0\,\text{rad}$), and its command value encodes **both the axis position and the direction of travel**. So `main.py`'s worker sends the angle **verbatim** — a plain radians→degrees identity with **no wrap**, only clamped to $[-359, 359]$:
+
+$$\theta_{\text{wire}} = \text{clamp}_{\pm 359}\!\big(\deg(\theta_{\text{cmd}})\big), \qquad \theta_{\text{cmd,fb}} = \text{rad}(\theta_{\text{wire}})$$
+
+(`robot_rad_to_wire_deg` / `wire_deg_to_robot_rad` in `EthernetCom.py`; the clamp keeps the axis off the $\pm 360$ edge, where the teammate's ST program can flip direction; status feedback is exposed verbatim in R-frame **degrees** for logs/dashboard). **The minimal-turn decision is made ONCE upstream** — the scheduler wraps $\theta_{\text{cmd}}$ to $[-\pi,\pi)$ relative to the homed $0$ (Layer 2) — **not at this boundary.** Wrapping here would map $180° \to -180°$ and $270° \to -90°$; because the sign selects the spin direction, a $179°\to180°$ step would then drive the axis nearly a full turn the wrong way instead of $+1°$ (the "random"/over-rotation symptom). **Superseded (2026-07-06):** two earlier revisions were wrong — first a $[0,360)$ premise with a $+180$ shift (drove "home to 0" to physical $180°$), then a $[-360,360]$ identity that still *wrapped* to $[-180,180)$ at the boundary (the $180\to-180$ flip above). Both removed.
+
+**Calibration & diagnostics.** `rotate_sign`, `rotate_offset_deg` and `offset_by_class` must be calibrated on hardware: (1) `python3 -m modules.test_rotate` — Siemens-only probe: remap/settle check, implied axis speed (deg/s), **visual** direction check (mark the cup; +90° must turn CCW from above, else `rotate_sign: -1`), and a cmd-7→cmd-7 retrigger test (DB1 has no handshake; if the ST edge-triggers on CommandID change, consecutive rotates are dropped). (2) One production/test run reading the per-pick `[ROTATE]` log (`vision_angle`, `board_heading`, `rotate_cmd`, `rotate_at_gate`, `rotate_at_end`): `rotate_at_gate` far from 0 ⇒ the home-to-0 did not finish before the grip (axis too slow for the cycle); `rotate_at_end` far from `rotate_cmd` ⇒ the board was released mid-rotation. `scheduler.rotate_home_tolerance_deg` (> 0 to enable) turns the first condition into a `[WARN]` at pick time — warn-only, the positional gate is never delayed.
 
 ---
 
