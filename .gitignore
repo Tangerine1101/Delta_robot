@@ -7,7 +7,7 @@ calib_result.jpg
 .venv/
 YOLO_OBB/
 .pdf
-.zip
+*.zip
 
 # LaTeX build artifacts (latexmk/pdflatex)
 *.aux

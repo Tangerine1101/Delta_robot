@@ -316,7 +316,6 @@ class SchedulerSettings:
     ethernet_delay_s: float
     workspace_window_uv: UVWindow            # (u_min, u_max, v_min, v_max) on belt
     camera_window_uv: UVWindow
-    conveyor_length_mm: float
     conveyor_position_scale_mm: float   # multiply incoming conveyor_position by this to get mm (1.0: PLC reports mm)
     object_dimensions: dict[str, tuple[float, float]]   # type -> (w_mm, h_mm)
     accuracy_points: list[Position3D]
@@ -333,7 +332,6 @@ class SchedulerSettings:
     sorting_positions: dict[str, Position3D]
     throughput_object_types: list[str]
     throughput_lanes: list[float]
-    throughput_spawn_x: float
     throughput_spawn_y: float
     throughput_emit_interval_s: float
     accuracy_emit_interval_s: float
@@ -362,8 +360,8 @@ class SchedulerSettings:
     test_acceptance_cycles: int = 9
     # Initial/static belt speed (mm/s): used as production's startup setpoint before
     # the adaptive controller takes over (and as the static belt speed if adaptive
-    # control is disabled). Name predates the now-retired test_conveyor scenario.
-    test_conveyor_belt_speed_mm_s: float = 50.0
+    # control is disabled).
+    belt_speed_static_mm_s: float = 50.0
     # PLC MC_Inter_Curve_Vel interpolator limits (mm/s, mm/s^2) and the State-10
     # soft-start duration (s). Used to compute EXACT trajectory times that mirror
     # the PLC, instead of the crude distance/nominal_speed estimate. Defaults from
@@ -379,7 +377,7 @@ class SchedulerSettings:
     # real mechanism via the speed_tuning validation.
     interp_scurve_shape_factor: float = 1.5
     # --- Adaptive belt speed (doc/theory_basis.md §6). Opt-in; when disabled the
-    # belt keeps the static test_conveyor_belt_speed_mm_s. The controller holds the
+    # belt keeps the static belt_speed_static_mm_s. The controller holds the
     # presentation rate lambda_nom = headroom / pick_cycle_s by setting belt speed
     # INVERSELY to product density: v = clamp(lambda_nom * L_meas / N, v_min, v_cap).
     adaptive_speed_enabled: bool = False
@@ -526,7 +524,6 @@ class SchedulerSettings:
                 conveyor_raw.get("camera_window_uv", [0.0, 200.0, -75.0, 75.0]),
                 (0.0, 200.0, -75.0, 75.0),
             ),
-            conveyor_length_mm=float(conveyor_raw.get("length_mm", 800.0)),
             conveyor_position_scale_mm=float(
                 conveyor_raw.get("conveyor_position_scale_mm", 10.0)
             ),
@@ -543,7 +540,6 @@ class SchedulerSettings:
             sorting_positions=sorting_positions,
             throughput_object_types=list(scheduler_raw.get("throughput_object_types", ["object_A"])),
             throughput_lanes=[float(value) for value in scheduler_raw.get("throughput_lanes", [-60.0, 0.0, 60.0])],
-            throughput_spawn_x=float(scheduler_raw.get("throughput_spawn_x", -180.0)),
             throughput_spawn_y=float(scheduler_raw.get("throughput_spawn_y", -180.0)),
             throughput_emit_interval_s=float(scheduler_raw.get("throughput_emit_interval_s", 0.35)),
             accuracy_emit_interval_s=float(scheduler_raw.get("accuracy_emit_interval_s", 0.8)),
@@ -572,8 +568,8 @@ class SchedulerSettings:
             rotate_home_tolerance_deg=float(
                 scheduler_raw.get("rotate_home_tolerance_deg", 0.0)
             ),
-            test_conveyor_belt_speed_mm_s=float(
-                scheduler_raw.get("test_conveyor_belt_speed_mm_s", 50.0)
+            belt_speed_static_mm_s=float(
+                scheduler_raw.get("belt_speed_static_mm_s", 50.0)
             ),
             test_acceptance_cycles=int(scheduler_raw.get("test_acceptance_cycles", 9)),
             interp_v_max=float(interpolator_raw.get("v_max", 300.0)),
@@ -847,6 +843,9 @@ class RealtimePickExecutor:
         wait_margin_s: float,
         status_poll_interval_s: float,
         position_tolerance_mm: float = 5.0,
+        position_tolerance_max_mm: float | None = None,
+        tolerance_speed_min_mm_s: float = 0.0,
+        tolerance_speed_max_mm_s: float = 0.0,
         ipc_lock: threading.Lock | None = None,
         rotate_home_tolerance_deg: float = 0.0,
         rotate_offset_rad: float = 0.0,
@@ -859,6 +858,18 @@ class RealtimePickExecutor:
         self.wait_margin_s = float(wait_margin_s)
         self.status_poll_interval_s = max(status_poll_interval_s, 0.02)
         self.position_tolerance_mm = max(float(position_tolerance_mm), 0.0)
+        # Speed-mapped arrival tolerance: linear ramp from position_tolerance_mm
+        # (at/below tolerance_speed_min_mm_s) to position_tolerance_max_mm
+        # (at/above tolerance_speed_max_mm_s). Ceiling <= floor or a degenerate
+        # speed range collapses to the static floor (old behavior).
+        ceiling = (
+            self.position_tolerance_mm
+            if position_tolerance_max_mm is None
+            else max(float(position_tolerance_max_mm), 0.0)
+        )
+        self.position_tolerance_max_mm = max(ceiling, self.position_tolerance_mm)
+        self.tolerance_speed_min_mm_s = max(float(tolerance_speed_min_mm_s), 0.0)
+        self.tolerance_speed_max_mm_s = max(float(tolerance_speed_max_mm_s), 0.0)
         self.ipc_lock = ipc_lock or threading.Lock()
         self.round_trip = _RoundTripTracker()
         # 0 disables the pick-time "cup back at 0 yet?" warning (see execute()).
@@ -873,6 +884,24 @@ class RealtimePickExecutor:
         # from the plan-build heading (likely a vision glitch, not a real
         # refinement). 0 disables the refresh entirely.
         self.rotate_refresh_max_delta_deg = max(float(rotate_refresh_max_delta_deg), 0.0)
+
+    def _arrival_tolerance_mm(self, belt_speed_mm_s: float | None) -> float:
+        """Arm-arrival tolerance for the current belt speed: linear between the
+        (speed_min -> tolerance floor) and (speed_max -> tolerance ceiling)
+        anchors, clamped outside. Falls back to the static floor when the
+        ceiling/speed range is degenerate or the speed is unknown."""
+        span = self.tolerance_speed_max_mm_s - self.tolerance_speed_min_mm_s
+        if (
+            belt_speed_mm_s is None
+            or span <= 0.0
+            or self.position_tolerance_max_mm <= self.position_tolerance_mm
+        ):
+            return self.position_tolerance_mm
+        fraction = (belt_speed_mm_s - self.tolerance_speed_min_mm_s) / span
+        fraction = min(max(fraction, 0.0), 1.0)
+        return self.position_tolerance_mm + fraction * (
+            self.position_tolerance_max_mm - self.position_tolerance_mm
+        )
 
     def dispatch(self, packet: dict[str, Any]) -> dict[str, Any] | None:
         with self.ipc_lock:
@@ -1123,6 +1152,10 @@ class RealtimePickExecutor:
             )
             with state.state_lock:
                 pose = state.robot_pose
+                live_belt_speed = state.belt_speed_mm_s
+            # Re-evaluated each iteration: adaptive speed can change mid-wait
+            # and the tolerance follows the live belt speed.
+            tolerance_mm = self._arrival_tolerance_mm(live_belt_speed)
 
             def _log_gate(contact_observed: bool) -> None:
                 # T_delay calibration datum (doc/theory_basis.md §6.4): true
@@ -1196,9 +1229,9 @@ class RealtimePickExecutor:
                 distance = _distance_3d(pose, target)
                 if static_accept_allowed is None:
                     static_accept_allowed = (
-                        distance <= self.position_tolerance_mm and expected_duration_s <= 0.25
+                        distance <= tolerance_mm and expected_duration_s <= 0.25
                     )
-                if distance > self.position_tolerance_mm:
+                if distance > tolerance_mm:
                     departed = True
                 elif departed or (
                     bool(static_accept_allowed)
@@ -3014,7 +3047,7 @@ def _run_realtime_pick_loop(
         frame=frame,
         ipc_lock=executor.ipc_lock,
         command_delay_s=settings.robot_movement_delay_s + settings.ethernet_delay_s,
-        belt_speed_setpoint_mm_s=settings.test_conveyor_belt_speed_mm_s,
+        belt_speed_setpoint_mm_s=settings.belt_speed_static_mm_s,
         belt_speed_deadband_mm_s=settings.belt_speed_deadband_mm_s,
         adaptive_speed_enabled=settings.adaptive_speed_enabled,
         belt_speed_max_step_mm_s=settings.belt_speed_max_step_mm_s,
@@ -3162,10 +3195,10 @@ def _run_realtime_pick_loop(
                 "commandID": COMMAND_ID["change_speed"],
                 "CommandID": COMMAND_ID["change_speed"],
                 "rotate": 0.0,
-                "speed": settings.test_conveyor_belt_speed_mm_s,
+                "speed": settings.belt_speed_static_mm_s,
             }
         )
-        print(f"[INFO] Conveyor speed set to {settings.test_conveyor_belt_speed_mm_s} mm/s")
+        print(f"[INFO] Conveyor speed set to {settings.belt_speed_static_mm_s} mm/s")
         with state.state_lock:
             state.last_speed_commit_monotonic = time.monotonic()
     except Exception as exc:
@@ -3315,11 +3348,9 @@ def run_scheduler_scenario(
             {
                 "throughput_object_types": settings.throughput_object_types,
                 "throughput_lanes": settings.throughput_lanes,
-                "throughput_spawn_x": settings.throughput_spawn_x,
                 "throughput_spawn_y": settings.throughput_spawn_y,
                 "throughput_emit_interval_s": settings.throughput_emit_interval_s,
                 "accuracy_emit_interval_s": settings.accuracy_emit_interval_s,
-                "accuracy_points": settings.accuracy_points,
                 "accuracy_spawn_uv": settings.accuracy_spawn_uv,
             },
             start_time,

@@ -35,6 +35,9 @@ Execute these commands once connected to real PLCs:
 # Start interactive CLI mode
 python3 main.py --cli
 
+# CLI demo without hardware: spins up an in-process fake PLC (modules.test_module)
+python3 main.py --cli --dummy
+
 # Run auto-scheduler with Omron RealtimePickExecutor
 python3 main.py --scheduler --scenario test_throughput
 ```

@@ -238,7 +238,49 @@ def _stop_worker(worker: "mp.Process", command_queue: mp.Queue, response_queue: 
         worker.join(timeout=5.0)
 
 
+def _start_dummy_plc(interpolar_points: int) -> "tuple[str, int, Any, Any]":
+    """Start an in-process fake PLC (modules.test_module) for `--cli --dummy`.
+
+    Binds an ephemeral localhost port so it never clashes with a separately
+    running test_module. The worker's localhost branch then routes both the
+    Omron mock (pylogix MockPLC) and the Siemens mock to this one JSON-lines
+    socket. Returns (host, port, server, motion_stop_event).
+    """
+    import threading
+    from pathlib import Path
+
+    from modules.test_module import FakePLCState, ThreadedFakePLCServer
+
+    config = load_config()
+    scheduler_raw = getattr(config, "scheduler", {}) or {}
+    raw_home = scheduler_raw.get("home_position", [0.0, 0.0, -300.0])
+    state = FakePLCState(
+        interpolar_points=interpolar_points,
+        log_path=Path("test_module.log"),
+        sample_period_s=0.05,
+        home_position=(float(raw_home[0]), float(raw_home[1]), float(raw_home[2])),
+    )
+    stop_event = threading.Event()
+    threading.Thread(
+        target=state.run_motion_loop, args=(stop_event,), daemon=True
+    ).start()
+    server = ThreadedFakePLCServer(("127.0.0.1", 0), state)
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True
+    ).start()
+    host, port = server.server_address
+    print(f"[INFO] --dummy: in-process fake PLC on {host}:{port} (log: test_module.log)")
+    return host, port, server, stop_event
+
+
 def _run_cli(args: argparse.Namespace) -> None:
+    dummy_server = None
+    dummy_stop = None
+    if getattr(args, "dummy", False):
+        args.ip, args.port, dummy_server, dummy_stop = _start_dummy_plc(
+            args.interpolar_points
+        )
+
     ctx = mp.get_context("spawn")
     command_queue: mp.Queue = ctx.Queue()
     response_queue: mp.Queue = ctx.Queue()
@@ -246,6 +288,10 @@ def _run_cli(args: argparse.Namespace) -> None:
 
     worker = _start_worker(ctx, command_queue, response_queue, args)
     if worker is None:
+        if dummy_server is not None:
+            dummy_stop.set()
+            dummy_server.shutdown()
+            dummy_server.server_close()
         return
 
     def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
@@ -281,6 +327,10 @@ def _run_cli(args: argparse.Namespace) -> None:
         )
     finally:
         _stop_worker(worker, command_queue, response_queue, req_counter)
+        if dummy_server is not None:
+            dummy_stop.set()
+            dummy_server.shutdown()
+            dummy_server.server_close()
 
 
 def _start_interface(args: argparse.Namespace) -> "tuple[DashboardServer | None, dict[str, Any]]":
@@ -354,6 +404,13 @@ def _run_scheduler(args: argparse.Namespace) -> None:
     wait_margin_s = float(scheduler_config.get("execution_margin_s", 0.3))
     status_poll_interval_s = float(scheduler_config.get("poll_interval_s", 0.05))
     pick_arrival_tolerance_mm = float(scheduler_config.get("pick_arrival_tolerance_mm", 5.0))
+    # Speed-mapped arrival tolerance ceiling (defaults to the floor = static
+    # behavior), anchored on the adaptive belt speed range.
+    pick_arrival_tolerance_max_mm = float(
+        scheduler_config.get("pick_arrival_tolerance_max_mm", pick_arrival_tolerance_mm)
+    )
+    belt_speed_min_mm_s = float(scheduler_config.get("belt_speed_min_mm_s", 50.0))
+    belt_speed_max_mm_s = float(scheduler_config.get("belt_speed_max_mm_s", 120.0))
     if args.scenario == "test_vision_only":
         # Connect the full PLC (Omron + Siemens) for live belt feedback, but keep
         # the robot idle: NullExecutor reads conveyor_position and sends the belt
@@ -383,6 +440,9 @@ def _run_scheduler(args: argparse.Namespace) -> None:
             wait_margin_s=wait_margin_s,
             status_poll_interval_s=status_poll_interval_s,
             position_tolerance_mm=pick_arrival_tolerance_mm,
+            position_tolerance_max_mm=pick_arrival_tolerance_max_mm,
+            tolerance_speed_min_mm_s=belt_speed_min_mm_s,
+            tolerance_speed_max_mm_s=belt_speed_max_mm_s,
             rotate_home_tolerance_deg=float(
                 scheduler_config.get("rotate_home_tolerance_deg", 0.0)
             ),
@@ -437,6 +497,12 @@ def main() -> None:
     )
     parser.add_argument("--prompt", default="robot> ", help="CLI prompt text")
     parser.add_argument(
+        "--dummy",
+        action="store_true",
+        help="CLI only: spin up an in-process fake PLC (modules.test_module) and "
+             "connect the CLI to it — no real hardware needed.",
+    )
+    parser.add_argument(
         "--scenario",
         default="test_throughput",
         choices=sorted(SCENARIO_NAMES),
@@ -473,6 +539,9 @@ def main() -> None:
 
     if args.cli == args.scheduler:
         parser.error("Choose exactly one mode: --cli or --scheduler.")
+
+    if args.dummy and not args.cli:
+        parser.error("--dummy only applies to --cli.")
 
     if args.cli:
         _run_cli(args)

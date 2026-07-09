@@ -52,7 +52,6 @@ CONFIG_FILE = PARENT_DIR / "config.json"
 DEFAULT_CONFIG = {
     "ip_address": "192.168.250.1",
     "port": 502,
-    "period_s": 0.1,
     "interpolar_points": 4,
 }
 

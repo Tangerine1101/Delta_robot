@@ -3,7 +3,6 @@
     "port": 44818,
     "siemens_ip": "192.168.250.2",
     "siemens_port": 1502,
-    "period_s": 1,
     "interpolar_points": 7,
     "limit_radius_xy": 180.0,
     "object_types": {
@@ -23,7 +22,6 @@
     "conveyor": {
         "conveyor_position_scale_mm": 1.0,
         "velocity_ema_alpha": 0.4,
-        "length_mm": 800.0,
         "frame": {
             "theta_deg": 28.0,
             "robot_origin_uv": [
@@ -85,7 +83,6 @@
         },
         "show_window": true,
         "capture": {
-            "backend": "pyav",
             "camera_usb_id": "0c45:636b",
             "device": null,
             "width": 1920,
@@ -96,9 +93,9 @@
         "v4l2_controls": {
             "exposure_dynamic_framerate": 0,
             "auto_exposure": 0,
-            "exposure_time_absolute": 300
+            "exposure_time_absolute": 100
         },
-        "pixels_per_mm": 6.39,
+        "pixels_per_mm": 6.2182,
         "roi": {
             "enabled": true,
             "polygon": [
@@ -136,12 +133,10 @@
                 "marker_QFP": "QFP"
             },
             "cross_check": false,
-            "offset_deg": 0.0,
             "offset_by_class": {
                 "QFP": 0.0,
                 "TQFP": 0.0
             },
-            "symmetry_deg": 180,
             "symmetry_by_class": {
                 "TQFP": 180,
                 "QFP": 90
@@ -167,8 +162,8 @@
         ],
         "clearance_height": -260.0,
         "slope_transition_height": -275.0,
-        "pickup_height": -303.0,
-        "pre_pick_height": -290.0,
+        "pickup_height": -302.0,
+        "pre_pick_height": -287.0,
         "place_height": -280.0,
         "corner_blend_xy": 25.0,
         "intercept_lead_time_s": 0.8,
@@ -189,12 +184,14 @@
             30.0,
             0.0
         ],
-        "robot_movement_delay_s": 0.01,
-        "ethernet_delay_s": 0.00,
+        "robot_movement_delay_s": 0.09,
+        "ethernet_delay_s": 0.016,
         "rotate_offset_deg": -62.0,
         "rotate_sign": 1,
         "rotate_home_tolerance_deg": 0.0,
         "rotate_refresh_max_delta_deg": 15.0,
+        "pick_arrival_tolerance_mm": 5.0,
+        "pick_arrival_tolerance_max_mm": 10.0,
         "test_acceptance_cycles": 9,
         "accuracy_spawn_uv": [
             [
@@ -215,11 +212,11 @@
         ],
         "adaptive_speed_enabled": true,
         "oblique_descent_enabled": false,
-        "test_conveyor_belt_speed_mm_s": 50.0,
-        "pick_cycle_s": 2.5,
-        "pick_transit_min_s": 0.8,
+        "belt_speed_static_mm_s": 50.0,
+        "pick_cycle_s": 3,
+        "pick_transit_min_s": 0.6,
         "belt_speed_headroom": 0.4,
-        "belt_speed_min_mm_s": 10.0,
+        "belt_speed_min_mm_s": 50.0,
         "belt_speed_max_mm_s": 120.0,
         "belt_speed_hw_max_mm_s": 200.0,
         "belt_speed_deadband_mm_s": 5.0,
@@ -236,30 +233,12 @@
             50.0,
             90.0
         ],
-        "throughput_spawn_x": 0.0,
         "throughput_spawn_y": 200.0,
         "throughput_emit_interval_s": 0.35,
         "accuracy_emit_interval_s": 0.7,
         "execution_margin_s": 1,
         "evaluate_position_tolerance_mm": 2,
         "evaluate_wait_timeout_s": 10.0,
-        "accuracy_points": [
-            [
-                66.64,
-                -52.9,
-                -290.0
-            ],
-            [
-                -2.66,
-                -34.8,
-                -290.0
-            ],
-            [
-                -22.5,
-                -76.4,
-                -290.0
-            ]
-        ],
         "log_path": "data.log"
     },
     "interface": {

@@ -314,13 +314,6 @@ def _parse_plan(
         return CommandPlan(packages=[
             _cartesian_command("goto_absolute", x, y, z, interpolar_points)
         ])
-    if command == "snap":
-        print("[INFO] snap command is a placeholder (empty)")
-        return CommandPlan(packages=[])
-    if command == "autocollect":
-        print("[INFO] autocollect command is a placeholder (empty)")
-        return CommandPlan(packages=[])
-
     raise ValueError(f"Unknown command: {command}")
 
 
@@ -511,8 +504,6 @@ def _print_help() -> None:
         "  grab <object> <x> <y> <z> [rotate]   # manual grab sequence\n"
         "  place <object> <x> <y> <z> [rotate]  # manual place sequence\n"
         "  jog <x|y|z> <distance>               # jog axis\n"
-        "  snap [filename]                      # snap photo (placeholder)\n"
-        "  autocollect                          # auto data collection (placeholder)\n"
         "  calib\n"
         "  pick\n"
         "  release\n"
