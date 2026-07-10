@@ -251,13 +251,17 @@ Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,
 
 ## 4. Documentation Index
 
-Detailed documentation files are available in the `doc/` directory:
-* [theory_basis.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/theory_basis.md): Human-oriented software architecture, coordinate transforms, and high-level concepts; maintained by the human team.
-* [academic_report.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/academic_report.md): Formal academic archive of the mathematical model, kinematics, and trajectory generation derivations.
-* [ai_context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/ai_context.md): Compact summary of codebase facts, command maps, and verification scripts for quick AI context updates.
-* [rebuild_plan.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/rebuild_plan.md): **Design of record** for the real-time two-thread pick scheduler — the detailed spec (architecture, component design, kept/rewritten/removed inventory).
-* [realtime_pick_redesign.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/realtime_pick_redesign.md): **Design of record** companion — the post-implementation summary of the real-time pick flow and verification checklist.
-* `doc/archive/`: superseded multi-object-lag debugging reports (Gemini/GPT/final bug reports + video analyses). Kept for history; **not** a current reference.
+Documentation now follows a 4-file standard in `doc/`:
+* [context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/context.md): AI onboarding — directory map, file access rules, verification commands. **Read this first.**
+* [basis-theory.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/basis-theory.md): Theoretical framework for every algorithm — coordinate transforms, kinematics, tracking, adaptive speed, rotation chain.
+* [basis-programming.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/basis-programming.md): Program architecture — concurrency model, PLC data contracts, trajectory templates, scenario matrix, config key reference.
+* [dev-note.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/dev-note.md): Developer-maintained notes — pending hardware calibration, things tried and abandoned.
+
+`doc/PLC_Program_description/` (PLC ST/Ladder breakdowns) and `doc/Manuals/` (hardware
+datasheets) are kept as-is. The graduation thesis, old test harness, and superseded
+documentation sources have moved to a local-only `.archive/` directory — see `dev-note.md`
+for what moved and why. **Note**: this quickstart section may lag `basis-programming.md`,
+which is authoritative on current scenarios and architecture.
 
 ---
 

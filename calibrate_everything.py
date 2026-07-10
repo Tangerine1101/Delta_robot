@@ -374,7 +374,7 @@ def _todo_physical_calibration() -> None:
         `evaluate` scenario (gate on pos_EE convergence, not argument_time).
       * conveyor_position_scale_mm — from measured belt travel over a known move.
 
-    Not yet enabled — see doc/ai_context.md for the calibration roadmap.
+    Not yet enabled — see doc/dev-note.md for the calibration roadmap.
     """
     print("[INFO] physical calibration stage is not yet enabled "
           "(needs a fully-working rig; see _todo_physical_calibration docstring).")

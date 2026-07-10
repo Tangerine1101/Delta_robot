@@ -167,7 +167,7 @@ class RealtimeState:
     command_delay_s: float = 0.0
     # Last belt speed setpoint committed by the adaptive controller (deadband state).
     belt_speed_setpoint_mm_s: float = 0.0
-    # Adaptive belt speed (doc/theory_basis.md §6.6): continuously refreshed by the
+    # Adaptive belt speed (doc/basis-theory.md §6.5): continuously refreshed by the
     # perception thread every tick from live density; committed opportunistically by
     # _commit_adaptive_speed whenever the pick gate is not imminent. Constant config
     # below, set once.
@@ -376,7 +376,7 @@ class SchedulerSettings:
     # constant-accel ramp to hit A_max). Exposed so the model can be matched to the
     # real mechanism via the speed_tuning validation.
     interp_scurve_shape_factor: float = 1.5
-    # --- Adaptive belt speed (doc/theory_basis.md §6). Opt-in; when disabled the
+    # --- Adaptive belt speed (doc/basis-theory.md §6). Opt-in; when disabled the
     # belt keeps the static belt_speed_static_mm_s. The controller holds the
     # presentation rate lambda_nom = headroom / pick_cycle_s by setting belt speed
     # INVERSELY to product density: v = clamp(lambda_nom * L_meas / N, v_min, v_cap).
@@ -1046,7 +1046,7 @@ class RealtimePickExecutor:
             belt_speed_at_grip = state.belt_speed_mm_s
         if status is not None:
             print("[PLC]", json.dumps(status, ensure_ascii=True))
-        # Adaptive belt speed (doc/theory_basis.md §6.6): commit the live target at
+        # Adaptive belt speed (doc/basis-theory.md §6.5): commit the live target at
         # the grip instant — the object is already past the gate, so the density
         # drop from this pick is reflected immediately rather than waiting for the
         # next opportunistic commit.
@@ -1158,7 +1158,7 @@ class RealtimePickExecutor:
             tolerance_mm = self._arrival_tolerance_mm(live_belt_speed)
 
             def _log_gate(contact_observed: bool) -> None:
-                # T_delay calibration datum (doc/theory_basis.md §6.4): true
+                # T_delay calibration datum (doc/basis-theory.md §4.4): true
                 # dispatch->contact latency vs the configured robot_movement_delay_s.
                 # contact_observed=False means the narrow contact_z+2mm band was
                 # missed by the poll — the timing below is a degraded estimate
@@ -1364,9 +1364,9 @@ def _find_tracked_object(tracker: BeltTracker, object_id: str) -> TrackedObject 
 
 def _belt_lead_offset_mm(belt_speed_mm_s: float, command_delay_s: float) -> float:
     """Lead distance the pick gate must fire early to absorb the dispatch->grip
-    latency T_delay (doc/theory_basis.md §3.1, §6.4). The object's u is anchored to
+    latency T_delay (doc/basis-theory.md §4.4). The object's u is anchored to
     the belt encoder, so during T_delay it advances by exactly the belt's
-    displacement. Steady-belt form (a=0): offset = v * T_delay. The §6.6 timing
+    displacement. Steady-belt form (a=0): offset = v * T_delay. The §6.5 timing
     strategy guarantees the belt is steady at gate-fire time, so no acceleration
     term is needed; any residual ramp error is corrected by the live gate itself."""
     return max(0.0, belt_speed_mm_s * command_delay_s)
@@ -1421,7 +1421,7 @@ def _contact_position(
 
 
 def _adaptive_belt_speed(n_objects: int, settings: SchedulerSettings) -> float:
-    """Rate-regulation belt speed (doc/theory_basis.md §6.1/§6.5).
+    """Rate-regulation belt speed (doc/basis-theory.md §6.2/§6.3).
 
     Holds the presentation rate lambda_nom = headroom * mu_max by setting belt
     speed INVERSELY to product density: v = clamp(lambda_nom / rho, v_min, v_cap)
@@ -1500,8 +1500,8 @@ def _commit_adaptive_speed(
     *,
     min_interval_s: float = 0.0,
 ) -> None:
-    """Walk the belt setpoint toward the live adaptive target (doc/theory_basis.md
-    §6.6, revised). Called opportunistically from the executor wait loops, at the
+    """Walk the belt setpoint toward the live adaptive target (doc/basis-theory.md
+    §6.5, revised). Called opportunistically from the executor wait loops, at the
     grip instant, and from the idle main loop — commits are suppressed only while
     `gate_critical` is set (pick gate imminent). Each commit is rate-limited to
     `belt_speed_max_step_mm_s` so its ramp settles quickly, and throttled to at
@@ -3124,7 +3124,7 @@ def _run_realtime_pick_loop(
             # Live object density (count within the workspace window) — sensed every
             # tick (25 ms) regardless of whether adaptive control is enabled, so the
             # dashboard density chart is always meaningful. Adaptive belt speed
-            # (doc/theory_basis.md §6.6) reuses the same count when it's on; the
+            # (doc/basis-theory.md §6.5) reuses the same count when it's on; the
             # executor commits the target at the grip instant via _commit_adaptive_speed.
             u_max = settings.workspace_window_uv[1]
             density_u = []
