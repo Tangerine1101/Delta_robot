@@ -60,13 +60,13 @@
         ]
     },
     "QFP": [
-        148.18,
-        -40.0,
+        149.65,
+        -13.07,
         -280.0
     ],
     "TQFP": [
-        117.3,
-        21.69,
+        116.8,
+        48.735,
         -280.0
     ],
     "vision": {
@@ -162,7 +162,7 @@
         ],
         "clearance_height": -260.0,
         "slope_transition_height": -275.0,
-        "pickup_height": -302.0,
+        "pickup_height": -303.0,
         "pre_pick_height": -287.0,
         "place_height": -280.0,
         "corner_blend_xy": 25.0,
@@ -184,14 +184,14 @@
             30.0,
             0.0
         ],
-        "robot_movement_delay_s": 0.09,
+        "robot_movement_delay_s": 0.17,
         "ethernet_delay_s": 0.016,
         "rotate_offset_deg": -62.0,
         "rotate_sign": 1,
         "rotate_home_tolerance_deg": 0.0,
         "rotate_refresh_max_delta_deg": 15.0,
-        "pick_arrival_tolerance_mm": 5.0,
-        "pick_arrival_tolerance_max_mm": 10.0,
+        "pick_arrival_tolerance_mm": 15.0,
+        "pick_arrival_tolerance_max_mm": 50.0,
         "test_acceptance_cycles": 9,
         "accuracy_spawn_uv": [
             [
@@ -212,12 +212,12 @@
         ],
         "adaptive_speed_enabled": true,
         "oblique_descent_enabled": false,
-        "belt_speed_static_mm_s": 50.0,
+        "belt_speed_static_mm_s": 120.0,
         "pick_cycle_s": 3,
         "pick_transit_min_s": 0.6,
         "belt_speed_headroom": 0.4,
-        "belt_speed_min_mm_s": 50.0,
-        "belt_speed_max_mm_s": 120.0,
+        "belt_speed_min_mm_s": 30.0,
+        "belt_speed_max_mm_s": 100.0,
         "belt_speed_hw_max_mm_s": 200.0,
         "belt_speed_deadband_mm_s": 5.0,
         "belt_speed_max_step_mm_s": 20.0,
