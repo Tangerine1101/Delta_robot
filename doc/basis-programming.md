@@ -6,7 +6,10 @@
 > (the algorithms) — read that for *why* a computation is shaped the way it is; read this for
 > *where* it runs and *what* talks to what.
 > **Companions**: [`context.md`](context.md) (AI onboarding / directory map),
-> [`dev-note.md`](dev-note.md) (developer notes, pending calibration).
+> [`open-issues.md`](open-issues.md) (everything unresolved),
+> [`decision-log.md`](decision-log.md) (superseded designs).
+> **Status policy**: this document describes the system **as it currently is**. It carries no
+> history and no roadmap.
 
 ---
 
@@ -22,7 +25,9 @@
 | `modules/interface.py` | In-process web dashboard (stdlib `http.server` + SSE + MJPEG) |
 | `modules/cli.py` | Interactive command-line command builder/parser |
 | `modules/test_module.py` | Standalone fake PLC simulator (TCP socket, JSON-lines) |
-| `modules/latency_probe.py` | Calibration tool: measures PLC status round-trip latency |
+| `modules/latency_probe.py` | Calibration tool: measures PLC status round-trip latency (`--target omron\|siemens\|both`) |
+| `modules/test_rotate.py` | 4th-DOF rotation probe on real hardware: remap/settle, implied axis speed, `rotate_sign` visual check, cmd-7 retrigger test |
+| `modules/rotate_sweep_sim.py` | Offline sweep of the vision→wire angle chain across headings/classes (no hardware, optional CSV) |
 | `modules/config.json` | Active system configuration (see §7) |
 | `camera_calibrate.py` | Camera calibration tool (ROI, trigger line, pixels/mm) |
 | `calibrate_everything.py` | Whole-config consistency + workspace boundary checker |
@@ -82,8 +87,12 @@ graph TD
   (read/claim).
 
 The simulated scenarios (`test_throughput`, `test_accuracy`, `test_acceptance`, `evaluate`)
-run on the **original single-threaded harness**, not this two-thread loop — their targets are
+run on a **separate single-threaded harness**, not this two-thread loop — their targets are
 synthetic, not a live tracked belt, so there is no perception thread to isolate.
+
+> Two execution paths means a simulated run does not exercise the code that runs in
+> production — a real constraint on any benchmark produced from this repository
+> (`open-issues.md` **L7**, **L8**).
 
 ---
 
@@ -121,7 +130,7 @@ Structs exchanged with Siemens via `snap7` **must** use `ctypes.BigEndianStructu
 | 0 | `rotate_current` | REAL | Current suction cup rotation angle |
 | 4 | `speed_current` | REAL | Current conveyor belt speed (mm/s) |
 | 8 | `task_doing` | DINT | Command ID currently executing |
-| 12 | `task_state` | DINT | Inconsistent/legacy status — use `bit_doing` instead |
+| 12 | `task_state` | DINT | Reports inconsistent values — unusable; use Omron's `bit_doing` handshake instead (`open-issues.md` **L3**) |
 | 16 | `conveyor_position` | REAL | Pre-decoded belt position in mm (`scale = 1.0`) |
 
 > **Invariant** (from `CLAUDE.md`): never remove or reorder fields in `SiemensSendPacket` /
@@ -146,9 +155,13 @@ Written to the Omron global tag `pc_package` via `pylogix` (EtherNet/IP):
 
 The array length must be padded to exactly `interpolar_points` elements (default 7) — do not
 change this default without updating every downstream array that pads to it. `goto_absolute`
-commands require `argument_e` all-zero. The Omron firmware **ignores** `argument_time`
-(motors run at fixed maximum speed); PC-side values are scheduler approximations only, used
-for logs/ETA, never for real timing.
+commands require `argument_e` all-zero.
+
+> The Omron firmware **ignores** `argument_time` — motors always run at the interpolator's
+> fixed limits, so PC-side times are approximations for logs/ETA only and the PC cannot
+> modulate execution speed. Command ID 1 (`goto_relative`) is likewise not implemented on the
+> PLC side. Both are permanent properties of the current firmware:
+> `open-issues.md` **L1**, **L4**.
 
 ### 3.4. Command ID mapping
 
@@ -254,15 +267,20 @@ object): dispatch a phase, poll `pos_EE` until convergence, record wall time. Th
 `test_throughput` run on the single-threaded harness, not the two-thread realtime loop.
 
 `production` cannot be dry-run with `--simulate-executor` — it requires live PLC
-`conveyor_position` feedback by design. Use `test_throughput` for the simulated pick pipeline.
+`conveyor_position` feedback by design. Use `test_throughput` for the simulated pick pipeline,
+keeping `open-issues.md` **L7**/**L8** in mind: that pipeline is a different code path, and no
+offline replay of the production loop exists.
 
 ---
 
 ## 7. Config Key Reference (`modules/config.json`)
 
 Every key below is read by live code. Renamed/removed keys are not re-listed here — treat the
-table as the current contract, not a changelog (see `dev-note.md` for the history of what
-changed and why).
+table as the current contract, not a changelog (retired keys are in `decision-log.md` §1.10).
+
+> A key appearing here says nothing about whether its **value** is trustworthy. Uncalibrated
+> parameters and known-inconsistent values are listed in `open-issues.md` §A–§B; check there
+> before relying on any number in `config.json`.
 
 ### Top level
 
@@ -367,4 +385,21 @@ python3 main.py --scheduler --scenario test_vision_only --interface --duration 2
 # 10. Real-hardware acceptance run: exactly test_acceptance_cycles picks, then stops,
 #     printing a final [ACCEPT-SUMMARY] (per-phase goto/pick wall times).
 python3 main.py --scheduler --scenario test_acceptance --interface
+```
+
+### 8.1. Calibration probes (see `open-issues.md` §A)
+
+```bash
+# PLC round-trip latency -> ethernet_delay_s (C2). Siemens is the one that gates picks.
+python3 -m modules.latency_probe --target siemens
+
+# 4th-DOF rotation probe -> rotate_sign (C1): remap/settle, implied axis speed,
+# visual direction check, cmd-7 retrigger test. REQUIRES HARDWARE.
+python3 -m modules.test_rotate
+
+# Offline sweep of the vision -> wire angle chain across headings and classes (no hardware)
+python3 -m modules.rotate_sweep_sim --step-deg 0.5 --csv /tmp/rotate_sweep.csv
+
+# Whole-config consistency + workspace boundary check
+python3 calibrate_everything.py --check
 ```

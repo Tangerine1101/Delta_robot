@@ -1,0 +1,52 @@
+test_descend_time_is_inflated_when_the_oblique_descent_is_off (__main__.ContactDelayBudget.test_descend_time_is_inflated_when_the_oblique_descent_is_off)
+`plan.descend_time_s` folds the belt slant in unconditionally. ... ok
+test_oblique_shift_equals_the_missing_term (__main__.ContactDelayBudget.test_oblique_shift_equals_the_missing_term)
+Turning the oblique descent on shifts contact downstream by exactly ... ok
+test_robot_gate_lead_omits_soft_start_and_descent (__main__.ContactDelayBudget.test_robot_gate_lead_omits_soft_start_and_descent) ... ok
+test_sandbox_budget_terms (__main__.ContactDelayBudget.test_sandbox_budget_terms) ... ok
+test_belt_direction_matches (__main__.CoordinateFrameParity.test_belt_direction_matches) ... ok
+test_forward_transform_matches (__main__.CoordinateFrameParity.test_forward_transform_matches) ... ok
+test_inverse_transform_matches (__main__.CoordinateFrameParity.test_inverse_transform_matches) ... ok
+test_transform_is_a_reflection_in_both (__main__.CoordinateFrameParity.test_transform_is_a_reflection_in_both)
+Both blocks have determinant -1, not +1. ... ok
+test_geometric_term_matches (__main__.CornerVelocityParity.test_geometric_term_matches) ... ok
+test_robot_lacks_the_stop_distance_clamp (__main__.CornerVelocityParity.test_robot_lacks_the_stop_distance_clamp)
+The robot's corner velocity never asks 'can I still stop in time?'. ... ok
+test_robot_solver_convergence_condition (__main__.PickSolverParity.test_robot_solver_convergence_condition) ... ok
+test_identical_over_a_grid (__main__.SegmentProfileParity.test_identical_over_a_grid) ... ok
+test_backward_pass_matters_most_on_the_short_final_segment (__main__.TrajectoryScheduleParity.test_backward_pass_matters_most_on_the_short_final_segment)
+Forward-only scheduling enters the last waypoint above the speed it ... ok
+test_goto_phase_timing (__main__.TrajectoryScheduleParity.test_goto_phase_timing)
+Forward-only scheduling is *slower on paper* than the two-pass one. ... ok
+test_pick_phase_timing_and_the_missing_descent (__main__.TrajectoryScheduleParity.test_pick_phase_timing_and_the_missing_descent)
+The pick packet's Pos[0] IS the contact point, so the segment the ... ok
+test_goto_template_identical (__main__.TrajectoryTemplateParity.test_goto_template_identical) ... ok
+test_pick_template_identical (__main__.TrajectoryTemplateParity.test_pick_template_identical) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.104s
+
+OK
+
+  descend_time_s reported with oblique OFF vs. the vertical descent the arm actually performs:
+           belt    0.0 mm/s -> reported t_d=0.3898s, true vertical t_d=0.3898s, calibration bias=+0.0000s
+           belt   60.0 mm/s -> reported t_d=0.4924s, true vertical t_d=0.3898s, calibration bias=-0.1025s
+           belt  100.0 mm/s -> reported t_d=0.5828s, true vertical t_d=0.3898s, calibration bias=-0.1930s
+           belt  120.0 mm/s -> reported t_d=0.6247s, true vertical t_d=0.3898s, calibration bias=-0.2348s
+  [robot  ] gate lead covers 0.2235s (move 0.17 + eth 0.016 + sampling 0.0375)
+  [robot  ] modelled park->contact t_d = 0.3898s (soft_start 0.08 + descent 0.3098)
+  [robot  ] oblique_descent_enabled = False
+           belt   30.0 mm/s -> board travels  11.70 mm during the descent, and nothing in the pipeline leads by it
+           belt   60.0 mm/s -> board travels  23.39 mm during the descent, and nothing in the pipeline leads by it
+           belt  100.0 mm/s -> board travels  38.98 mm during the descent, and nothing in the pipeline leads by it
+           belt  120.0 mm/s -> board travels  46.78 mm during the descent, and nothing in the pipeline leads by it
+           belt  150.0 mm/s -> board travels  58.48 mm during the descent, and nothing in the pipeline leads by it
+
+  [sandbox] command_delay=0.1860s soft_start=0.0800s descent=0.3098s -> contact_delay=0.5758s
+
+  [solver] robot adds 0.0800s after arrival, sandbox adds 0.5758s
+  [last ] segment len=5.0mm  entry v=261.1mm/s  stop distance needed=34.1mm
+
+  [goto ] robot=0.9868s  sandbox(same pts)=0.9128s sandbox(+bridge)=0.9295s  over-estimate=+0.0740s
+  [pick ] robot=1.0805s  sandbox(same pts)=0.9832s sandbox(+bridge from park)=1.2931s
+  [pick ] omitted park->contact descent = 0.3098s

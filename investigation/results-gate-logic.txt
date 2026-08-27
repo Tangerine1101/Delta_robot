@@ -1,0 +1,76 @@
+test_density_law_is_hyperbolic_and_steps_hard_at_small_n (__main__.AdaptiveSpeedLaw.test_density_law_is_hyperbolic_and_steps_hard_at_small_n) ... ok
+test_density_region_starts_upstream_of_the_workspace (__main__.AdaptiveSpeedLaw.test_density_region_starts_upstream_of_the_workspace)
+Open issue G3: `belt_density_length_mm = 0` derives L_meas = u_max, ... ok
+test_static_seed_sits_above_the_adaptive_ceiling (__main__.AdaptiveSpeedLaw.test_static_seed_sits_above_the_adaptive_ceiling)
+Open issue G1, confirmed numerically: startup commands a speed the ... ok
+test_pick_packet_pos0_is_the_contact_point (__main__.ContactPointConstruction.test_pick_packet_pos0_is_the_contact_point) ... ok
+test_the_park_to_contact_move_is_not_a_packet_segment (__main__.ContactPointConstruction.test_the_park_to_contact_move_is_not_a_packet_segment)
+The arm is parked at `pre_pick_height` when the pick packet is sent, ... ok
+test_gate_is_one_sided_and_has_no_late_bound (__main__.GateThresholdShape.test_gate_is_one_sided_and_has_no_late_bound)
+The only question the gate asks is 'has it got here yet?'. ... ok
+test_gate_uses_the_smoothed_belt_speed (__main__.GateThresholdShape.test_gate_uses_the_smoothed_belt_speed)
+The lead is `v * T`, and `v` is the EMA-filtered encoder derivative. ... ok
+test_lead_is_linear_in_belt_speed (__main__.GateThresholdShape.test_lead_is_linear_in_belt_speed) ... ok
+test_accepted_plans_have_zero_time_margin (__main__.InterceptFeasibility.test_accepted_plans_have_zero_time_margin)
+The feasibility test is `arm_arrival <= pick_time`, with no margin. ... ok
+test_intercept_lead_time_only_binds_when_the_flight_is_short (__main__.InterceptFeasibility.test_intercept_lead_time_only_binds_when_the_flight_is_short)
+`intercept_lead_time_s = 0.8` is the promised parked-and-waiting time. ... ok
+test_the_plannable_window_collapses_with_belt_speed (__main__.InterceptFeasibility.test_the_plannable_window_collapses_with_belt_speed)
+How far upstream must a board still be for a plan to be accepted? ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.036s
+
+OK
+   N  ->  v_target
+   0  ->    100.0 mm/s
+   1  ->     48.4 mm/s   (step -51.6)
+   2  ->     30.0 mm/s   (step -18.4)
+   3  ->     30.0 mm/s   (step +0.0)
+   4  ->     30.0 mm/s   (step +0.0)
+   5  ->     30.0 mm/s   (step +0.0)
+   6  ->     30.0 mm/s   (step +0.0)
+  the regulated interior of the law is reached only at N = 1; N >= 2 pins v_min = 30 mm/s
+  regulated window = [188, 363] (175 mm); density measured over [0, 363] (363 mm)
+
+  startup seed 120 mm/s vs adaptive ceiling 100.0 mm/s
+
+  park->contact drop = 16.0 mm
+    modelled by _descent_time_s as an S-curve segment: 0.3098s (+0.08s soft start)
+    performed by the PLC as State 10             : 0.0800s linear setpoint ramp
+    implied mean cup speed during State 10       : 200 mm/s, from and to a full stop
+  a 20 mm/s speed-estimate error moves the gate by 4.47 mm
+
+  gate lead budget = 0.2235s
+    belt    0.0 mm/s -> fires   0.00 mm early
+    belt   60.0 mm/s -> fires  13.41 mm early
+    belt  120.0 mm/s -> fires  26.82 mm early
+    belt  200.0 mm/s -> fires  44.70 mm early
+
+   belt   u_now   park margin (s)   u_pick
+     60     150         +0.0799    228.4
+     60     200         +0.0796    281.6
+     60     260         +0.0797    349.4
+     60     300   rejected
+     90     150         +0.0795    271.1
+     90     200         +0.0792    330.4
+     90     260   rejected
+     90     300   rejected
+    120     150         +0.0787    321.6
+    120     200   rejected
+    120     260   rejected
+    120     300   rejected
+    150     150   rejected
+    150     200   rejected
+    150     260   rejected
+    150     300   rejected
+
+  modelled goto flight from the bin = 0.9868s, + command delay 0.1860s = 1.1728s vs lead 0.80s
+
+  workspace = [188, 363]; camera sees [0, 120]
+   belt   latest u_now still plannable   headroom past u_min
+     60                              270   +82 mm
+     90                              226   +38 mm
+    120                              180   -8 mm
+    150                              134   -54 mm
+    180                               88   -100 mm

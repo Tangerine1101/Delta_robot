@@ -1,65 +1,39 @@
 # Dev Notes — Delta Robot
 
-> **Maintained by the human developer.** AI assistants should read this for context but must
-> **not** edit it unless explicitly asked to. Record here whatever `basis-theory.md` /
-> `basis-programming.md` are too formal for: calibration TODOs, hardware quirks, open
-> questions, things tried and abandoned.
+> **Maintained by the human developer.** AI assistants may read this for context but must
+> **not** edit it unless explicitly asked to.
+>
+> This is a personal scratchpad: hardware quirks, hunches, things to remember at the bench.
+> It is deliberately *not* the project's issue tracker any more —
+> **open problems live in [`open-issues.md`](open-issues.md)** (which AI agents may update),
+> and superseded designs live in [`decision-log.md`](decision-log.md).
 
 ---
 
-## Pending hardware calibration
+## Bench notes
 
-- **`rotate_sign`** — currently `1` in `config.json`. Confirm with the visual sweep in
-  `python3 -m modules.test_rotate` (+90° commanded must turn the cup CCW seen from above; if
-  not, flip to `-1`).
-- **`robot_movement_delay_s`** (currently `0.17`) / **`ethernet_delay_s`** (currently `0.016`)
-  — refine from the per-pick `[GATE]` log (`dispatch_to_contact_s`) and
-  `modules/latency_probe.py --target siemens` (this is the one that gates picks).
-- **`oblique_descent_enabled`** (currently `False`) — re-evaluate once `interpolator.a_max` is
-  calibrated against the real belt; the descent-time model over-estimates $t_d$ until then, so
-  keep off in production until re-tested.
-- **Siemens DB1 handshake** — DB1 has no handshake bit; verify in TIA Portal whether the ST
-  program edge-triggers on `CommandID` change (would silently drop a second `rotate_absolute`
-  sent back-to-back with `change_speed`). Document findings in
-  `doc/PLC_Program_description/` if confirmed either way.
-- **`rotate_offset_deg` / `offset_by_class`** — re-check after any marker/mounting change on
-  the suction cup; calibrated via a hardware run reading the `[ROTATE]` log.
+* **Rotation axis.** The `[ROTATE]` log line prints the whole chain per pick
+  (`vision_angle / board_heading / rotate_cmd / rotate_at_gate / rotate_at_end`). Read it
+  after any change to the cup marker or the mounting — the offsets do not survive a
+  re-mount. Probe with `python3 -m modules.test_rotate`; `rotate_sweep_sim` covers the maths
+  without touching hardware.
+* **Gate latency.** `dispatch_to_contact_s` in the `[GATE]` log is the number to watch; it is
+  what `robot_movement_delay_s` is supposed to model. `latency_probe --target siemens`
+  isolates the wire portion of it.
+* **Belt speed control is coarse.** The Siemens speed command is imprecise at the low end and
+  the encoder quantisation adds noise — that is what `conveyor.velocity_ema_alpha` smooths.
+  `conveyor_position_scale_mm = 1.0` because the PLC already reports millimetres.
+* **Camera.** Auto-exposure must stay off or FPS collapses and motion blur breaks tracking;
+  disable auto-exposure *before* writing the manual exposure value. Frames are captured with
+  PyAV, not OpenCV's V4L2 backend — that backend was the real 30 FPS bottleneck.
+* **Local archive.** `../Delta_robot_git_backup_2026-07-11.git` is the full pre-purge mirror
+  of the repository history. Keep it; never push it.
 
-## Recent hardware calibration (2026-07-09/10, applied)
+## Where things go
 
-- Sorting-bin drop positions `QFP`/`TQFP` and `pickup_height` nudged from live pick data.
-- `pick_arrival_tolerance_mm` / `_max_mm` widened (15/50mm) — the previous 5/10mm band was too
-  tight for the belt-speed range now in use.
-- `belt_speed_static_mm_s` raised to 120 mm/s; `belt_speed_min/max_mm_s` rebalanced to
-  30–100 mm/s.
-
-## Things tried and abandoned
-
-- **Grip-instant-only speed commits** — too coarse (≤1 commit per pick cycle, 2–10s); belt felt
-  laggy on hardware. Replaced by the opportunistic commit policy
-  (`basis-theory.md` §6.5).
-- **Wrapping the wire-degree boundary to [-180,180)** — caused near-full-turn spins on a
-  179°→180° step because the Siemens command encodes spin direction, not just position. Fixed
-  by making Layer 3 verbatim (`basis-theory.md` §5.2).
-- **Parking the arm upstream by `v·t_d` for oblique descent** — flew the arm outside the
-  workspace at belt speed. Only the pick-phase *contact* point shifts downstream now, never the
-  park/goto.
-- **Fixed wall-clock gate-abort deadline** — fired spuriously whenever the belt slowed
-  mid-cycle. Replaced by a progress-based stall check (object `u` advances <0.5mm for ~3s).
-
-## Repo housekeeping (2026-07-11)
-
-- Consolidated all documentation into the 4-file standard
-  (`basis-theory.md`/`basis-programming.md`/`context.md`/`dev-note.md`).
-  `report/`, `tests/`, `doc/archive/`, `.trash/`, and superseded doc sources moved to a
-  local-only `.archive/` directory (gitignored).
-- Purged personal information (thesis authors' names/student IDs, only ever present under
-  `report/` and `doc/archive/report_draft_v1/`) from git history via `git-filter-repo`, along
-  with heavy blobs (`report.zip`, old model checkpoints under
-  `models/small@1280_old_dataset/` and per-epoch `.pt` files).
-- A full mirror of the pre-purge repository is kept locally
-  (`../Delta_robot_git_backup_2026-07-11.git`) as the permanent archive of the original
-  history — **never push it anywhere**.
-- README.md quickstart sections may still reference retired concepts (e.g. `test_conveyor`,
-  `run_test.py`) — `basis-programming.md` is authoritative on current scenarios/architecture;
-  update README opportunistically when touched.
+| I want to record… | Put it in |
+|---|---|
+| a problem that is still unresolved | `open-issues.md` |
+| a design that was tried and dropped, and why | `decision-log.md` |
+| how something currently works | `basis-theory.md` / `basis-programming.md` |
+| a bench hunch, a quirk, a reminder to myself | here |

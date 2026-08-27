@@ -4,11 +4,15 @@
 > transforms, kinematics, trajectory profiles, tracking/interception, orientation resolution,
 > and the adaptive conveyor speed law.
 > **Companions**: [`basis-programming.md`](basis-programming.md) (how the program implements
-> this), [`context.md`](context.md) (AI onboarding), [`dev-note.md`](dev-note.md) (developer
-> notes & pending calibration).
+> this), [`context.md`](context.md) (AI onboarding), [`open-issues.md`](open-issues.md)
+> (what is still unresolved), [`decision-log.md`](decision-log.md) (superseded designs and
+> why they were replaced).
 > **Numeric policy**: formulas here are symbolic; each symbol maps to a `modules/config.json`
-> key (tables below). Live values belong to the config, not this document — earlier revisions
-> hardcoded worked examples that silently drifted from the deployed config.
+> key (tables below). Live values belong to the config, not this document.
+> **Status policy**: this document describes the system **as it currently behaves**. It
+> contains no history and no roadmap — those live in `decision-log.md` and
+> `open-issues.md` respectively. A parameter appearing here is *not* evidence that it has
+> been calibrated; check `open-issues.md` §A before trusting a number.
 
 ---
 
@@ -208,8 +212,7 @@ Implementation: `BeltPositionTracker.position_at`, `_capture_loop` in
 ### 4.3. Fixed-point pick-position prediction
 
 The predictor chooses a stable **park position**, not a firing time — the pick itself fires on
-a live positional gate (§4.4), making it immune to belt-speed estimate noise (the historical
-"arrive → wait → miss" lag).
+a live positional gate (§4.4), which makes it immune to belt-speed estimate noise.
 
 Iterate to the earliest goto-feasible pick:
 
@@ -245,9 +248,13 @@ window at the ramp end $T_{\text{accel}} = |v_{sp} - v_c| / a_{\text{nom}}$:
   + v_{sp}(T_{\text{delay}} - T_{\text{accel}})$
 
 These are **not implemented**: the commit-timing strategy (§6.5) guarantees a steady belt at
-gate-fire time, so the precision path stays single-term; the live gate absorbs residual drift.
-`robot_movement_delay_s` is calibrated from the per-pick `[GATE]` log
-(`dispatch_to_contact_s`), `ethernet_delay_s` from `modules/latency_probe.py`.
+gate-fire time, so the precision path stays single-term and the live gate absorbs residual
+drift. Any redesign of the speed controller that relaxes that guarantee must revisit this —
+see `open-issues.md` **L9**.
+
+$T_{\text{delay}}$ is calibrated from the per-pick `[GATE]` log (`dispatch_to_contact_s`) and
+`modules/latency_probe.py`; both terms are **currently uncalibrated estimates**
+(`open-issues.md` **C2**).
 
 ### 4.5. Oblique intercept (belt-tracking descent, opt-in)
 
@@ -264,11 +271,13 @@ where $\hat{u}$ is the belt-flow unit vector in the R-frame and $t_d$ the modele
 and meets it at near-zero relative velocity. The gate lead is **unchanged** (the slant itself
 absorbs the $t_d$ travel — $t_d$ is *not* added to the lead).
 
-> A superseded revision moved the *park* upstream by $v \cdot t_d$ instead — at operating belt
-> speed that placed the arm outside the workspace. Only the **contact** shifts, never the park.
-> Default **off** (vertical descent) until `interpolator.a_max` is calibrated: $t_d$ is
-> over-estimated, so at high belt speed the contact can approach $u_{\max}$ (handled as a safe
-> dispatch-reject, not a clamp).
+> **Invariant**: only the *contact* point shifts downstream — never the park/goto target,
+> which would leave the workspace at operating belt speed.
+>
+> **Currently disabled** (`oblique_descent_enabled = false` ⇒ vertical descent) because
+> `interpolator.a_max` is uncalibrated and $t_d$ is consequently over-estimated: at high belt
+> speed the computed contact can approach $u_{\max}$, which is handled as a safe
+> dispatch-reject rather than a clamp. See `open-issues.md` **C3**/**C5**.
 
 ### 4.6. Tracked-object lifecycle
 
@@ -284,18 +293,18 @@ stateDiagram-v2
 ### 4.7. Pick-attempt exclusivity (no re-pick)
 
 There is **no slip-detection/retry**: `execute()` reports success when the arm's *motion*
-completes; suction is never verified. Exactly-once bookkeeping keys off whether the grip was
-actually **dispatched**:
+completes; suction is never verified (`open-issues.md` **L6** — the software success count is
+therefore an optimistic estimate of the true one). Exactly-once bookkeeping keys off whether
+the grip was actually **dispatched**:
 
 * **Pick dispatched** (success, or failure after the grip command): remove the object from the
   tracker — a possible suction miss is never retried.
 * **Aborted pre-grip** (goto timeout, gate stall, track lost): only unclaim; the object stays
-  tracked and re-plannable. (Blanket removal used to drop still-pickable objects *and* deflate
-  the density count $N$, speeding the belt up right after a failure.)
+  tracked and re-plannable, and continues to count toward the density $N$ of §6.
 
-The gate abort itself is a **progress-based stall check** (object's $u$ advances < 0.5 mm for
-several seconds, or track lost), not a wall-clock deadline — a fixed deadline fired spuriously
-whenever the belt slowed after plan-build.
+The gate abort itself is a **progress-based stall check**: abort when the object's $u$
+advances < 0.5 mm for several seconds, or when the track is lost. It is deliberately not a
+wall-clock deadline, which cannot survive a belt slow-down after plan-build.
 
 ---
 
@@ -326,8 +335,8 @@ measured against image +y **down**) converts once, in
 
 $$\varphi_{\text{board}} = \text{wrap}_{\pi}\!\big(\text{rad}(h - 90°) + \theta_{\text{frame}}\big)$$
 
-($0$ = robot $+X$, positive = CCW from above; the $-90°$ fixes the image-axis reference, a
-historical constant bias.)
+($0$ = robot $+X$, positive = CCW from above. The $-90°$ is a fixed constant that rebases the
+angle from the image axis convention to the R-frame $+X$ axis.)
 
 **Layer 2 — algorithm (R-frame radians only).** `TrackedObject.rotation_rad` stores
 $\varphi_{\text{board}}$; the post-grip command is
@@ -347,28 +356,30 @@ $[-359, 359]$ — **no wrap**:
 $$\theta_{\text{wire}} = \text{clamp}_{\pm 359}\big(\deg(\theta_{\text{cmd}})\big)$$
 
 Wrapping here ($180° \to -180°$, $270° \to -90°$) would flip the commanded spin direction and
-drive the axis nearly a full turn the wrong way on a $179° \to 180°$ step — the historical
-"random over-rotation" fault. Manual/CLI absolute angles pass through untouched.
+drive the axis nearly a full turn the wrong way on a $179° \to 180°$ step. Manual/CLI absolute
+angles pass through untouched.
 (`robot_rad_to_wire_deg` / `wire_deg_to_robot_rad` in `modules/EthernetCom.py`.)
 
 **Calibration**: (1) `test_rotate` probe — remap/settle, implied axis speed, visual direction
 check for `rotate_sign`, cmd-7→cmd-7 retrigger test; (2) a hardware run reading the per-pick
 `[ROTATE]` log (`vision_angle / board_heading / rotate_cmd / rotate_at_gate / rotate_at_end`)
 to set `rotate_offset_deg` + `offset_by_class`. `rotate_home_tolerance_deg` > 0 turns
-"axis not yet home at grip" into a warn-only check.
+"axis not yet home at grip" into a warn-only check. Neither `rotate_sign` nor the offsets
+have been confirmed on hardware — `open-issues.md` **C1**/**C4**.
 
 ---
 
 ## 6. Adaptive Conveyor Speed (Rate Regulation)
 
+> **Baseline notice.** §6 documents the **currently deployed** speed controller. It is the
+> starting point of the ongoing redesign, not the target design — in particular it is
+> open-loop with respect to missed picks (`open-issues.md` **L10**). Do not treat it as the
+> intended final algorithm.
+
 **Goal: preserve the serial arm's throughput under an unstable feeder.** The belt is a **rate
 regulator**, not a transport to maximize: its job is to hold the *presentation rate* of
 pickable objects near a nominal target. Belt speed is therefore set **inversely** to object
-density.
-
-> **Rejected model**: "run fast when busy" ($v = A \cdot N + v_{\min}$). Belt speed does not
-> set throughput — the serial arm's pick cycle does. Speeding up under high density only
-> shortens transit time and pushes objects past $u_{\max}$ unpicked.
+density: belt speed does not set throughput — the serial arm's pick cycle does.
 
 ### 6.1. Symbols ↔ config
 
@@ -411,7 +422,8 @@ arm's ceiling — the headroom absorbs feeder bursts and timing jitter.
    $\lambda_{\text{nom}}$ — sub-unity utilization *by design*.
 3. **Overload (dense)**: law pins $v = v_{\min}$; the window stays full and utilization rises
    to ~100 % **emergently** — no separate brake/exception state. The backlog count (in-window
-   unpicked objects predicted to pass $u_{\max}$) is telemetry only. If the feeder exceeds
+   unpicked objects predicted to pass $u_{\max}$) is **telemetry only — it never feeds back
+   into the speed decision** (`open-issues.md` **L10**). If the feeder exceeds
    $\mu_{\max}$ even here, loss is unavoidable — no speed policy recovers a genuinely
    over-saturated cell.
 
@@ -426,8 +438,9 @@ $$v_{\text{target}} = \max\!\Big(v_{\min},\; \min\big(v_{\rho},\; g_{\min} / t_{
 \qquad g_{\min} = \min_i (u_i - u_{i+1})$$
 
 over the leading few objects only (`_SPACING_LEAD_OBJECTS`, default 4) — an upstream cluster
-does not force a premature slow-down. A cluster tighter than $v_{\min} t_{\text{pick}}$ pins
-the floor (best-effort; the cell is locally over-dense).
+does not force a premature slow-down, but is also invisible to the law until it reaches the
+front (`open-issues.md` **L11**). A cluster tighter than $v_{\min} t_{\text{pick}}$ pins the
+floor (best-effort; the cell is locally over-dense).
 
 ### 6.5. Commit policy, anti-thrash, and jerk avoidance
 
@@ -443,8 +456,8 @@ the gate-critical window** (object within ~2 s of belt travel of the fire thresh
   raw hyperbolic law is near bang-bang at small $N$; the $N = 1 \leftrightarrow 2$ jump alone
   would ramp for seconds.)
 * **Closed loop**: perception stores the PLC's measured `speed_current`; if it diverges from
-  the setpoint > 3 s after the last commit, the setpoint is re-sent (catches lost commands —
-  the old controller compared against a phantom setpoint it assumed was applied).
+  the setpoint > 3 s after the last commit, the setpoint is re-sent. This catches commands
+  lost on the wire — the controller never assumes a commit was applied.
 
 **Jerk avoidance**: modeling the belt's S-curve ramp explicitly in the gate offset would add a
 piecewise-cubic bookkeeping for a sub-millimetre correction that only applies mid-ramp.
@@ -453,10 +466,19 @@ construction, not by hope — so the precision path keeps the single-term offset
 the live gate absorbs residuals. Startup seeds the belt with `belt_speed_static_mm_s`
 unconditionally (adaptive off = static speed).
 
-> Historical note: the original policy committed only at the grip instant (≤ 1 commit per
-> 2–10 s pick cycle) — density changes sat uncommitted for seconds and the belt felt laggy and
-> uneven on hardware; quantitatively, large speed jumps need ramps longer than the window that
-> policy assumed. The inverted (opportunistic + gate-critical-suppression) policy replaced it.
+### 6.6. Known gaps in this controller
+
+Recorded here so the baseline is not mistaken for a finished design. Details and status in
+[`open-issues.md`](open-issues.md):
+
+* **L10** — no feedback from missed/at-risk picks into the speed decision; the law sees only
+  instantaneous density and spacing.
+* **L11** — the spacing cap has a 4-object horizon.
+* **L9** — the steady-belt-at-gate guarantee of §6.5 is what licenses the single-term gate
+  offset of §4.4; a controller that commits more freely must implement the ramp-aware form.
+* **G1/G2/G3** — the static seed sits above the adaptive ceiling, the calibrated pick cycle
+  disagrees with the cell's stated nominal rate, and the density measurement region is longer
+  than the workspace it regulates.
 
 ---
 
@@ -475,14 +497,12 @@ Theory-level view; the full runtime layout is in `basis-programming.md` §1.
 
 ---
 
-## 8. Future Ideas & Research Proposals
+## 8. What this document deliberately omits
 
-* **Web GUI dashboard v2** — live 3D end-effector trajectory, positional-error graphs from
-  `data.log`, sorted-item database views (the current in-process dashboard covers telemetry
-  and MJPEG).
-* **SQL sorting database** — `product_types` (destinations per class) + `pick_history`
-  (per-pick audit trail with timestamps and status).
-* **Closed-loop conveyor control via queueing theory** — the §6 rate-regulation law is the
-  near-term realization; a full Little's-Law queueing model is the longer-term evolution.
-* **Suction verification** — a vacuum-pressure or vision check after the grip would make the
-  exactly-once policy (§4.7) retry-capable for true misses.
+* **Open problems** — every unresolved calibration, config inconsistency and algorithmic gap
+  is registered in [`open-issues.md`](open-issues.md), including which of them constrain the
+  scheduler redesign.
+* **Superseded designs** — the alternatives that were tried and replaced, with the reason
+  each was rejected, are in [`decision-log.md`](decision-log.md).
+* **Speculative extensions** — parked ideas (dashboard v2, SQL pick history, queueing-theory
+  belt control, suction verification) are in `decision-log.md` §4.

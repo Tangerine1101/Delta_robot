@@ -10,9 +10,12 @@ YOLO_OBB/
 *.zip
 
 # Local-only archive: thesis, legacy backups, superseded docs, old model checkpoints.
-# See doc/dev-note.md for what moved here and why. Never track or push this directory.
+# See doc/decision-log.md for what moved here and why. Never track or push this directory.
 .archive/
+.report/
 
+# YOLO training / inference output
+runs/
 # LaTeX build artifacts (latexmk/pdflatex)
 *.aux
 *.fdb_latexmk

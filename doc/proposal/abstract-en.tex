@@ -1,0 +1,45 @@
+\documentclass[conference,a4paper]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{microtype}
+
+\begin{document}
+
+\title{Integrated Pick Scheduling and Conveyor Speed Control for a
+Delta-Robot Sorting Cell}
+
+\author{
+\IEEEauthorblockN{Tran Manh Son, Dao Minh Thong, Tran Dang Kim Toan}
+}
+
+\maketitle
+
+\begin{abstract}
+This study develops an online algorithm that jointly schedules picks and
+controls conveyor speed for a delta-robot sorting system. Each part on the
+conveyor stays within the robot's reachable area only for a limited time; if
+it is not picked before leaving, it is lost. The goal is to pick as many
+parts as possible before time runs out -- an online scheduling problem with
+time-varying release times and deadlines, $1 \mid r_j(t), d_j(t),
+\text{online} \mid \sum U_j$. These deadlines are not fixed: they depend on
+the conveyor speed, which the controller can adjust. Slowing the belt gives
+more time for the part being chased, but delays every part behind it. The
+algorithm treats scheduling and conveyor speed as one problem, using a
+two-loop structure. Because the camera sits upstream, the inner loop sees
+each part before it arrives, decides which part to pick next, and predicts
+how many parts on the belt will likely be missed. The outer loop uses that
+prediction to adjust the belt speed. The time to switch between two picks
+depends only on the type of the part just picked, so it is folded into the
+pick time. The algorithm is validated on a self-built delta-robot cell --
+vacuum gripper, rotation axis, encoder-equipped conveyor, a YOLO-OBB vision
+model, two PLCs, and a control computer -- running at 30-60 picks per minute.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Delta robot; Online scheduling; Conveyor speed control; Sorting system;
+Machine vision.
+\end{IEEEkeywords}
+
+\end{document}

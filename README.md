@@ -1,371 +1,109 @@
-# Delta Robot Pick-and-Place Project
+# Delta Robot Pick-and-Place Sorting Cell
 
-This repository contains Python-side control tooling for a Delta Robot sorting system communicating with PLCs (Omron NX1P2 and Siemens S7-1200) over Ethernet. It supports an interactive CLI mode for direct hardware commands and an offline scheduler simulation/benchmark tool.
+Python control software for a delta-robot sorting cell. A control PC runs the vision pipeline
+and the pick scheduler, and drives two PLCs over Ethernet:
+
+* **Omron NX1P2** (EtherNet/IP, `pylogix`) — delta arm motion and vacuum gripper.
+* **Siemens S7-1200** (Modbus TCP, `snap7`) — conveyor speed and the 4th-DOF suction-cup
+  rotation.
+
+Parts (QFP / TQFP boards) are detected on the moving belt by a YOLO-OBB model, tracked against
+the belt encoder, intercepted by the arm while still inside the reachable window, and dropped
+into per-class bins.
 
 ---
 
-## 1. Quickstart & Usage
+## Current phase
 
-### 1.1. Setup & Environment
-Ensure you have the required packages installed. Pylogix is used for communicating with the Omron PLC.
+The cell is built and operational. Active work is a **research project on online pick
+scheduling integrated with conveyor speed control** — each part carries a deadline set by when
+it leaves the reachable window, and belt speed is treated as a scheduling decision rather than
+a separate control loop. The proposal sources are in [`doc/proposal/`](doc/proposal/).
+
+The scheduler and belt-speed controller currently in the repository are the **baseline being
+redesigned**. Before proposing or planning any change, read
+**[`doc/open-issues.md`](doc/open-issues.md)** — the single register of everything unresolved,
+including which parameters have never been calibrated.
+
+---
+
+## Setup
+
 ```bash
-pip install pylogix
-```
-Settings are loaded from `modules/config.json`. Check `ip_address`, `port`, and `scheduler` geometry values before executing commands on real hardware.
-
-### 1.2. Run the Offline Scheduler Simulation
-Simulates the pick scheduler, simulated object detections, and conveyor speed streams without hitting physical hardware:
-```bash
-# Run throughput scenario
-python3 main.py --scheduler --scenario test_throughput --duration 10.0 --simulate-executor
-
-# Run accuracy tracking scenario
-python3 main.py --scheduler --scenario test_accuracy --duration 5.0 --simulate-executor
-```
-
-### 1.3. Run the Fake PLC TCP Server
-Useful to test Python communication interfaces and telemetry log output without real controllers:
-```bash
-python3 -m modules.test_module --port 1502 --self-test --duration 1.0
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 1.4. Run the Real CLI or Auto-Scheduler
-Execute these commands once connected to real PLCs:
+Requires a CUDA-capable GPU for real-time YOLO-OBB inference, a UVC camera capable of 1080p30
+MJPEG, and network access to both PLCs. All settings live in
+[`modules/config.json`](modules/config.json); check `ip_address` / `siemens_ip` and the
+`scheduler` geometry before running anything against real hardware.
+
+Sanity-check the configuration first:
+
 ```bash
-# Start interactive CLI mode
+python3 calibrate_everything.py --check
+```
+
+---
+
+## Running
+
+```bash
+# Interactive CLI against real PLCs
 python3 main.py --cli
 
-# CLI demo without hardware: spins up an in-process fake PLC (modules.test_module)
+# Interactive CLI against an in-process fake PLC (no hardware)
 python3 main.py --cli --dummy
 
-# Run auto-scheduler with Omron RealtimePickExecutor
-python3 main.py --scheduler --scenario test_throughput
-```
+# Simulated pick pipeline, no hardware
+python3 main.py --scheduler --scenario test_throughput --duration 12.0 --simulate-executor
 
-### 1.5. Camera scenarios + live overlay window
-Scenarios that use the real camera open a window showing each tracked board/marker
-(object id, position, rotation angle) plus camera-capture and inference (GPU-max) FPS.
-Set `vision.show_window=false` in `config.json` to run headless.
-
-Add `--interface` to any scenario to serve a **live web dashboard** instead of the
-native cv2 window: it streams the annotated camera frame over MJPEG plus a live
-table of detected objects, predicted picks, and belt speed/position. Open
-`http://localhost:8000` (port configurable via `config.interface.port` or
-`--interface-port`). For real-camera scenarios `--interface` suppresses the native
-cv2 window so the two GUIs don't conflict.
-```bash
-# Vision only — real camera, no robot; live web dashboard (annotated MJPEG + data)
+# Vision only — real camera, no robot, live web dashboard on http://localhost:8000
 python3 main.py --scheduler --scenario test_vision_only --interface --duration 20
 
-# Conveyor test — real camera + robot + Siemens conveyor_position belt feedback
-python3 main.py --scheduler --scenario test_conveyor --interface --duration 30
-
-# Web dashboard smoke test (no hardware — serves synthetic events)
-python3 -m modules.interface                         # open http://localhost:8000
-
-# Standalone vision (runs YOLO + shows the same window; q or Ctrl-C to quit)
-python3 -m modules.image_processing                 # runs until q / Ctrl-C
-python3 -m modules.image_processing --duration 15   # or run for a fixed time
-python3 -m modules.image_processing --no-window      # headless (no window)
+# Production run on real hardware
+python3 main.py --scheduler --scenario production --interface
 ```
-> The window is pumped on the main thread; press **q** in the window or **Ctrl-C**
-> in the terminal to stop. Run from the project root using the `.venv` interpreter
-> (`.venv/bin/python -m modules.image_processing`) so `ultralytics`/`opencv` resolve.
->
-> **Camera FPS notes**: the capture loop runs on its own thread so `CAM` FPS reflects the
-> camera's true rate. USB webcams only reach their rated FPS in **MJPG** (set automatically)
-> and with `exposure_dynamic_framerate=0` (set automatically via `v4l2-ctl`; tune through
-> `vision.camera_controls`) — otherwise auto-exposure throttles them (~30→~18) in dim light.
-> With YOLO inference running concurrently, effective capture settles lower (~17–20 fps) due
-> to the CPython GIL; `PROC` FPS shows the model's per-frame throughput.
 
-### 1.6. Scenarios
-| Scenario | Vision | Robot | Belt source | Camera window | Entry points |
-|----------|--------|-------|-------------|---------------|--------------|
-| `test_throughput` | simulated | sim/real | synthetic | no | main.py (`--interface` opt.) |
-| `test_accuracy` | simulated | sim/real | none (static) | no | main.py (`--interface` opt.) |
-| `evaluate` | simulated | sim/real | synthetic | no | main.py |
-| `test_vision_only` | real camera | none | `conveyor_position` | web/native | main.py (`--interface` opt.) |
-| `test_conveyor` | real camera | real | `conveyor_position` (Siemens) | web/native | main.py (`--interface` opt.) |
-| `production` | real camera | real | `conveyor_position` (Siemens) | web/native | main.py only |
+`--interface` serves an in-process web dashboard (annotated MJPEG plus live telemetry) and
+suppresses the native OpenCV window. Without it, real-camera scenarios open a local overlay
+window; set `vision.show_window = false` to run headless.
 
-> **Live visualization** is provided by the in-process web dashboard
-> (`modules/interface.py`, `--interface`). The old `run_test.py` subprocess +
-> matplotlib launcher has been removed — it conflicted with the cv2 window on
-> real hardware. Simulation is built into the scheduler via `--simulate-executor`.
+The full verification command list — compile check, fake-PLC dry run, calibration probes — is
+in [`doc/basis-programming.md`](doc/basis-programming.md) §8.
+
+### Scenarios
+
+| Scenario | Vision | Robot | Conveyor speed |
+|---|---|---|---|
+| `production` | real camera | real, two-thread realtime loop | Siemens PLC |
+| `test_vision_only` | real camera | idle | Siemens PLC |
+| `test_throughput` | simulated | sim or real | synthetic |
+| `test_accuracy` | simulated | sim or real | static |
+| `test_acceptance` | simulated | sim or real | static |
+| `evaluate` | simulated | sim or real | synthetic |
+
+`production` requires live PLC belt-position feedback and cannot be dry-run with
+`--simulate-executor`. Note that only `production` and `test_vision_only` exercise the
+two-thread realtime loop; the other scenarios run a separate single-threaded harness
+(`doc/open-issues.md` L7/L8).
 
 ---
 
-## 2. Basic Logic & Architecture
+## Documentation
 
-```
-                  ┌──────────────────────┐
-                  │      main.py         │
-                  └──────────┬───────────┘
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-   ┌─────────────────┐               ┌─────────────────┐
-   │ CLI Interactive │               │  Scheduler Loop │
-   │   (cli.py)      │               │ (scheduler.py)  │
-   └────────┬────────┘               └────────┬────────┘
-            ▼                                 ▼
-   ┌──────────────────────────────────────────────────┐
-   │             EthernetCom.py (Gateway)             │
-   └────────────────────────┬─────────────────────────┘
-                            ▼
-   ┌──────────────────────────────────────────────────┐
-   │                PLC Hardware Layer                │
-   └──────────────────────────────────────────────────┘
-```
+Everything technical lives in [`doc/`](doc/) — this README intentionally holds no
+configuration reference, roadmap or bug list.
 
-* **Threading Model (real pick path — `production` / `test_conveyor`)**: the scheduler runs
-  as **two cooperating threads** over one guarded `RealtimeState`, plus the IPC worker:
-  - **Perception/state thread** (`_realtime_perception_loop`, ~25 ms): the only regular PLC
-    status read — updates belt position/speed + `pos_EE`, polls vision, refreshes the
-    `BeltTracker` (prunes only *unclaimed* stale objects), emits `[SPEED]`/`[DETECT]`.
-  - **Main decision/execution thread** (`_run_realtime_pick_loop` → `RealtimePickExecutor`):
-    selects an object, predicts the pick point, dispatches goto/pick. Its wait loops read
-    shared state and issue **no PLC I/O**.
-  - **Worker Process** (`multiprocessing` queue): the single PLCGateway; an `ipc_lock` keeps
-    exactly one round-trip in flight, a `state_lock` guards the shared state.
-  (The simulated scenarios keep the original single-threaded loop.)
-* **PLC Package Contract**: Fixed 7-slot coordinate arrays (`interpolar_points`) sent to the
-  `pc_package` tag on the Omron PLC. Unused elements are zero-padded.
-* **Interception Math**: The kept iterative solver `_predict_pick_position` projects the
-  object forward (belt velocity) to find the **earliest feasible straight-down pick
-  position** and verify reachability — it no longer fires the pick on a converged *time*.
-* **Conveyor Speed Synchronization**: The Omron PLC has no awareness of belt speed. The PC
-  reads the belt position (`conveyor_position`, **mm — `conveyor_position_scale_mm = 1.0`**)
-  from the Siemens S7-1200, derives speed, and plans the pick. The robot simply executes the
-  received coordinates.
-* **2-Phase Trajectory**: A `goto` phase followed by a `pick` phase, each a 7-point template.
-  `B_goto -> C_goto` and `B_pick -> C_pick` are mandatory 3D slope segments, not
-  flat-then-vertical moves.
-* **Positional pick gate (replaces timing compensation)**: the arm parks `intercept_lead_time_s`
-  = **1.6 s** downstream of the object, then the pick packet is fired by a **live position
-  gate** — when the tracked object's `u` reaches the parked pick `u`
-  (`u_now >= u_pick - _belt_lead_offset_mm(speed)`). There is **no** time-based dispatch-ahead
-  formula; closing the loop on the live object makes the pick immune to belt-speed estimate
-  noise. The empty `_belt_lead_offset_mm` hook (returns `0.0`) is reserved for future
-  latency compensation — see §5 Roadmap.
+| File | Contents |
+|---|---|
+| [`doc/context.md`](doc/context.md) | **Start here.** Project phase, document map, directory structure, rules for AI assistants |
+| [`doc/basis-theory.md`](doc/basis-theory.md) | Coordinate transforms, delta kinematics, trajectory profiles, tracking and interception, orientation chain, adaptive belt-speed law |
+| [`doc/basis-programming.md`](doc/basis-programming.md) | Thread/process architecture, PLC data contracts, trajectory templates, scenario matrix, config-key reference, verification commands |
+| [`doc/open-issues.md`](doc/open-issues.md) | Single register of unresolved problems: pending calibration, config inconsistencies, architectural limits |
+| [`doc/decision-log.md`](doc/decision-log.md) | History: superseded designs and why they were replaced |
+| [`doc/dev-note.md`](doc/dev-note.md) | Developer's bench notes |
 
----
-
-## 3. Configuration Variables
-
-All system settings are stored in [config.json](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/config.json).
-
-### 3.1. Connection & PLC Settings
-* `ip_address` (string): IP address of the Omron NX1P2 PLC (default: `192.168.250.1`).
-* `port` (int): TCP port for Omron PLC connection (default: `44818` for EtherNet/IP).
-* `siemens_ip` (string): IP address of the Siemens S7-1200 PLC (default: `192.168.250.2`).
-* `siemens_port` (int): TCP port for Siemens PLC connection (default: `1502`).
-* `period_s` (float): Status polling period or data update cycle (seconds).
-* `interpolar_points` (int): Maximum number of trajectory points per PC packet (default: `4`).
-* `object_types` (object): Map from object type identifier (e.g. `object_A`) to its sorting bin name.
-* `object_A` (array): 3D coordinates `[x, y, z]` (mm) of the sorting bin for `object_A`.
-
-### 3.2. Scheduler & Robot Geometry (`scheduler` block)
-* `home_position` (array): 3D coordinates `[x, y, z]` of the robot's default rest (Home) position.
-* `clearance_height` (float): Safe Z height (negative) for horizontal travel between bins and conveyor (e.g. `-290.0`).
-* `slope_transition_height` (float): Z height at which the 3D slope segment begins to smooth the approach (e.g. `-295.0`).
-* `pickup_height` (float): Z height at which the gripper picks the object off the conveyor (e.g. `-310.0`).
-* `pre_pick_height` (float): Z height above the object just before the descent to pick (e.g. `-300.0`).
-* `place_height` (float): Z height at which the gripper releases the object into the bin (e.g. `-290.0`).
-* `corner_blend_xy` (float): XY corner blend radius at trajectory waypoints for smoother motion.
-* `intercept_lead_time_s` (float): Minimum initial time estimate used to seed the interception convergence loop (seconds).
-* `release_descent_time_s` (float): Dwell time at the release point while the suction cup deactivates (seconds).
-* `nominal_xy_speed` (float): Nominal horizontal XY travel speed of the robot (mm/s). **No longer used for pick-time prediction** (the `interpolator` model below replaces it); now only fills the cosmetic per-segment `argument_time` array (which the Omron ignores).
-* `nominal_z_speed` (float): Nominal vertical Z travel speed of the robot (mm/s). Same status as `nominal_xy_speed`.
-* `interpolator` (object): Parameters of the PLC `MC_Inter_Curve_Vel` velocity model, ported to Python to compute **exact** goto/pick times (see §5 *Major Update 24/6*). Defaults mirror the real PLC function-block constants.
-  * `v_max` (float, mm/s): max linear velocity along the path (cruise cap). Used by every profile.
-  * `a_max` / `d_max` (float, mm/s²): max linear acceleration / deceleration. Used by every profile.
-  * `soft_start_s` (float, s): State-10 soft-start — a one-time linear ramp (20 PLC cycles ≈ 80 ms) from the actual servo position to the first waypoint, applied once per motion command (which always starts from rest). Added once to the total time.
-  * `scurve_shape_factor` (float): S-curve accel-shape compensation, `t_acc = factor·V/A`. `1.5` for the PLC's 4th-order polynomial (bell-shaped accel needs 50 % more time than a constant-accel ramp to hit `A_max`). **Only affects the S-curve (rest-to-rest) branch**; trapezoidal segments ignore it.
-* `stale_timeout_s` (float): Maximum time to track an object before dropping it from the queue (seconds).
-* `speed_timeout_s` (float): Expiry time for conveyor speed data if no new sample is received (seconds).
-* `poll_interval_s` (float): Scheduler loop repeat period (seconds).
-* `default_speed` (array): Default conveyor velocity vector `[vx, vy]` (mm/s) used in simulation or when PLC is disconnected.
-* `robot_movement_delay_s` (float): Mechanical response and acceleration lag of the physical robot (seconds).
-* `ethernet_delay_s` (float): One-way Ethernet communication latency (seconds).
-* `pickup_window_x` / `pickup_window_y` — **removed.** The pickable region is now defined in the C-frame by `conveyor.workspace_window_uv` (see §3.3).
-* `throughput_object_types` (array): Object types spawned in the throughput simulation scenario.
-* `throughput_lanes` (array): X coordinates of the conveyor lanes where simulated objects are spawned.
-* `throughput_spawn_x` & `throughput_spawn_y` (float): Upstream spawn origin of simulated objects on the conveyor.
-* `throughput_emit_interval_s` (float): Time interval between successive object spawns in the Throughput scenario.
-* `accuracy_emit_interval_s` (float): Time interval between object spawns in the Accuracy scenario.
-* `execution_margin_s` (float): Additional safety buffer added before a trajectory command expires (seconds).
-* `accuracy_points` (array): List of static target coordinates used for tracking error profiling.
-* `log_path` (string): File path for trajectory tracking data logs.
-
-### 3.3. Coordinate Frames & Position/Trajectory Settings
-
-> **Note:** `modules/conveyor.py` was written *after* the original config, so several
-> position keys changed the frame they are interpreted in. Some descriptions in §3.1–3.2
-> predate that migration; the table below is authoritative for which frame each
-> position/trajectory value lives in.
-
-**Frames in use:**
-* **R-frame** — Robot Cartesian `(x, y, z)` in mm. Z is **negative-down** (closer to `0` = physically higher). Every trajectory packet sent to the Omron PLC is in this frame.
-* **C-frame `(u, v)`** — Conveyor belt. `+u` points downstream (belt flow), `+v` is cross-belt; origin at a fixed marker on the belt. Belt dead-reckoning advances `u`.
-* **ROI-mm** — millimetres inside the camera ROI (origin = `vision.roi.polygon[3]`, the bottom-left corner). Produced by the vision pipeline.
-* **Pixel** — raw image pixels in the 1920×1080 camera frame.
-
-**Transform chain (defined in [conveyor.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/conveyor.py)):**
-```
-Pixel --(vision.pixels_per_mm)--> ROI-mm --(M_VISION_TO_CONVEYOR)--> C-frame (u,v) --(F_CONVEYOR_TO_ROBOT)--> R-frame (x,y)
-```
-* `F_CONVEYOR_TO_ROBOT` — C→R; now **built from config** `conveyor.frame = { theta_deg, robot_origin_uv }`. `robot_origin_uv (u,v)` is the robot base expressed in conveyor axes (read off `doc/frames.png`); the translation column is derived as `T = -Rot(theta)·(u,v)`, so `(_T_X, _T_Y)` no longer need to be hand-computed. This is the master pick transform: an error here offsets every pick. Re-calibrate by editing `robot_origin_uv` (default `[360, 130]` → `T ≈ (54.2, -378.9)`).
-* `M_VISION_TO_CONVEYOR` — ROI-mm→C; a pure axis swap (`u = y_mm`, `v = x_mm`, zero offset). The `+u` sign is **confirmed correct** on the live running belt (ROI `y_mm` increases downstream, matching `BeltTracker.current_uv`'s `+delta_p` convention).
-* `M_CAMERA_TO_ROBOT` / `CameraFrame` — **not used at runtime** (placeholder for a future direct pixel→robot path).
-
-**Per-setting frame map:**
-
-| Setting (config key) | Block | Frame | Notes |
-|----------------------|-------|-------|-------|
-| `QFP`, `TQFP` `[x,y,z]` | top-level | **R-frame** | Sorting-bin destination. X,Y used for every place; Z used **only** by `evaluate` (in production the place Z is overridden by `place_height`). |
-| `object_types.*.w` / `.h` | top-level | physical mm | Board dimensions; frame-independent. |
-| `home_position` `[x,y,z]` | scheduler | **R-frame** | Robot rest pose / cycle start. |
-| `clearance_height`, `slope_transition_height`, `pre_pick_height`, `pickup_height`, `place_height` | scheduler | **R-frame Z** | Must satisfy `clearance > slope_transition > pre_pick > pickup` and `clearance ≥ place` (validated at load). |
-| `corner_blend_xy` | scheduler | **R-frame XY** (mm) | Blend radius for the 3D-slope waypoints. |
-| `accuracy_points` `[x,y,z]` | scheduler | **R-frame** | **Legacy** — superseded by `accuracy_points_uv`; only used if the latter is absent. |
-| `accuracy_points_uv` `[u,v,z]` | conveyor | **C-frame (u,v)** + R-frame Z | `evaluate` targets (preferred). Mapped C→R via `F_CONVEYOR_TO_ROBOT`. |
-| `workspace_window_uv` `[u_min,u_max,v_min,v_max]` | conveyor | **C-frame** | Pickable region. Coordinates outside are **discarded, not clamped**. |
-| `camera_window_uv` | conveyor | **C-frame** | Camera coverage region (upstream of `workspace_window_uv`). |
-| `default_speed` `[vx,vy]` | scheduler | **frame-migration leftover** | Only its **magnitude** is used, as a scalar belt speed along `+u` (C-frame). The direction (vy) is ignored. |
-| `throughput_spawn_y` | scheduler | **C-frame `u`** (sim) | Reused as the upstream spawn `u` for `test_throughput`. |
-| `throughput_lanes` | scheduler | **C-frame `v`** (sim) | Cross-belt lane positions for simulated objects. |
-| `throughput_spawn_x` | scheduler | **unused (dead key)** | Loaded into settings but never consumed by `SimulatedImageProcessing`. |
-| `rotate_offset_deg` | scheduler | angle (deg) | Added to the vision `angle_deg` before the Siemens `rotate_absolute` command. |
-| `pixels_per_mm` | vision | **Pixel→ROI-mm** scale | Calibrated against the live 1920×1080 frame via [camera_calibrate.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/camera_calibrate.py) (`--scale` stage). |
-| `roi.polygon` | vision | **Pixel** | Defines the ROI-mm origin/axes. Calibrated via `camera_calibrate.py` (`--roi` stage). |
-| `trigger_line.y_px` | vision | **Pixel** | Emit/trigger line. Calibrated via `camera_calibrate.py` (`--trigger` stage). |
-
-> **Calibration-pending values** (must be set from physical measurement before production):
-> sorting-bin coordinates `QFP`/`TQFP`, and `F_CONVEYOR_TO_ROBOT` rotation `_THETA_RAD`.
-> The vision pixel-frame keys (`pixels_per_mm`, `roi.polygon`, `trigger_line.y_px`) are
-> calibrated via `camera_calibrate.py`; re-run it if the camera is repositioned. The
-> `M_VISION_TO_CONVEYOR` `+u` sign has been confirmed correct on the live belt.
-
----
-
-## 4. Documentation Index
-
-Documentation now follows a 4-file standard in `doc/`:
-* [context.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/context.md): AI onboarding — directory map, file access rules, verification commands. **Read this first.**
-* [basis-theory.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/basis-theory.md): Theoretical framework for every algorithm — coordinate transforms, kinematics, tracking, adaptive speed, rotation chain.
-* [basis-programming.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/basis-programming.md): Program architecture — concurrency model, PLC data contracts, trajectory templates, scenario matrix, config key reference.
-* [dev-note.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/dev-note.md): Developer-maintained notes — pending hardware calibration, things tried and abandoned.
-
-`doc/PLC_Program_description/` (PLC ST/Ladder breakdowns) and `doc/Manuals/` (hardware
-datasheets) are kept as-is. The graduation thesis, old test harness, and superseded
-documentation sources have moved to a local-only `.archive/` directory — see `dev-note.md`
-for what moved and why. **Note**: this quickstart section may lag `basis-programming.md`,
-which is authoritative on current scenarios and architecture.
-
----
-
-## 5. Updates & Roadmap
-
-### Major Update (24/6) — Exact PLC timing model, config-driven belt frame, calibration CLI
-
-This update consumes the new `doc/PLC_Program_description/` (the real Omron PLC code),
-turning several previously-guessed values into derivations from the PLC's own logic.
-
-1. **Exact trajectory timing — `MC_Inter_Curve_Vel` ported to Python.**
-   The PLC interpolator's velocity model (jerk-bounded **S-curve**, **trapezoidal**, and
-   **blend look-ahead** corner velocities) is reproduced in `modules/scheduler.py`
-   (`_segment_profile_time`, `_corner_v_end`, `_trajectory_total_time`). Pick-time
-   prediction (`_predict_pick_position`) and the dispatch lead now use the **exact**
-   trajectory time computed from the PLC's own constants instead of the crude
-   `distance / nominal_speed` estimate (the Omron ignores `argument_time` and runs the
-   interpolator at fixed limits, so this matches real motion far better).
-   - **Which profile runs when** (PLC `MC_Inter_Curve_Vel` §3.5): the S-curve is used
-     **only when both ends of a segment are at rest**. In a blended 7-point
-     `go_trajectory` the pipeline (Rungs 13–18) blends segments 0–4 and stops on segment
-     5, so **every segment runs trapezoidal** — including the final one, which enters at
-     the previous corner velocity (`V_start > 0`) and decelerates to a stop. A single
-     **point-to-point** rest-to-rest move is the S-curve case. (So: trajectory ⇒
-     trapezoidal throughout; lone P2P move ⇒ S-curve — matching the documented FB logic.)
-   - New `scheduler.interpolator` config block: `v_max`, `a_max`, `d_max`, `soft_start_s`,
-     `scurve_shape_factor` (see §3.2).
-
-2. **Config-driven conveyor→robot frame.** `conveyor.frame = { theta_deg, robot_origin_uv }`.
-   Type the belt offset `(u, v)` straight off `doc/frames.png` (default `[360, 130]`); the
-   homogeneous translation is derived as `T = -Rot(theta)·(u, v)`. No more hand-computing
-   `_T_X/_T_Y` in `conveyor.py` (see §3.3).
-
-3. **Calibration CLI commands** (`modules/cli.py`, available in `python3 main.py --cli`):
-   - `validate` — whole-config consistency + forbidden-circle check (wraps
-     `calibrate_everything --check`).
-   - `camera_tuning [args]` — delegates to `camera_calibrate.py` (ROI / trigger / scale).
-   - `speed_tuning` — runs a tilted heptagon (radius `limit_radius_xy/2`, Z tilted between
-     `clearance_height` and `slope_transition_height`) and **validates the interpolator
-     timing model** against the real arm: it compares the measured execution time with
-     `_trajectory_total_time` and reports the ratio plus a first-order `v_max` suggestion.
-     **Report-only** — never writes config.
-
-4. **Multi-object pick-lag bug (`doc/bug_report_final.md`).** With the PLC model the
-   dispatch contact-lead is `command_delay + soft_start` (PLC-faithful), so the report's
-   "Layer 2" was largely already correct. The real serialization cause — **Layer 1**, the
-   blocking single-threaded scheduler — is a **deferred** follow-up (see Roadmap).
-
-### Recent Updates (23/5)
-* **4 DOF and Siemens PLC Integration**: Added support for 4th degree of freedom (end-effector suction rotation via stepper) and conveyor speed adjustments handled by a secondary Siemens S7-1200 PLC. Defined new command IDs: `rotate_absolute` (7), `change_speed` (8), and `plan_siemen` (9).
-* **2D Speed Vectors**: Updated conveyor speed calculations from a scalar speed to a 2D velocity vector `[vx, vy]` in `modules/scheduler.py` and `modules/config.json`.
-* **Config Safety Constraints**: Added automated safety verification in `modules/scheduler.py` to assert:
-  $$\text{clearance\_height} > \text{slope\_transition\_height} > \text{pre\_pick\_height} > \text{pickup\_height}$$
-
-### Future Roadmap
-- **Belt-speed lead offset (`_belt_lead_offset_mm`) — not yet developed**:
-  - Implement the currently-empty offset hook in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py) (it returns `0.0`) so the
-    positional pick gate fires `offset` mm **early**, compensating command + network +
-    mechanism latency. The gate already subtracts it
-    (`threshold = u_pick - _belt_lead_offset_mm(speed)`), so only the function body needs a
-    speed-dependent model (latency × belt speed, calibrated on the real belt).
-  - Rationale: negligible at the current 50–100 mm/s belt, but the lead grows with belt
-    speed; without it, faster belts will land the pick slightly behind the part.
-  - **Deferred — roadmap only.** Both design docs flag the same hook
-    ([doc/realtime_pick_redesign.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/realtime_pick_redesign.md) §Execution, [doc/rebuild_plan.md](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/doc/rebuild_plan.md) §G); this Roadmap entry is the single source of truth for the work.
-0. **Concurrent executor (bug `doc/archive/bug_report_final.md` Layer 1 — highest priority)**:
-   - Decouple `executor.execute` onto a background thread/process so the main loop keeps
-     sampling the belt, polling vision, re-anchoring, and pre-planning the next object
-     *while* the arm handles the current pick. This removes the strict pick serialization
-     (loop frozen 4–7 s per pick) that causes every second-and-later pick in a burst to
-     land behind the part. Deferred from the 24/6 update.
-1. **Endianness Fix & 4th-Axis Rotation (Upcoming)**:
-   - Change Siemens communication structs from `ctypes.Structure` to `ctypes.BigEndianStructure` in [modules/EthernetCom.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/EthernetCom.py#L28-L46) for automatic S7-1200 big-endian compatibility. *(Done)*
-   - Remove the hardcoded 90.0° rotation value in `RealtimePickExecutor` in [modules/scheduler.py](file:///home/tangerine/Share/Global%20Share/Documents/Delta_robot/modules/scheduler.py) and replace with a dynamic $\theta$ angle supplied by the vision system.
-2. **Vision Integration (Next milestone)**:
-   - Set up a real camera and build an image processing module to classify PCB types (25×25 mm and 40×40 mm) and measure the PCB tilt angle $\theta$ using OpenCV or a YOLO model.
-3. **PC-side Workspace Safety Check**:
-   - Add a kinematic workspace boundary check on the PC as a redundant safety layer (current motion limits are hardcoded directly on the PLC to keep the Python layer flexible).
-4. **Profile Smoothing**: Add jerk/acceleration-limited profiles on top of the mandatory 3D slope waypoints.
-
----
-
-## 6. Known Bugs & Limitations
-
-### 6.1. Logic & Algorithm
-1. **Early exit in pick position prediction (`_predict_pick_position` in `scheduler.py`)** — **[FIXED]**:
-   - Workspace boundary check was inside the convergence loop. Fixed by bounding iterations to when the object enters the pickup window (`t_enter`).
-2. **Hardcoded pick/release segment timing (`_build_pick_timing` in `scheduler.py`)** — **[FIXED]**:
-   - Timing is now computed dynamically from actual diagonal blend distance and nominal speeds.
-3. **Memory leak in scheduler** — **[FIXED]**:
-   - `self.seen_object_ids` was an unbounded set; converted to a dict and pruned periodically using `stale_timeout_s`.
-4. **Missing statistics counter** — **[FIXED]**:
-   - `skipped_outside_workspace` counter added and incremented correctly when an object drifts past the lower workspace boundary.
-
-### 6.2. PLC Integration & Simulation Limitations
-1. **`argument_time` array has no effect on real hardware**:
-   - The current PLC program does not implement trajectory time planning; actual robot motion speed is unaffected by the timing values sent from the PC.
-2. **GOTO and PICK trajectories must be sent as separate phases**:
-   - The Omron PLC has no internal trajectory time planner (segment travel time is opaque to the PC), so the PC must split the motion into two separate phases to control pick timing precisely. Real hardware testing confirmed smooth motion because the descent and ascent segments are short enough.
-3. **Tag name inconsistency**:
-   - The correct PLC-side command trigger tag is `bit_doing`. This key must be synchronized across all PC-side communication data structures.
-4. **`goto_relative` command not implemented on PLC**:
-   - Command ID 1 (`goto_relative`) has not been programmed on the physical PLC.
-5. **`run_test.py` removed (replaced by `--interface` web dashboard)**:
-   - The old subprocess + matplotlib launcher (and its hardcoded plot path) has been
-     deleted. Live visualization now runs in-process via `modules/interface.py`
-     (`main.py ... --interface`); simulation uses the scheduler's `--simulate-executor`.
+`doc/PLC_Program_description/` holds rung-by-rung breakdowns of the PLC programs, and
+`doc/Manuals/` the hardware datasheets.
