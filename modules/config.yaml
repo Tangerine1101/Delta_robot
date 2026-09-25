@@ -1,0 +1,176 @@
+# Delta robot cell configuration.
+#
+# Key reference: doc/basis-programming.md §7. A value being present here is NOT a claim that
+# it was measured: tags of the form "open-issues C2" point at the unresolved item in
+# doc/open-issues.md that governs the value.
+#
+# The calibration tools (camera_calibrate.py, calibrate_everything.py) rewrite this file through
+# modules/config_io.write_config, which keeps comments and layout. Hand edits are safe.
+
+# PLC endpoints
+ip_address: 192.168.250.1       # Omron NX1P2 EtherNet/IP address (arm + suction)
+port: 44818                     # Omron EtherNet/IP port
+siemens_ip: 192.168.250.2       # Siemens S7-1200 address (belt speed + 4th-DOF rotation)
+siemens_port: 1502              # Siemens snap7 port
+# Length of every Omron packet waypoint array. Must equal the PLC DB array size: do not change
+# without updating every downstream array that pads to it.
+interpolar_points: 7
+limit_radius_xy: 180.0          # physical XY reach circle (mm), enforced at PLCGateway.send_package
+
+# Part classes. `destination` names the top-level drop position below; w/h are the board
+# footprint in mm (used by the simulator and the vision tooling).
+object_types:
+  QFP: {destination: QFP, w: 25.4, h: 25.4}
+  TQFP: {destination: TQFP, w: 46.0, h: 38.0}
+
+# Conveyor belt and frame transforms (doc/basis-theory.md §1)
+conveyor:
+  conveyor_position_scale_mm: 1.0   # PLC belt position -> mm (1.0: the PLC already reports mm)
+  velocity_ema_alpha: 0.4           # EMA smoothing of the measured belt velocity (0..1, higher = less smoothing)
+  # C-frame (belt u,v) -> R-frame (robot x,y) rigid transform. open-issues C6: no automated
+  # calibration procedure.
+  frame:
+    theta_deg: 28.0                 # rotation of the belt axis in the robot frame (deg)
+    robot_origin_uv: [287.0, 88.0]  # robot origin expressed in belt coordinates (mm)
+  camera_window_uv: [0.0, 120.0, 0.0, 125.0]       # [u_min, u_max, v_min, v_max] seen by the camera (mm)
+  workspace_window_uv: [188.0, 363.0, 0.0, 125.0]  # [u_min, u_max, v_min, v_max] the arm may pick in (mm)
+  # `evaluate` scenario movement targets, C-frame [u, v, z] (mm).
+  accuracy_points_uv: [[330.0, 80.0, -293.0], [220.0, 20.0, -293.0], [220.0, 100.0, -293.0]]
+
+# Drop (bin) positions in the robot frame [x, y, z] mm, referenced by object_types.*.destination
+QFP: [149.65, -13.07, -280.0]
+TQFP: [116.8, 48.735, -280.0]
+
+# Vision pipeline: YOLO-OBB inference + PyAV capture (doc/basis-programming.md §2)
+vision:
+  model_weights: models/nano@1920/weights/best.pt  # YOLO-OBB weights, relative to the repo root
+  imgsz: 1920                   # inference image size (px)
+  conf: 0.7                     # minimum confidence for a board detection
+  conf_marker: 0.55             # minimum confidence for an orientation marker detection
+  iou: 0.7                      # NMS IoU threshold
+  device: "0"                   # torch device: "0" = first CUDA GPU, "cpu" for CPU (keep quoted)
+  half: true                    # FP16 inference
+  class_map: {QFP: QFP, TQFP: TQFP}  # model class name -> object_types key
+  show_window: true             # open an OpenCV preview window
+  capture:
+    camera_usb_id: "0c45:636b"  # USB vendor:product used to locate the camera (keep quoted)
+    device: null                # explicit /dev/videoN; null = resolve from camera_usb_id
+    width: 1920
+    height: 1080
+    pixelformat: mjpeg          # MJPEG is required for 30 fps at 1080p
+    fps: 30
+  # Applied verbatim through v4l2 (manual exposure). exposure_time_absolute also feeds the
+  # camera-latency back-dating of each detection.
+  v4l2_controls:
+    exposure_dynamic_framerate: 0
+    auto_exposure: 0
+    exposure_time_absolute: 100
+  pixels_per_mm: 6.2182         # image scale (written by camera_calibrate.py)
+  roi:
+    enabled: true               # ignore detections outside the polygon
+    polygon: [[544, 162], [1328, 154], [1314, 904], [544, 908]]  # image-space ROI (px)
+  trigger_line:
+    y_px: 342                   # detections are handed to the scheduler once they cross this line
+    direction: down             # image direction the belt moves in
+    min_conf: 0.6               # confidence required at the crossing
+  # Marker-based board heading (doc/basis-theory.md §5)
+  orientation:
+    enabled: true
+    pcb_classes: [TQFP, QFP]    # classes that carry an orientation marker
+    marker_map: {marker_TQFP: TQFP, marker_QFP: QFP}  # marker class -> board class
+    cross_check: false          # cross-check marker heading against the OBB angle
+    offset_by_class: {QFP: 0.0, TQFP: 0.0}  # per-class heading offset (deg). open-issues C4
+    symmetry_by_class: {TQFP: 180, QFP: 90}  # rotational symmetry of each board (deg)
+    marker_max_dist_mm: 30.0    # a marker farther than this from a board centre is not its marker
+  tracker:
+    max_match_dist_px: 250      # centroid tracker association radius (px)
+    max_missing_frames: 15      # frames a track survives without a detection
+  # Informational belt-speed estimate from track motion; the scheduler uses the PLC encoder.
+  belt_estimator:
+    enabled: true
+    ema_alpha: 0.3
+    min_track_frames: 3
+    axis: y
+
+# Pick scheduler, trajectory model and belt speed controller (doc/basis-theory.md §3-§6)
+scheduler:
+  # Trajectory template geometry, robot frame (mm). Height hierarchy: basis-programming.md §4.2.
+  home_position: [0.0, 0.0, -290.0]
+  clearance_height: -260.0          # travel height between picks. open-issues G7 (joint limit binds here)
+  slope_transition_height: -275.0   # where the slanted approach turns vertical
+  pickup_height: -303.0             # suction-cup contact height
+  pre_pick_height: -287.0           # park height above the part before the pick phase
+  place_height: -280.0              # release height over the bin
+  corner_blend_xy: 25.0             # XY corner blend radius of the 7-point template (mm)
+
+  intercept_lead_time_s: 0.8        # minimum time from planning to predicted pick (s)
+  release_descent_time_s: 0.14      # place-phase descent before the suction is released (s)
+  nominal_xy_speed: 220.0           # rough constant-velocity ETA for logs only (mm/s) — NOT the timing model
+  nominal_z_speed: 220.0
+
+  # PLC S-curve trajectory-time model: the scheduler's estimate of every processing time.
+  # open-issues C5 (never validated on the real arm — blocking).
+  interpolator:
+    v_max: 300.0                    # mm/s
+    a_max: 1000.0                   # mm/s^2
+    d_max: 1000.0                   # mm/s^2
+    soft_start_s: 0.08              # PLC State-10 soft start (s)
+    scurve_shape_factor: 1.5        # S-curve time stretch over the trapezoid
+
+  stale_timeout_s: 5.0              # drop a track not re-seen for this long while in camera view (s)
+  speed_timeout_s: 1.0              # a belt speed sample older than this blocks planning (s)
+  poll_interval_s: 0.05             # main-loop / status poll period (s)
+
+  # Dispatch -> motion latency. Their sum is the pick gate's lead offset. open-issues C2, T3.
+  robot_movement_delay_s: 0.17
+  ethernet_delay_s: 0.016
+
+  # Post-grip rotation chain (doc/basis-theory.md §5)
+  rotate_offset_deg: -62.0          # cup marker offset (deg). open-issues C4
+  rotate_sign: 1                    # +1/-1 axis direction. open-issues C1
+  rotate_home_tolerance_deg: 0.0    # 0 = strict "axis home at grip" check. open-issues G4
+  rotate_refresh_max_delta_deg: 15.0  # largest late heading refresh accepted before the pick (deg)
+
+  # Arm-arrival tolerance, linear in belt speed from the floor (at belt_speed_min_mm_s) to the
+  # ceiling (at belt_speed_max_mm_s). open-issues G6 (widened as a symptom treatment).
+  pick_arrival_tolerance_mm: 15.0
+  pick_arrival_tolerance_max_mm: 50.0
+
+  oblique_descent_enabled: false    # belt-tracking slanted descent; false = vertical. open-issues C3
+  pick_descent_time_s: 0.0          # extra gate lead for the vertical descent (s). open-issues T1
+  gate_late_abort_mm: 12.0          # abort (and re-queue) when the gate fires this late; <= 0 disables
+
+  # Belt speed (doc/basis-theory.md §6)
+  belt_speed_static_mm_s: 120.0     # startup setpoint / static belt speed. open-issues G1 (above max)
+  adaptive_speed_enabled: true      # run the adaptive speed law instead of a static belt
+  pick_cycle_s: 3                   # calibrated arm cycle t_pick (s). open-issues G2
+  pick_transit_min_s: 0.6           # minimum residence in the workspace; caps speed at L / this (s)
+  belt_speed_headroom: 0.4          # fraction of arm capacity the density law targets
+  belt_speed_min_mm_s: 30.0         # adaptive lower bound (mm/s)
+  belt_speed_max_mm_s: 100.0        # adaptive soft ceiling (mm/s)
+  belt_speed_hw_max_mm_s: 200.0     # drive hardware maximum (mm/s)
+  belt_speed_deadband_mm_s: 5.0     # target changes smaller than this are not sent (mm/s)
+  belt_speed_max_step_mm_s: 20.0    # largest setpoint change per commit (mm/s)
+  belt_density_length_mm: 0.0       # density measurement length; 0 = u_max. open-issues G3
+  belt_accel_mm_s2: 22.31           # belt acceleration; drives the simulator ramp, informational on hardware
+
+  # Simulation / test scenarios only (not read by production)
+  default_speed: [30.0, 0.0]        # simulated belt velocity; only the magnitude is used. open-issues G5
+  test_acceptance_cycles: 9
+  accuracy_spawn_uv: [[298.0, 66.0], [330.0, 80.0], [220.0, 100.0]]  # fake-object spawn points (u, v)
+  accuracy_object_types: [TQFP]
+  accuracy_emit_interval_s: 0.7
+  throughput_object_types: [QFP, TQFP]
+  throughput_lanes: [10.0, 50.0, 90.0]  # spawn lanes (v, mm)
+  throughput_spawn_y: 200.0
+  throughput_emit_interval_s: 0.35
+  execution_margin_s: 1             # EvaluateExecutor wait margin (s)
+  evaluate_position_tolerance_mm: 2
+  evaluate_wait_timeout_s: 10.0
+
+  log_path: data.log                # performance log file
+
+# Operator console (main.py --interface)
+interface:
+  port: 8000                        # HTTP port
+  mjpeg_fps: 15                     # camera stream frame rate
