@@ -28,12 +28,14 @@ Declared work phases:
 
 Consequences for anyone working here:
 
-* The scheduler and speed controller documented in `basis-theory.md` §4 and §6 are the
-  **baseline being replaced**, not a design to defend or extend incrementally.
+* The planners and speed laws are plugins of one framework (`modules/scheduling/`, contracts
+  in its `README.md`); new algorithms are added there and measured in `sandbox/` before they
+  run on the cell. The laws documented in `basis-theory.md` §6–§7 are baselines, not designs
+  to defend.
 * **Every unresolved problem is registered in [`open-issues.md`](open-issues.md).** Read it
   before proposing changes — several obvious-looking improvements are blocked on a
   calibration or a hardware fact listed there. It is the only file where open problems live.
-* A value in `modules/config.json` being present is **not** evidence it was measured.
+* A value in `modules/config.yaml` being present is **not** evidence it was measured.
 
 ---
 
@@ -47,6 +49,10 @@ Consequences for anyone working here:
 | [`open-issues.md`](open-issues.md) | **Single register of everything unresolved** — pending calibration, config inconsistencies, architectural limits, reproducibility gaps | anyone, including AI agents |
 | [`decision-log.md`](decision-log.md) | History only: superseded designs and why they were rejected, applied calibrations, repo restructuring, parked ideas | append-only |
 | [`dev-note.md`](dev-note.md) | Human developer's working notes and hardware quirks | **human only — AI must not edit** |
+| [`plc/`](plc/README.md) | PLC programs (deployed Omron `Matching_Code_10`, target `delta_paper_0_2`), PC↔PLC data contract, defect review with proposed ST patches, config review against the PLC, PLC simulator | anyone |
+| [`pick-accuracy-findings.md`](pick-accuracy-findings.md) | Pick-gate timing defect register (T1–T9): why picks land off-centre and worsen above ~120 mm/s, evidence, fix roadmap | anyone |
+| [`../modules/scheduling/README.md`](../modules/scheduling/README.md) | How to write a dispatch rule, planner or speed law: the contracts, with worked examples | anyone |
+| [`../sandbox/README.md`](../sandbox/README.md) | The offline algorithm bench: configuration, model/plant, sweeps, what is modelled | anyone |
 
 **Rule of thumb**: descriptive documents (`basis-*`) describe only current behaviour. If you
 find yourself writing "used to", "was replaced by", or "[FIXED]" in them, that text belongs in
@@ -59,42 +65,59 @@ find yourself writing "used to", "was replaced by", or "[FIXED]" in them, that t
 
 ```
 Delta_robot/
-├── main.py                    # Orchestrator: CLI + scheduler entry point, IPC worker process
+├── main.py                    # Entry point: --cli, --scheduler, or the operator console (--interface)
 ├── camera_calibrate.py        # Camera calibration tool (ROI, trigger line, pixels/mm)
 ├── calibrate_everything.py    # Whole-config consistency + workspace boundary checker
 ├── README.md                  # Short project overview + quickstart (doc/ is authoritative)
 ├── requirements.txt           # Python dependency list
-├── CLAUDE.md                  # Claude developer rulebook (Claude-only)
-├── AGENTS.md                  # General AI developer rulebook (non-Claude-only)
+├── CLAUDE.md, AGENTS.md       # AI developer rulebooks (Claude / other agents)
 │
-├── modules/                   # System core Python modules
-│   ├── scheduler.py           # Real-time two-thread pick loop, trajectory generation, adaptive speed
-│   ├── conveyor.py            # Coordinate transforms, tracker, encoder decoder
-│   ├── EthernetCom.py         # PLC socket gateway (snap7 + pylogix)
-│   ├── image_processing.py    # YOLO-OBB inference + PyAV camera capture threads
-│   ├── interface.py           # In-process web dashboard (stdlib http.server + SSE)
-│   ├── cli.py                 # Interactive command-line command builder/parser
-│   ├── test_module.py         # Standalone fake PLC simulator (TCP socket, JSON-lines)
-│   ├── latency_probe.py       # PLC round-trip latency calibration tool
-│   ├── test_rotate.py         # 4th-DOF rotation probe (sign, axis speed, cmd-7 retrigger)
-│   ├── rotate_sweep_sim.py    # Offline sweep of the angle chain (no hardware)
-│   └── config.json            # Active system configuration (see basis-programming.md §7)
+├── modules/                   # The control software (layers: basis-programming.md §1)
+│   ├── settings.py            # Every config key: type, one default, loader, moved-key errors
+│   ├── config.yaml            # Active configuration (reference: basis-programming.md §8)
+│   ├── config_io.py           # Comment-preserving config.yaml reader/writer
+│   ├── runlog.py              # Per-run debug logs under log/
+│   ├── core/                  # Geometry and time models: frames, tracking, kinematics (PLC IK/FK),
+│   │                          #   motion (PLC time model), trajectory templates, forecast, arm models,
+│   │                          #   feeders (seeded arrivals)
+│   ├── scheduling/            # Which part next, which belt speed: rules, planners, speed laws,
+│   │                          #   gates, commit policy (README.md = the plugin contracts)
+│   ├── runtime/               # Realtime cell: decision loop, perception thread, pick executor,
+│   │                          #   pick gate, speed controller, scenario registry, part record,
+│   │                          #   virtual feeder
+│   ├── comm/                  # PLC data contract, Omron/Siemens gateways, PLC worker, UDP pose stream
+│   ├── vision/                # PyAV capture, YOLO-OBB pipeline, board heading, ROI, centroid tracker
+│   ├── ui/                    # Web dashboard, operator console back-end, interactive CLI
+│   ├── tools/                 # Probes: latency, rotation, angle sweep, frame converter, rank bounds, UDP;
+│   │                          #   flow_report (input vs throughput across runs)
+│   └── plc_sim/               # PLC simulator (Omron Matching_Code_10 port, Siemens, boards, camera)
 │
-├── doc/                        # Documentation (see §2)
+├── sandbox/                   # Offline algorithm bench: config, arm models, feeders, sweeps (README.md)
+├── tests/                     # Unit and integration tests: python3 -m unittest discover -s tests -t .
+│
+├── doc/                       # Documentation (see §2)
 │   ├── context.md, basis-theory.md, basis-programming.md
 │   ├── open-issues.md, decision-log.md, dev-note.md
-│   ├── proposal/               # Research proposal / paper sources (LaTeX)
-│   ├── PLC_Program_description/ # PLC Structured Text & Ladder rung-by-rung breakdowns
-│   └── Manuals/                 # PLC & hardware datasheets (open only to check a register)
+│   ├── pick-accuracy-findings.md  # Pick-gate timing defect register (T1-T9) + fix roadmap
+│   ├── proposal/              # Research proposal / paper sources (LaTeX)
+│   ├── plc/                   # PLC programs, PC↔PLC data contract, PLC defect review,
+│   │                          #   config review, simulator (start at plc/README.md)
+│   └── Manuals/               # PLC & hardware datasheets (open only to check a register)
 │
-└── models/                    # Trained YOLO weights
-    ├── nano@1280/              # YOLO-OBB 1280p models
-    └── nano@1920/              # YOLO-OBB 1920p models (default active model)
+├── log/                       # Run logs written by main.py (git-ignored; basis-programming.md §2.5)
+├── OMRON/                     # Omron Sysmac exports: matching code/ (current), delta_paper_0_2/ (target)
+├── windows/                   # Windows launchers of the operator console (setup.bat, run.bat)
+└── models/                    # Trained YOLO weights (nano@1280, nano@1920 = default)
 ```
 
 **Ignored working directories** (present on disk, not part of the project): `runs/` (YOLO
-training/inference output), `.report/`, `.venv/`, `__pycache__/`, and `.archive/` — a
-local-only archive of the graduation thesis, the old test harness and superseded docs.
+training/inference output), `sandbox/results/` (sweep output), `.report/`, `.venv/`,
+`__pycache__/`, and `.archive/` — a local-only archive of the graduation thesis, the old test
+harness, the 2026-08 pick-accuracy investigation and superseded docs.
+
+The scheduling research that produced the published results lives in a separate repository
+(`../python for scheduling`, frozen at tag `paper-submitted`); algorithm work continues in
+`sandbox/`.
 `.archive/` must never be read, referenced, or restored into the tracked tree; what moved
 there and why is in `decision-log.md` §3.
 
@@ -110,8 +133,8 @@ there and why is in `decision-log.md` §3.
 
 ### File access rules
 
-* Read freely: `main.py`, `README.md`, `modules/**/*.py`, `modules/config.json`, and
-  `doc/*.md`.
+* Read freely: `main.py`, `README.md`, `modules/**/*.py`, `modules/config.yaml`,
+  `modules/scheduling/README.md`, `sandbox/`, `tests/`, and `doc/*.md`.
 * Read with caution: `doc/Manuals/*.pdf` (large hardware documentation — open only when
   checking a specific physical register).
 * Never read or edit: `.archive/`, `.git/`, `.venv/`, `__pycache__/`, `runs/`.
@@ -125,8 +148,11 @@ there and why is in `decision-log.md` §3.
 
 * **Never commit** `data.log` or other runtime log files, or `__pycache__/` directories.
 * **Never remove or reorder** fields in `SiemensSendPacket` / `SiemensReceivePacket` — the
-  byte layout must match the PLC DB offsets exactly (`basis-programming.md` §3.2).
-* **Never change** the default `interpolar_points` value in `config.json` without updating
-  every downstream array that pads to that size.
-* After any change to `EthernetCom.py`, `scheduler.py`, or `cli.py`, run the compile check in
-  `basis-programming.md` §8.
+  byte layout must match the PLC DB offsets exactly (`basis-programming.md` §3.2,
+  `modules/comm/packets.py`).
+* **Never change** `plc.interpolar_points` in `config.yaml` without updating every
+  downstream array that pads to that size.
+* Respect the layering (`basis-programming.md` §1); a new config key is a field in
+  `modules/settings.py`, a moved key an entry in `settings.MOVED_KEYS`.
+* After any Python change, run the compile check and the test suite in
+  `basis-programming.md` §9.

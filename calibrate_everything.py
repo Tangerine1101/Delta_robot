@@ -6,22 +6,22 @@ section interactively, this one validates the *entire* parameter set for mutual
 consistency and physical safety, orchestrates the camera tool, and leaves
 clearly-marked hooks for future physical calibration.
 
-It answers, in one place: are the scheduler heights sane, do the test-scenario
-configs sit inside the workspace, and — most importantly — does any config the
+It answers, in one place: does the config load (every key known, heights in
+order), is the vision section sane, and — most importantly — does any point the
 robot is actually commanded to during operation push it OUTSIDE the physical
-forbidden circle (`limit_radius_xy`)?
+motion envelope (`robot.limits`: XY circle and z band)?
 
 Design notes:
   * Read-only by default. The script itself only writes config under --fix, and
-    only for SAFE DERIVED values (e.g. slope_transition_height = midpoint). It
+    only for SAFE DERIVED values (e.g. robot.heights.slope_transition = midpoint). It
     never rewrites hand-measured physical values, and never clamps an
     out-of-circle workspace (CLAUDE.md §4.4: discard, not clamp — we *suggest* a
     fitted window instead).
   * The camera stage delegates to `camera_calibrate.py` as a subprocess: that
     tool must set QT_QPA_PLATFORM=xcb before importing cv2, so a separate process
     keeps the env isolated and keeps GUI deps out of the headless validators.
-  * Importing modules.scheduler / modules.conveyor does not pull cv2/ultralytics
-    (lazy inside image_processing), so --check runs headless / in CI.
+  * Importing modules.settings / modules.core does not pull cv2/ultralytics, so
+    --check runs headless / in CI.
 
 Usage:
     python3 calibrate_everything.py            # all non-interactive validators + report
@@ -36,25 +36,21 @@ Exit code is non-zero if any validator fails.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import subprocess
 import sys
 from typing import Any
 
-from modules.EthernetCom import load_config
-from modules.conveyor import ConveyorFrame, is_within_xy_limit
-from modules.scheduler import (
-    SchedulerSettings,
-    _build_goto_geometry,
-    _build_pick_geometry,
-)
+from modules.config_io import CONFIG_PATH as _CONFIG_PATH, read_config, write_config
+from modules.core.frames import ConveyorFrame, is_within_xy_limit
+from modules.core.trajectory import goto_waypoints, pick_waypoints
+from modules.scheduling.registry import validate_plugin_config
+from modules.settings import Settings, settings_from_dict
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(ROOT, "modules", "config.json")
+CONFIG_PATH = str(_CONFIG_PATH)
 CAMERA_SCRIPT = os.path.join(ROOT, "camera_calibrate.py")
-DEFAULT_LIMIT_RADIUS_XY = 180.0
 
 # A check result: (name, ok, detail).
 CheckResult = tuple[str, bool, str]
@@ -66,24 +62,24 @@ CheckResult = tuple[str, bool, str]
 
 
 def _load_raw() -> dict[str, Any]:
-    with open(CONFIG_PATH, encoding="utf-8") as handle:
-        return json.load(handle)
+    return read_config(CONFIG_PATH)
 
 
 def _save_raw(cfg: dict[str, Any]) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-        json.dump(cfg, handle, indent=4)
+    write_config(cfg, CONFIG_PATH)
     print(f"[OK] wrote {CONFIG_PATH}")
 
 
-def _build_settings() -> tuple[SchedulerSettings | None, str | None]:
-    """Build SchedulerSettings from the live config. Returns (settings, error).
+def _build_settings(raw: dict[str, Any]) -> tuple[Settings | None, str | None]:
+    """Build Settings from the raw config. Returns (settings, error).
 
-    SchedulerSettings.from_config() calls .validate() at the end, so a bad height
-    hierarchy raises here — we capture it as an error string instead of crashing.
+    The loader rejects unknown or moved keys and validates the height hierarchy and the
+    plugin names, so any of those surfaces here as an error string instead of a crash.
     """
     try:
-        return SchedulerSettings.from_config(load_config()), None
+        settings = settings_from_dict(raw)
+        validate_plugin_config(settings)
+        return settings, None
     except Exception as exc:  # noqa: BLE001 — surface any config error as a FAIL
         return None, str(exc)
 
@@ -95,54 +91,32 @@ def _build_settings() -> tuple[SchedulerSettings | None, str | None]:
 
 def validate_structure(
     raw: dict[str, Any],
-    settings: SchedulerSettings | None,
+    settings: Settings | None,
     settings_error: str | None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     if settings is None:
-        results.append(("scheduler settings build + height hierarchy", False, settings_error or "unknown error"))
+        results.append(("config loads (keys, types, height hierarchy, plugins)", False,
+                        settings_error or "unknown error"))
         # Without settings we cannot run the structural checks that depend on it.
         return results
+    h = settings.robot.heights
     results.append((
-        "scheduler settings build + height hierarchy",
+        "config loads (keys, types, height hierarchy, plugins)",
         True,
-        f"clearance {settings.clearance_height} > slope {settings.slope_transition_height} "
-        f"> pre_pick {settings.pre_pick_height} > pickup {settings.pickup_height}; "
-        f"place {settings.place_height}",
+        f"clearance {h.clearance} > slope {h.slope_transition} > pre_pick {h.pre_pick} "
+        f"> pickup {h.pickup}; place {h.place}",
     ))
 
-    # Window ordering.
-    for label, window in (("workspace_window_uv", settings.workspace_window_uv),
-                          ("camera_window_uv", settings.camera_window_uv)):
-        u_min, u_max, v_min, v_max = window
-        ok = u_min < u_max and v_min < v_max
-        results.append((f"{label} ordering", ok,
-                        f"u[{u_min}, {u_max}] v[{v_min}, {v_max}]"))
-
-    ws = settings.workspace_window_uv
-
-    # Simulated spawn / evaluate points must sit inside the workspace window.
-    spawn_bad = [pt for pt in settings.accuracy_spawn_uv
-                 if not ConveyorFrame.is_in_window_uv(pt[0], pt[1], ws)]
-    results.append(("accuracy_spawn_uv inside workspace", not spawn_bad,
-                    "all inside" if not spawn_bad else f"outside: {spawn_bad}"))
-
-    apuv_bad = [pt for pt in settings.accuracy_points_uv
-                if not ConveyorFrame.is_in_window_uv(pt[0], pt[1], ws)]
-    results.append(("accuracy_points_uv inside workspace", not apuv_bad,
-                    "all inside (or none configured)" if not apuv_bad else f"outside: {apuv_bad}"))
-
-    # Throughput lanes (v positions) must fall within the workspace v-range.
-    lane_bad = [v for v in settings.throughput_lanes if not (ws[2] <= v <= ws[3])]
-    results.append(("throughput_lanes within workspace v-range", not lane_bad,
+    # The simulator feeds boards on these lanes; they must fall within the workspace v-range.
+    ws = settings.conveyor.workspace_window_uv
+    lane_bad = [v for v in settings.plc_sim.feed_lanes if not (ws[2] <= v <= ws[3])]
+    results.append(("plc_sim.feed_lanes within workspace v-range", not lane_bad,
                     "all inside" if not lane_bad else f"outside [{ws[2]}, {ws[3]}]: {lane_bad}"))
-
-    # Each object type's destination must have a sorting position.
-    missing_dest = [dest for dest in settings.object_type_map.values()
-                    if dest not in settings.sorting_positions]
-    results.append(("object_types destinations resolve to sorting positions", not missing_dest,
-                    "all resolved" if not missing_dest else f"missing top-level position(s): {missing_dest}"))
+    unknown_feed = [t for t in settings.plc_sim.feed_types if t not in settings.object_types]
+    results.append(("plc_sim.feed_types are object_types", not unknown_feed,
+                    "all known" if not unknown_feed else f"unknown: {unknown_feed}"))
 
     # Vision sanity (from raw config).
     results.extend(_validate_vision(raw))
@@ -203,28 +177,23 @@ def _sample_workspace_picks(
 
 def validate_forbidden_circle(
     raw: dict[str, Any],
-    settings: SchedulerSettings | None,
+    settings: Settings | None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     if settings is None:
-        results.append(("forbidden-circle check", False, "scheduler settings did not build"))
+        results.append(("forbidden-circle check", False, "config did not load"))
         return results
 
-    limit = float(raw.get("limit_radius_xy", DEFAULT_LIMIT_RADIUS_XY))
-    frame = ConveyorFrame()
-    ws = settings.workspace_window_uv
+    envelope = settings.robot.limits
+    limit = envelope.radius_xy_mm
+    frame = ConveyorFrame.from_settings(settings.conveyor)
+    ws = settings.conveyor.workspace_window_uv
+    home = settings.robot.home_position
 
-    # 1) Static commanded points: home, sorting positions, accuracy points.
-    static_points: list[tuple[str, float, float]] = [
-        ("home_position", settings.home_position[0], settings.home_position[1]),
-    ]
-    for dest, pos in settings.sorting_positions.items():
-        static_points.append((f"sorting[{dest}]", pos[0], pos[1]))
-    for i, pos in enumerate(settings.accuracy_points):
-        static_points.append((f"accuracy_points[{i}]", pos[0], pos[1]))
-    for i, pos in enumerate(settings.accuracy_points_uv):
-        x, y = frame.to_robot(pos[0], pos[1])
-        static_points.append((f"accuracy_points_uv[{i}]->R", x, y))
+    # 1) Static commanded points: home and the bins.
+    static_points: list[tuple[str, float, float]] = [("robot.home_position", home[0], home[1])]
+    for name, spec in settings.object_types.items():
+        static_points.append((f"object_types.{name}.bin", spec.bin[0], spec.bin[1]))
 
     static_bad = [(name, math.hypot(x, y)) for name, x, y in static_points
                   if not is_within_xy_limit(x, y, limit)]
@@ -237,22 +206,30 @@ def validate_forbidden_circle(
     ))
 
     # 2) Full trajectory waypoints across the workspace, during operation.
-    picks = _sample_workspace_picks(ws, frame, settings.pickup_height)
-    sorts = list(settings.sorting_positions.values()) or [settings.home_position]
+    picks = _sample_workspace_picks(ws, frame, settings.robot.heights.pickup)
+    sorts = [spec.bin for spec in settings.object_types.values()] or [home]
     worst: tuple[float, str] | None = None
     n_waypoints = 0
+    z_bad: list[str] = []
     for pick in picks:
         for sort in sorts:
-            goto = _build_goto_geometry(settings.home_position, pick, settings)
-            pick_traj = _build_pick_geometry(pick, sort, settings, goto)
+            goto = goto_waypoints(home, pick, settings.robot)
+            pick_traj = pick_waypoints(pick, sort, settings.robot)
             for phase, traj in (("goto", goto), ("pick", pick_traj)):
-                for j, (x, y, _z) in enumerate(traj):
+                for j, (x, y, z) in enumerate(traj):
                     n_waypoints += 1
+                    if not envelope.z_min_mm <= z <= envelope.z_max_mm and len(z_bad) < 3:
+                        z_bad.append(f"{phase} P{j + 1} z={z:.1f}")
                     r = math.hypot(x, y)
                     if not is_within_xy_limit(x, y, limit):
                         if worst is None or r > worst[0]:
                             worst = (r, f"{phase} P{j + 1} at pick=({pick[0]:.1f},{pick[1]:.1f}) "
                                         f"sort=({sort[0]:.1f},{sort[1]:.1f}) -> r={r:.1f}")
+    results.append((
+        f"all operating waypoints within z [{envelope.z_min_mm:.1f}, {envelope.z_max_mm:.1f}]",
+        not z_bad,
+        f"checked {n_waypoints} waypoints" if not z_bad else "; ".join(z_bad),
+    ))
     if worst is None:
         results.append((
             f"all operating waypoints within {limit:.1f} mm circle",
@@ -321,30 +298,30 @@ def _suggest_fitted_window(
 
 
 def apply_safe_fixes(raw: dict[str, Any], no_save: bool) -> list[CheckResult]:
-    """Recompute SAFE DERIVED config values. Currently: slope_transition_height
+    """Recompute SAFE DERIVED config values. Currently: robot.heights.slope_transition
     as the (clearance + pre_pick)/2 midpoint when missing or out of hierarchy.
     Nothing physical, nothing clamped.
     """
     results: list[CheckResult] = []
-    sched = raw.get("scheduler", {}) or {}
-    clearance = float(sched.get("clearance_height", -270.0))
-    pre_pick = float(sched.get("pre_pick_height", -290.0))
+    heights = (raw.get("robot", {}) or {}).get("heights", {}) or {}
+    clearance = float(heights.get("clearance", -270.0))
+    pre_pick = float(heights.get("pre_pick", -290.0))
     midpoint = round((clearance + pre_pick) / 2.0, 3)
-    current = sched.get("slope_transition_height")
+    current = heights.get("slope_transition")
 
     needs = current is None or not (pre_pick < float(current) < clearance)
     if not needs:
-        results.append(("fix slope_transition_height", True, f"already valid ({current}); no change"))
+        results.append(("fix robot.heights.slope_transition", True, f"already valid ({current}); no change"))
         return results
 
     if no_save:
-        results.append(("fix slope_transition_height", True,
+        results.append(("fix robot.heights.slope_transition", True,
                         f"WOULD set {current} -> {midpoint} (--no-save: not written)"))
         return results
 
-    raw.setdefault("scheduler", {})["slope_transition_height"] = midpoint
+    raw.setdefault("robot", {}).setdefault("heights", {})["slope_transition"] = midpoint
     _save_raw(raw)
-    results.append(("fix slope_transition_height", True, f"set {current} -> {midpoint}"))
+    results.append(("fix robot.heights.slope_transition", True, f"set {current} -> {midpoint}"))
     return results
 
 
@@ -368,11 +345,11 @@ def _todo_physical_calibration() -> None:
     """Placeholder for physical-rig calibration, enabled once every scenario runs
     perfectly. Each item should be driven by an existing test scenario:
 
-      * F_CONVEYOR_TO_ROBOT (_T_X, _T_Y, _THETA_RAD) — from `test_vision_only`
-        board readings vs hand-measured robot position.
-      * robot_movement_delay_s / nominal_xy_speed / nominal_z_speed — from the
-        `evaluate` scenario (gate on pos_EE convergence, not argument_time).
-      * conveyor_position_scale_mm — from measured belt travel over a known move.
+      * conveyor.frame (theta, robot origin) — from `test_vision_only` board
+        readings vs hand-measured robot position.
+      * pick_gate.robot_movement_delay_s — from the stationary-belt [GATE]
+        measurement (pick-accuracy-findings §3.1).
+      * conveyor.position_scale_mm — from measured belt travel over a known move.
 
     Not yet enabled — see doc/dev-note.md for the calibration roadmap.
     """
@@ -414,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     args, camera_extra = parser.parse_known_args(argv)
 
     raw = _load_raw()
-    settings, settings_error = _build_settings()
+    settings, settings_error = _build_settings(raw)
     failures = 0
 
     # --camera is a standalone interactive stage (only when no validator-only flag).

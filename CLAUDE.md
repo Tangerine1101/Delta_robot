@@ -27,7 +27,8 @@ The `doc/` set is six files:
 
 ### Read freely:
 - `main.py`, `README.md`
-- `modules/` — all `.py` files and `config.json`
+- `modules/` — all `.py` files and `config.yaml`, and `modules/scheduling/README.md`
+- `sandbox/`, `tests/`
 - `doc/*.md`
 
 ### Read with caution:
@@ -53,8 +54,24 @@ The `doc/` set is six files:
 
 - **Never commit** `data.log` or other runtime log files, or `__pycache__/` directories.
 - **Never remove or reorder** fields in `SiemensSendPacket` or `SiemensReceivePacket` — the byte layout must match the PLC DB offsets exactly.
-- **Never change** the default `interpolar_points` value in `config.json` without updating downstream arrays that pad to that size.
-- After any change to `EthernetCom.py`, `scheduler.py`, or `cli.py`, run the compile check:
+- **Never change** `plc.interpolar_points` in `config.yaml` without updating downstream arrays that pad to that size.
+- Respect the layering (`doc/basis-programming.md` §1): `core` never imports `scheduling`, `scheduling` never imports `runtime`, nothing under `modules/` imports `sandbox/`. A new config key is a dataclass field in `modules/settings.py` (its one default); a moved key gets an entry in `settings.MOVED_KEYS`.
+- After any Python change, run the compile check and the test suite (no hardware needed):
   ```bash
-  python3 -m py_compile main.py modules/cli.py modules/EthernetCom.py modules/image_processing.py modules/scheduler.py modules/test_module.py modules/conveyor.py modules/interface.py
+  python3 -m compileall -q main.py calibrate_everything.py camera_calibrate.py modules sandbox tests
+  python3 -m unittest discover -s tests -t .
   ```
+
+---
+
+## 5. Subagents — pick the model by task difficulty
+
+When spawning an agent, set `model` to match how hard the task is, not a single default:
+
+| Model | Use for |
+|---|---|
+| `opus` | Design and architecture, cross-module reasoning, timing- or safety-critical code (scheduler, pick gate, speed controller, PLC data contracts), root-cause investigation |
+| `sonnet` | Routine implementation against a clear spec, moderate-breadth exploration, test updates, doc rewrites |
+| `haiku` | Simple tasks with short context only: grep/listing, single-file lookups, running compile checks or tests and reporting the output, formatting |
+
+If a `haiku`/`sonnet` agent returns an uncertain or shallow result on a hard question, redo it with a stronger model rather than trusting it.

@@ -7,7 +7,7 @@
 > this), [`context.md`](context.md) (AI onboarding), [`open-issues.md`](open-issues.md)
 > (what is still unresolved), [`decision-log.md`](decision-log.md) (superseded designs and
 > why they were replaced).
-> **Numeric policy**: formulas here are symbolic; each symbol maps to a `modules/config.json`
+> **Numeric policy**: formulas here are symbolic; each symbol maps to a `modules/config.yaml`
 > key (tables below). Live values belong to the config, not this document.
 > **Status policy**: this document describes the system **as it currently behaves**. It
 > contains no history and no roadmap — those live in `decision-log.md` and
@@ -55,7 +55,7 @@ $$
   (`conveyor.frame.theta_deg`).
 * $(T_X, T_Y)$: translation of the conveyor origin (`conveyor.frame.robot_origin_uv`).
 
-Implementation: `ConveyorFrame` in `modules/conveyor.py`; calibration procedure via the
+Implementation: `ConveyorFrame` in `modules/core/frames.py`; calibration procedure via the
 `test_vision_only` scenario (see `basis-programming.md`).
 
 ### 1.2. Planar homography H (V → C)
@@ -69,17 +69,17 @@ $$
 
 In the deployed system the camera is mounted square to the belt, so $\mathbf{H}$ degenerates
 into an axis swap + uniform scale (`vision.pixels_per_mm`, ROI offsets) — see
-`M_VISION_TO_CONVEYOR` in `modules/conveyor.py`.
+`M_VISION_TO_CONVEYOR` in `modules/core/frames.py`.
 
 ---
 
 ## 2. Kinematics of the Delta Mechanism
 
 The kinematics run **on the Omron PLC**, not the PC — this section is the reference model.
-The rung-level/ST derivations live in `doc/PLC_Program_description/`
-(`inverse_kinematics.md`, `calc_forward_kinematic.md`).
+What the PLC code does (limits, sign conventions, error cases) is in
+[`plc/kinematics.md`](plc/kinematics.md).
 
-Geometric parameters: $s_b$ base triangle side (320.0 mm), $s_p$ platform side (94.0 mm),
+Geometric parameters: $s_b$ base triangle side (346.4 mm), $s_p$ platform side (86.6 mm),
 $L$ bicep length (140.0 mm), $l$ forearm length (315.0 mm).
 
 ### 2.1. Inverse kinematics (IK)
@@ -139,10 +139,11 @@ The physical (lower) root: $Z_0 = \frac{-B_q - \sqrt{B_q^2 - 4 A_q C_q}}{2 A_q}$
 
 ## 3. Trajectory Profiles
 
-The PLC executes the trajectory; the PC's `TrajectoryInterpolator`
-(`scheduler.interpolator.*` config) mirrors the same model to *predict segment timing* for
-gate leads and ETAs. ST derivations: `doc/PLC_Program_description/MC_inter_curve_vel.md`,
-`s_and_trapodize.md`, `easy_understand_talet_3d.md`.
+The PLC executes the trajectory; the PC's time model (`modules/core/motion.py`,
+`robot.interpolator.*` config) mirrors the same model to *predict segment timing* for
+gate leads and ETAs. The PLC function blocks themselves are described in
+[`plc/motion-fbs.md`](plc/motion-fbs.md); the target PLC program's profile differs from the
+model below (no corner look-ahead) — see `open-issues.md` §C.1.
 
 ### 3.1. Polynomial S-curve profile (jerk-bounded)
 
@@ -171,12 +172,12 @@ V_{\text{corner}} = V_{\max} \cos\frac{\Theta}{2} = V_{\max}\sqrt{\frac{\cos\The
 This bounds centripetal acceleration and mechanical shock at corner transitions
 (`corner_blend_xy`).
 
-| Symbol | Config key (`scheduler.`) |
+| Symbol | Config key (`robot.`) |
 |---|---|
 | $V_{\max}$, $A_{\max}$, $D_{\max}$ | `interpolator.v_max` / `.a_max` / `.d_max` |
 | soft-start dwell | `interpolator.soft_start_s` |
 | 1.5× shape factor | `interpolator.scurve_shape_factor` |
-| coarse ETA speeds (logs only, NOT the timing model) | `nominal_xy_speed`, `nominal_z_speed` |
+| coarse ETA speeds written into `argument_time` (NOT the timing model) | `packet_time.nominal_xy_speed`, `.nominal_z_speed` |
 
 ---
 
@@ -206,8 +207,8 @@ $$p_{\text{anchor}} = p(t_{\text{cap}}), \qquad
 t_{\text{cap}} = t_{\text{decode}} - \tfrac{1}{2} t_{\text{exposure}}$$
 
 Falls back to the current position when history is unavailable (static/simulated belt).
-Implementation: `BeltPositionTracker.position_at`, `_capture_loop` in
-`modules/image_processing.py`.
+Implementation: `BeltPositionTracker.position_at` (`modules/core/tracking.py`), `_capture_loop`
+in `modules/vision/pipeline.py`.
 
 ### 4.3. Fixed-point pick-position prediction
 
@@ -221,9 +222,13 @@ Iterate to the earliest goto-feasible pick:
 3. Map to R-frame; compute robot travel time $\Delta t_{\text{goto}}$.
 4. $t^{(k+1)} = t_{\text{now}} + \Delta t_{\text{goto}} + t_{\text{delay}}$; repeat to
    convergence.
-5. Apply the minimum lead (`intercept_lead_time_s`) so the arm parks *downstream* of the
-   object; clamp $u_{\text{pick}}$ to the workspace edge for danger-zone objects. If the arm
+5. Apply the minimum lead (`pick_gate.intercept_lead_time_s`) so the arm parks *downstream* of the
+   object; clamp $u_{\text{pick}}$ to the workspace edge. If the arm
    cannot arrive before the object passes $u_{\text{pick}}$, skip (genuinely unreachable).
+
+This solver is `DeltaArm.predict` (`modules/core/delta.py`); it costs every job a planner sees
+(§7). The `spt` rule picks the job with the shortest start → pick → bin path: path length
+stands in for processing time, since on this arm a shorter path is a shorter pick cycle.
 
 ### 4.4. Positional pick gate
 
@@ -233,9 +238,14 @@ encoder-anchored position and dispatches the pick the moment
 $$u_{\text{now}} \ge u_{\text{pick}} - \text{offset}(v_{\text{belt}})$$
 
 **Lead offset.** Between gate-true and physical suction contact lies
-$T_{\text{delay}} =$ `robot_movement_delay_s` + `ethernet_delay_s` (+ sampling latency ≈ gate
-poll/2 + perception tick/2). The object moves $v_{\text{belt}} \cdot T_{\text{delay}}$
-downstream in that window, so the gate fires early by exactly that displacement:
+$T_{\text{delay}} =$ `pick_gate.robot_movement_delay_s` + `ethernet_delay_s` + `pick_descent_time_s`
+(+ sampling latency ≈ gate poll/2 + perception tick/2). `robot_movement_delay_s` is the
+empirical dispatch→contact delay and already contains the deployed PLC's State-10 descent
+(≈ 0.08 s ramp to `Pos[0]`); `pick_descent_time_s` (default 0) is an explicit extra term for
+a vertical descent, used only if a stationary-belt measurement shows contact later than that.
+With the oblique descent on it is not added (the slanted contact absorbs the travel, §4.5).
+The object moves $v_{\text{belt}} \cdot T_{\text{delay}}$ downstream in that window, so the
+gate fires early by exactly that displacement:
 
 $$\text{offset}(v_{\text{belt}}) = v_{\text{belt}} \cdot T_{\text{delay}}$$
 
@@ -247,20 +257,39 @@ window at the ramp end $T_{\text{accel}} = |v_{sp} - v_c| / a_{\text{nom}}$:
 * ramp finishes: $\text{offset} = \tfrac{v_c + v_{sp}}{2} T_{\text{accel}}
   + v_{sp}(T_{\text{delay}} - T_{\text{accel}})$
 
-These are **not implemented**: the commit-timing strategy (§6.5) guarantees a steady belt at
-gate-fire time, so the precision path stays single-term and the live gate absorbs residual
-drift. Any redesign of the speed controller that relaxes that guarantee must revisit this —
-see `open-issues.md` **L9**.
+These are **not implemented**: the speed controller (§6.5) freezes the belt setpoint for the
+whole committed pick, so the precision path stays single-term and the live gate absorbs
+residual drift. Any redesign of the speed controller that relaxes that guarantee must revisit
+this — see `open-issues.md` **L9**.
 
-$T_{\text{delay}}$ is calibrated from the per-pick `[GATE]` log (`dispatch_to_contact_s`) and
-`modules/latency_probe.py`; both terms are **currently uncalibrated estimates**
-(`open-issues.md` **C2**).
+**Park before the gate.** The gate fires $T_{\text{lead}}$ (the full lead above, in seconds)
+before the object reaches $u_{\text{pick}}$, so a plan is feasible only if
+$t_{\text{now}} + T_{\text{cmd}} + T_{\text{goto}} + T_{\text{lead}} \le t_{\text{pick}}$;
+the predictor pushes the intercept downstream (fixed point, ≤ 4 passes) until that holds, and
+rejects the object if the push reaches $u_{\max}$.
+
+**Two-sided gate.** If the arm parks late and the object is already more than
+`pick_gate.late_abort_mm` past the threshold when the gate is evaluated, the pick is aborted
+before dispatch (the object is re-queued) instead of landing the cup behind the board.
+
+**Arrival acceptance.** The arm counts as arrived only when it is within the speed-mapped
+tolerance of the target **and** inside the final vertical segment of the packet: the deployed
+PLC accepts a new command 3 on top of a running chain (`open-issues.md` **O2**), which is
+harmless only once the last chain instance is running.
+
+**IK pre-check.** Every waypoint of a plan is checked against the PLC-faithful IK port
+(`modules/core/kinematics.ik_reachable`, joint limit included) before the object is
+claimed; the deployed IK reports a joint-limit trip as success (**O1**).
+
+$T_{\text{delay}}$ is calibrated from the per-pick `[GATE]` log (`dispatch_to_contact_s`,
+with `t_d_model_s` reporting the vertical descent model) and `modules/tools/latency_probe.py`; the
+terms are **currently uncalibrated estimates** (`open-issues.md` **C2**, **T3**).
 
 ### 4.5. Oblique intercept (belt-tracking descent, opt-in)
 
 A vertical descent at a fixed R-frame point contacts the board with horizontal *relative*
 velocity equal to the belt speed, dragging it during suction settling. With
-`scheduler.oblique_descent_enabled`: the arm still **parks above the predicted point**
+`pick_gate.oblique_descent_enabled`: the arm still **parks above the predicted point**
 $\mathbf{p}_{\text{pick}}$ (goto unchanged, stays in-workspace), but the pick-phase **contact
 point shifts downstream** by the board's travel during the descent:
 
@@ -275,9 +304,9 @@ absorbs the $t_d$ travel — $t_d$ is *not* added to the lead).
 > which would leave the workspace at operating belt speed.
 >
 > **Currently disabled** (`oblique_descent_enabled = false` ⇒ vertical descent) because
-> `interpolator.a_max` is uncalibrated and $t_d$ is consequently over-estimated: at high belt
+> `robot.interpolator.a_max` is uncalibrated and $t_d$ is consequently over-estimated: at high belt
 > speed the computed contact can approach $u_{\max}$, which is handled as a safe
-> dispatch-reject rather than a clamp. See `open-issues.md` **C3**/**C5**.
+> dispatch-reject rather than a clamp. See `open-issues.md` **C3**/**C5**/**T2**.
 
 ### 4.6. Tracked-object lifecycle
 
@@ -343,9 +372,9 @@ $\varphi_{\text{board}}$; the post-grip command is
 
 $$\theta_{\text{cmd}} = \text{wrap}_{\pi}\!\big(s\,(\theta_{\text{offset}} - \varphi_{\text{board}})\big)$$
 
-with $\theta_{\text{offset}}$ = `rotate_offset_deg` (bin orientation) and $s$ = `rotate_sign`
-$\in \{+1, -1\}$ (physical axis direction vs. R-frame CCW; calibrate with
-`python3 -m modules.test_rotate`). The wrap to $[-\pi, \pi)$ **is** the minimal-turn decision,
+with $\theta_{\text{offset}}$ = `robot.rotation.offset_deg` (bin orientation) and $s$ =
+`robot.rotation.sign` $\in \{+1, -1\}$ (physical axis direction vs. R-frame CCW; calibrate with
+`python3 -m modules.tools.test_rotate`); `runtime/plan.post_grip_rotation_rad`. The wrap to $[-\pi, \pi)$ **is** the minimal-turn decision,
 made exactly once, relative to the homed 0.
 
 **Layer 3 — wire (IPC boundary, verbatim).** The Siemens axis accepts signed degrees in
@@ -358,23 +387,23 @@ $$\theta_{\text{wire}} = \text{clamp}_{\pm 359}\big(\deg(\theta_{\text{cmd}})\bi
 Wrapping here ($180° \to -180°$, $270° \to -90°$) would flip the commanded spin direction and
 drive the axis nearly a full turn the wrong way on a $179° \to 180°$ step. Manual/CLI absolute
 angles pass through untouched.
-(`robot_rad_to_wire_deg` / `wire_deg_to_robot_rad` in `modules/EthernetCom.py`.)
+(`robot_rad_to_wire_deg` / `wire_deg_to_robot_rad` in `modules/core/angles.py`.)
 
 **Calibration**: (1) `test_rotate` probe — remap/settle, implied axis speed, visual direction
-check for `rotate_sign`, cmd-7→cmd-7 retrigger test; (2) a hardware run reading the per-pick
+check for `robot.rotation.sign`, cmd-7→cmd-7 retrigger test; (2) a hardware run reading the per-pick
 `[ROTATE]` log (`vision_angle / board_heading / rotate_cmd / rotate_at_gate / rotate_at_end`)
-to set `rotate_offset_deg` + `offset_by_class`. `rotate_home_tolerance_deg` > 0 turns
-"axis not yet home at grip" into a warn-only check. Neither `rotate_sign` nor the offsets
+to set `robot.rotation.offset_deg` + `object_types.<type>.heading_offset_deg`.
+`robot.rotation.home_tolerance_deg` > 0 turns "axis not yet home at grip" into a warn-only
+check. Neither the sign nor the offsets
 have been confirmed on hardware — `open-issues.md` **C1**/**C4**.
 
 ---
 
 ## 6. Adaptive Conveyor Speed (Rate Regulation)
 
-> **Baseline notice.** §6 documents the **currently deployed** speed controller. It is the
-> starting point of the ongoing redesign, not the target design — in particular it is
-> open-loop with respect to missed picks (`open-issues.md` **L10**). Do not treat it as the
-> intended final algorithm.
+> **Baseline notice.** §6 documents the `inverse_density` speed law, the cell's first
+> adaptive law. It is a baseline, not the target design — in particular it is open-loop with
+> respect to missed picks (`open-issues.md` **L10**). The other laws are in §7.
 
 **Goal: preserve the serial arm's throughput under an unstable feeder.** The belt is a **rate
 regulator**, not a transport to maximize: its job is to hold the *presentation rate* of
@@ -383,16 +412,16 @@ density: belt speed does not set throughput — the serial arm's pick cycle does
 
 ### 6.1. Symbols ↔ config
 
-| Symbol | Meaning | Config key (`scheduler.`) |
+| Symbol | Meaning | Config key |
 |---|---|---|
-| $v_{\min}$ | operational floor (hardware control imprecise at very low speed) | `belt_speed_min_mm_s` |
-| $v_{\text{cap}}$ | pickability ceiling, derived $= \min(L/t_{\text{transit}},\, v_{\text{soft}},\, v_{\text{hw}})$ | via `pick_transit_min_s`, `belt_speed_max_mm_s`, `belt_speed_hw_max_mm_s` |
-| $a_{\text{nom}}$, $T_{\text{ramp}}$ | belt accel magnitude / jerk-phase build time (informational) | `belt_accel_mm_s2`, `belt_ramp_s` |
-| $t_{\text{pick}}$, $\mu_{\max} = 1/t_{\text{pick}}$ | calibrated pick cycle / arm ceiling | `pick_cycle_s` |
-| $k$, $\lambda_{\text{nom}} = k\,\mu_{\max}$ | headroom factor / presentation-rate target | `belt_speed_headroom` |
+| $v_{\min}$ | operational floor (hardware control imprecise at very low speed) | `speed.band.min_mm_s` |
+| $v_{\text{cap}}$ | pickability ceiling, derived $= \min(L/t_{\text{transit}},\, v_{\text{soft}},\, v_{\text{hw}})$ | via `speed.laws.inverse_density.transit_min_s`, `speed.band.max_mm_s`, `conveyor.hw_max_mm_s` |
+| $a_{\text{nom}}$ | belt accel magnitude (forecasts, simulator ramp) | `conveyor.accel_mm_s2` |
+| $t_{\text{pick}}$, $\mu_{\max} = 1/t_{\text{pick}}$ | calibrated pick cycle / arm ceiling | `scheduling.arm_cycle.cycle_s` |
+| $k$, $\lambda_{\text{nom}} = k\,\mu_{\max}$ | headroom factor / presentation-rate target | `speed.laws.inverse_density.headroom` |
 | $L$ | workspace window length $= u_{\max} - u_{\min}$ | `conveyor.workspace_window_uv` |
-| $L_{\text{meas}}$ | density region length (0 ⇒ derive $= u_{\max}$) | `belt_density_length_mm` |
-| $\Delta_{\min}$, $\Delta v_{\max}$ | commit deadband / per-commit step limit | `belt_speed_deadband_mm_s`, `belt_speed_max_step_mm_s` |
+| $L_{\text{meas}}$ | density region length (0 ⇒ derive $= u_{\max}$) | `speed.laws.inverse_density.density_length_mm` |
+| $\Delta_{\min}$, $\Delta v_{\max}$ | commit deadband / per-commit step limit | `speed.commit.deadband_mm_s`, `speed.commit.max_step_mm_s` |
 
 ### 6.2. The inverse density law
 
@@ -437,34 +466,36 @@ objects: $s_i / v \ge t_{\text{pick}}$. A **spacing ceiling** is min-ed onto the
 $$v_{\text{target}} = \max\!\Big(v_{\min},\; \min\big(v_{\rho},\; g_{\min} / t_{\text{pick}}\big)\Big),
 \qquad g_{\min} = \min_i (u_i - u_{i+1})$$
 
-over the leading few objects only (`_SPACING_LEAD_OBJECTS`, default 4) — an upstream cluster
+over the leading few objects only (`speed.laws.inverse_density.spacing_lead_objects`, default 4) — an upstream cluster
 does not force a premature slow-down, but is also invisible to the law until it reaches the
 front (`open-issues.md` **L11**). A cluster tighter than $v_{\min} t_{\text{pick}}$ pins the
 floor (best-effort; the cell is locally over-dense).
 
-### 6.5. Commit policy, anti-thrash, and jerk avoidance
+### 6.5. When the setpoint moves, and how far
 
-Density is sensed **continuously** (~25 ms perception tick); commits of `change_speed` are
-**opportunistic** — allowed from the executor wait loops (goto flight, far gate wait,
-post-grip return) and the idle loop, throttled ≥ 0.75 s apart — and **suppressed only inside
-the gate-critical window** (object within ~2 s of belt travel of the fire threshold,
-`RealtimeState.gate_critical`).
+Density is sensed **continuously** (~25 ms perception tick), but the law runs only when its
+**setpoint gate** opens (`modules/scheduling/gates.py`). `inverse_density` defaults to
+`at_contact`: when the arm becomes free, every `speed.control_period_s` while it stays free, and
+once at cup contact — the belt then ramps during the carry to the bin. Nothing is decided from
+goto dispatch to cup contact (`RealtimeState.pick_committed`), so the plan, the gate lead and
+the grip all see the setpoint that was live when the plan was built. The same commit policy
+applies to every law (`modules/scheduling/commit.py`):
 
-* **Deadband**: commit only if $|v_{\text{target}} - v_{\text{setpoint}}| > \Delta_{\min}$.
+* **Band**: the target is clamped to $[v_{\min},\, \min(v_{\text{soft}}, v_{\text{hw}})]$.
+* **Deadband**: commit only if the step exceeds $\Delta_{\min}$.
 * **Step limit**: each commit moves at most $\Delta v_{\max}$ toward the target, so each ramp
-  settles in $\Delta v_{\max} / a_{\text{nom}}$ — shorter than the gate-critical lead. (The
-  raw hyperbolic law is near bang-bang at small $N$; the $N = 1 \leftrightarrow 2$ jump alone
-  would ramp for seconds.)
-* **Closed loop**: perception stores the PLC's measured `speed_current`; if it diverges from
-  the setpoint > 3 s after the last commit, the setpoint is re-sent. This catches commands
-  lost on the wire — the controller never assumes a commit was applied.
+  settles in $\Delta v_{\max} / a_{\text{nom}}$ (≈ 0.9 s at 20 mm/s). (The raw hyperbolic law
+  is near bang-bang at small $N$; the $N = 1 \leftrightarrow 2$ jump alone would ramp for
+  seconds.)
+* **Closed loop**: if the PLC's measured `speed_current` still diverges from the setpoint by
+  more than $2\Delta_{\min}$ 3 s after the last commit, the setpoint is re-sent. This catches
+  commands lost on the wire — the controller never assumes a commit was applied.
 
 **Jerk avoidance**: modeling the belt's S-curve ramp explicitly in the gate offset would add a
 piecewise-cubic bookkeeping for a sub-millimetre correction that only applies mid-ramp.
-Instead, the commit policy above guarantees the belt is **steady whenever a gate fires** — by
-construction, not by hope — so the precision path keeps the single-term offset of §4.4, and
-the live gate absorbs residuals. Startup seeds the belt with `belt_speed_static_mm_s`
-unconditionally (adaptive off = static speed).
+Instead, the freeze above keeps the belt **steady from dispatch to contact**, so the precision
+path keeps the single-term offset of §4.4, and the live gate absorbs residuals. Startup seeds
+the belt with `speed.static_mm_s` unconditionally (the `constant` law then never moves it).
 
 ### 6.6. Known gaps in this controller
 
@@ -472,32 +503,162 @@ Recorded here so the baseline is not mistaken for a finished design. Details and
 [`open-issues.md`](open-issues.md):
 
 * **L10** — no feedback from missed/at-risk picks into the speed decision; the law sees only
-  instantaneous density and spacing.
+  instantaneous density and spacing. The `predictive_rank` law (§7.3) closes this loop when
+  selected.
 * **L11** — the spacing cap has a 4-object horizon.
-* **L9** — the steady-belt-at-gate guarantee of §6.5 is what licenses the single-term gate
-  offset of §4.4; a controller that commits more freely must implement the ramp-aware form.
-* **G1/G2/G3** — the static seed sits above the adaptive ceiling, the calibrated pick cycle
-  disagrees with the cell's stated nominal rate, and the density measurement region is longer
-  than the workspace it regulates.
+* **L9** — the freeze of §6.5 is what licenses the single-term gate offset of §4.4. A commit
+  issued while the arm is free can still be ramping when the next plan's gate fires.
+* **G1/G2/G3** — the static seed sits outside the band, the calibrated pick cycle disagrees
+  with the cell's stated nominal rate, and the density measurement region is longer than the
+  workspace it regulates.
 
 ---
 
-## 7. Concurrency Model (summary)
+## 7. Pluggable Scheduling: Planners and Speed Laws
 
-Theory-level view; the full runtime layout is in `basis-programming.md` §1.
+The pick order (§4) and the belt speed (§6) are each chosen by a named plugin
+(`scheduling.planner`, `speed.law`; code and contracts in `modules/scheduling/`). This section
+is the theory of the planners and laws beyond the `spt` rule and the density law; they were
+ported from the scheduling research repository onto the robot's own timing model. The
+configured planner is `drop_longest` (§7.2) and the configured law `constant`
+(`open-issues.md` **G10**, **L10**).
+
+### 7.1. The job model
+
+Every unclaimed tracked object $j$ becomes a job at planning time $t_0$:
+
+| Symbol | Meaning | Source |
+|---|---|---|
+| $r_j$ | release — dispatchable now | $t_0$ |
+| $d_j$ | deadline — the object passes $u_\max$ | $t_0 + T_V(u_\max - u_j)$ |
+| $g_j$ | grab — predicted cup contact | intercept of §4.3 from the arm's start pose |
+| $p_j$ | processing — until the arm is free over the bin | gate-fire time $+ T_\text{delay} + T(\text{pick trajectory}) + s$ |
+
+$T_V(\Delta u)$ is the time the belt needs to travel $\Delta u$ under the forecast of §7.4,
+$T(\cdot)$ the trajectory-time model of §3, and $s$ = `scheduling.setup_time_s`. The intercept is
+the two-stage fixed point of §4.3–§4.4 (earliest reachable contact, then pushed downstream until
+the arm is parked a full gate lead before it), generalised to an arbitrary start pose and start
+time and to a ramping belt: $v\,\Delta t$ becomes the forecast travel and $\Delta u / v$
+becomes $T_V$. On a steady belt it is identical to the realtime predictor.
+
+Because the arm starts each pick from the previous bin, $p_j$ and $g_j$ depend on the
+predecessor: they are re-predicted for every candidate sequence, never read from the job. A
+sequence is on time when $g_j \le d_j - \delta$ for every job ($\delta$ =
+`scheduling.safety_margin_s`).
+
+### 7.2. Sequence planners
+
+The belt fixes the order of arrival: objects cannot overtake, so release order and deadline
+order agree. For $1 \mid r_j \mid \sum U_j$ with agreeable release dates and deadlines:
+
+* **`kim`** — Kise–Ibaraki–Mine (1978): add the jobs one at a time in arrival order; if the
+  retained set plus the new job is on time, keep it; otherwise remove **exactly one** job — the
+  one whose removal leaves an on-time set that frees the arm earliest (ties remove the job
+  latest in the order, the new job first). Removing the new job restores the previous on-time
+  set, so one removal always suffices. **`kim_release`** walks the jobs in estimated release
+  order $r_j = a_j - g_j$ instead, which need not be agreeable.
+* **`cardinality_arrival` / `_release`** — Lawler's cardinality recurrence (1983): for every
+  $k$ keep the on-time schedule of $k$ jobs that frees the arm earliest; each job extends each of
+  them; the largest $k$ wins.
+* **`drop_longest`** — add jobs in belt order; while the sequence is late, drop the job with
+  the longest processing time (several drops per insertion can happen). Moore–Hodgson style;
+  the cell's planner before 2026-09.
+* **`dp`** — exact search over the `max_jobs` most urgent parts: layer $k$ keeps, for every
+  (set of $k$ parts, last part), the earliest instant the arm is free; $O(2^n n^2)$. The
+  reference the heuristics are measured against.
+* **`<rule>_rollout`** — a dispatch rule run forward against a simulated clock, so a rule can be
+  scored by a speed law like a planner.
+
+All are exact on the textbook problem (fixed $p_j$, agreeable order; `tests/test_scheduling.py`
+checks them against brute force). With sequence-dependent $p_j$ and the deadline tested at
+contact they are heuristics; the research repository measured `kim` within about one percentage
+point of the exact search's pick rate (paper, tag `paper-submitted`). The schedule is a plan: the realtime
+loop commits only its first entry that still validates against the live tracker (§7.5),
+executes it, and plans again. Objects a planner leaves out are abandoned on purpose.
+
+### 7.3. Predictive-rank speed law
+
+Choose the belt speed $V$ that maximises the number of picks the planner predicts within a
+horizon $W$ (`speed.laws.predictive_rank.horizon_s`):
+
+$$K(V) = \left|\{\, j \in \text{schedule}(V) : g_j \le t_0 + W \,\}\right|$$
+
+Candidates are enumerated on a grid (`candidate_step_mm_s`), not searched: $K$ is integer-valued
+and not unimodal. A candidate is admissible when
+
+* $v_\min \le V \le v_\max$, with $v_\min$ = `speed.band.min_mm_s` and
+  $$v_\max = \min\left(\frac{L}{k\,p_\text{worst} + g_\text{worst}},\; v_\text{max,op},\; v_\text{hw}\right)$$
+  where $L = u_\max - u_\min$: an object entering the band must still be pickable after the
+  arm finishes $k$ queued picks (`speed.laws.predictive_rank.queue_depth_k`,
+  `scheduling.arm_cycle.occupancy_worst_s`, `grab_worst_s`);
+* the drive reaches $V$ within $W$;
+* $|V - V_\text{set}| \le$ `speed.commit.max_step_mm_s`, so the speed scored is the speed the
+  step-limited commit (§6.5) actually sends (the law is exempt from the deadband for the same
+  reason).
+
+The current setpoint, if admissible, is scored first and replaced only by a strictly higher
+$K$ or an equal $K$ at a faster speed (`predictive_rank_hysteresis` keeps it unless a candidate
+scores strictly higher). An inadmissible setpoint is abandoned. The winner's schedule is
+executed as planned when it was made by the executing planner.
+
+### 7.4. Belt forecast and when the setpoint may move
+
+Scoring $V$ needs object positions under a speed the belt is not running at. The forecast
+assumes the drive ramps linearly from the measured speed $v_0$ to the setpoint at
+$a$ = `conveyor.accel_mm_s2` and then holds it:
+
+$$x(t) = \begin{cases} v_0 t + \tfrac{1}{2}\,\sigma a t^2 & t < t_r \\ \tfrac{1}{2}(v_0 + V)\,t_r + V (t - t_r) & t \ge t_r \end{cases}
+\qquad t_r = \frac{|V - v_0|}{a},\; \sigma = \operatorname{sign}(V - v_0)$$
+
+"Then holds it" is made true by the freeze of §6.5: whatever the gate (predictive-rank's
+default is `arm_free` — when the arm becomes free, then every `speed.control_period_s`), the
+setpoint never moves between goto dispatch and cup contact, which also keeps the single-term
+gate lead of §4.4 valid (L9). A commit made just before a plan can still be ramping at that
+plan's gate; the forecast used to plan it includes the ramp.
+
+### 7.5. Plan, then re-validate
+
+A KIM or predictive-rank solve can take a noticeable fraction of a second, during which objects
+move. Planning therefore runs on a value snapshot of the tracker, and the chosen entry is
+re-validated under the state lock before it is claimed: the object is still tracked and
+unclaimed, a fresh intercept from the arm's real pose on the live forecast meets
+$d_j - \delta$, and every waypoint passes the PLC-faithful IK. The first entry that passes is
+committed; the difference between its fresh and planned contact times is logged as `drift_s`.
+
+### 7.6. Other speed laws
+
+With $L = u_\max - u_\min$, $[v_\min, v_\max]$ the queue bound of §7.3 (own $k$ per law) and
+$N$ the unclaimed parts in view:
+
+* **`bound_only`** — sit at $v_\max$ and never look at the belt (open loop). If it scores close
+  to `predictive_rank`, the ranking is not earning its cost and the benefit was the bound.
+* **`backlog_patience`** — $v = L / (N p + g)$ with the measured backlog $N$ in the workspace and
+  mean occupancy $p$ and grab $g$, clamped to the bound.
+* **`min_slack`** — the $i$-th part in line must survive $i$ cycles and a grab:
+  $v = \min_i\, (u_\max - u_i) / (i\,p + g)$, clamped to the bound.
+* **`rate_schedule`** — gain scheduling: the detection rate over a window maps to a speed through
+  a declared table (linear between points).
+* **`periodic_two_speed`** — alternate two speeds on a fixed clock, blind to the belt: the control
+  that separates feedback from mere speed variation.
+
+---
+
+## 8. Concurrency Model (summary)
+
+Theory-level view; the full runtime layout is in `basis-programming.md` §2.
 
 * **Background communication process** — sole owner of PLC I/O (snap7 Modbus/TCP to Siemens,
   pylogix EtherNet/IP to Omron); IPC queues isolate network jitter from control loops.
 * **Perception/state daemon thread** (~25 ms) — sensor fusion: belt encoder, vision poll,
-  tracker refresh, adaptive speed target; sole regular PLC status reader.
-* **Decision/execution main thread** — plan build, claim, dispatch, gate wait; reads shared
-  state, issues no status I/O of its own.
+  tracker refresh; sole regular PLC status reader. It decides nothing.
+* **Decision/execution main thread** — speed law at its gate, plan build, claim, dispatch,
+  gate wait; reads shared state, issues no status I/O of its own.
 * Two locks: `ipc_lock` (exactly one dispatch/status round-trip in flight) and `state_lock`
   (guards `RealtimeState` between perception and decision threads).
 
 ---
 
-## 8. What this document deliberately omits
+## 9. What this document deliberately omits
 
 * **Open problems** — every unresolved calibration, config inconsistency and algorithmic gap
   is registered in [`open-issues.md`](open-issues.md), including which of them constrain the

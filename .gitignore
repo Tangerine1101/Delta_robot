@@ -16,6 +16,8 @@ YOLO_OBB/
 
 # YOLO training / inference output
 runs/
+# Per-run debug logs written by main.py
+log/
 # LaTeX build artifacts (latexmk/pdflatex)
 *.aux
 *.fdb_latexmk
@@ -29,3 +31,5 @@ runs/
 *.bcf
 *.blg
 *.run.xml
+# Sandbox sweep output (each run folder carries its own manifest)
+sandbox/results/

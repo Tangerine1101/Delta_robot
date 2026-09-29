@@ -2,8 +2,8 @@
 Camera calibration tool — ROI polygon, trigger line, pixel/mm scale.
 
 Written from scratch for the Delta Robot project's Linux/Wayland rig. It reads
-and writes the `vision` section of `modules/config.json`. The interactive GUI
-mirrors the proven display pattern of `modules/image_processing.py`:
+and writes the `vision` section of `modules/config.yaml`. The interactive GUI
+mirrors the proven display pattern of `modules/vision/pipeline.py`:
 
   * QT_QPA_PLATFORM is forced to "xcb" *before* cv2 is imported — the bundled
     OpenCV Qt build ships only the xcb plugin (no Wayland one), so leaving the
@@ -48,8 +48,10 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 import cv2  # noqa: E402  (must come after the env override above)
 import numpy as np  # noqa: E402
 
+from modules.config_io import CONFIG_PATH as _CONFIG_PATH, read_config, write_config  # noqa: E402
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(ROOT, "modules", "config.json")
+CONFIG_PATH = str(_CONFIG_PATH)
 WIN = "Delta Calib"
 MAX_DISP_W = 1280
 
@@ -71,13 +73,11 @@ CORNER_LABELS = ["1-TL", "2-TR", "3-BR", "4-BL(O)"]
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    return read_config(CONFIG_PATH)
 
 
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+    write_config(cfg, CONFIG_PATH)
     print(f"[OK] Đã ghi {CONFIG_PATH}")
 
 
@@ -156,7 +156,7 @@ def grab_camera_frame(vision_cfg: dict) -> np.ndarray:
     options = {"input_format": pixfmt, "video_size": f"{width}x{height}", "framerate": str(fps)}
     container = av.open(device, format="v4l2", options=options)
     # Discard warmup frames so the sensor stabilises at the configured exposure
-    # before taking the calibration snapshot. image_processing.py runs at 30fps
+    # before taking the calibration snapshot. the vision pipeline runs at 30fps
     # continuously so its displayed frames are already post-stabilisation; without
     # this the first frame is captured at whatever exposure the camera had before
     # apply_v4l2_controls ran.

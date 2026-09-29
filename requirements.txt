@@ -51,6 +51,7 @@ python-snap7==3.0.0
 PyYAML==6.0.3
 requests==2.34.2
 rich==15.0.0
+ruamel.yaml==0.19.1
 scipy==1.17.1
 setuptools==81.0.0
 shellingham==1.5.4

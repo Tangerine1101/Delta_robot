@@ -1,553 +1,271 @@
+"""Delta robot entry point.
+
+    python3 main.py --scheduler --scenario production [--sim] [--interface]
+    python3 main.py --scheduler --scenario simulate_feeder --set feeder.seed=3 [--sim]
+    python3 main.py --scheduler --scenario test_vision_only [--no-plc]
+    python3 main.py --cli [--dummy]
+    python3 main.py --interface [--sim]          # operator console
+
+`--set key=value` overrides one config value for this run (dotted path, e.g.
+`--set speed.law=predictive_rank`); the config file is never written.
+"""
 from __future__ import annotations
 
 import argparse
-import itertools
-import math
-import multiprocessing as mp
-from queue import Empty
+import time
 from typing import Any
 
-from modules.EthernetCom import (
-    PLCGateway,
-    SiemensGateway,
-    load_config,
-    robot_rad_to_wire_deg,
-    wire_deg_to_robot_rad,
-)
-from modules.cli import run_interactive
-from modules.interface import DashboardServer
-from modules.scheduler import (
-    EvaluateExecutor,
-    NullExecutor,
-    RealtimePickExecutor,
-    SCENARIO_NAMES,
-    run_scheduler_scenario,
-)
-
-_ACCURACY_SCENARIOS = ("test_accuracy", "test_acceptance")
-
-# How often (seconds) the worker probes the PLC connection when idle, to prevent
-# EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
-_KEEPALIVE_S = 25.0
+from modules.settings import Settings, SettingsError, load_settings, with_overrides
 
 
-def _worker(
-    command_queue: mp.Queue,
-    response_queue: mp.Queue,
-    ip: str,
-    port: int,
-    interpolar_points: int,
-) -> None:
-    config = load_config()
-    if ip in ("127.0.0.1", "localhost"):
-        siemens_ip = ip
-        siemens_port = port
-    else:
-        siemens_ip = getattr(config, "siemens_ip", "192.168.250.2")
-        siemens_port = getattr(config, "siemens_port", 1502)
+def _start_plc_sim(args: argparse.Namespace, settings: Settings, feed_interval_s: float | None = None) -> Any:
+    """Start the in-process PLC simulator (modules.plc_sim) for --dummy / --sim.
 
-    gateway = PLCGateway(ip=ip, port=port, interpolar_points=interpolar_points)
-    siemens_gateway = SiemensGateway(ip=siemens_ip, port=siemens_port)
+    Binds an ephemeral localhost port. The worker's localhost branch routes both the Omron
+    mock (pylogix MockPLC) and the Siemens mock to this one JSON-lines socket;
+    `sim.address` is the (host, port) to connect to.
+    """
+    from modules.plc_sim.sim import PLCSim
 
-    try:
-        gateway.connect()
-        siemens_gateway.connect()
-    except Exception as exc:
-        response_queue.put({"ok": False, "type": "connect_failed", "req_id": None, "error": str(exc)})
+    sim = PLCSim(
+        settings=settings,
+        servo_tau_s=args.sim_servo_tau,
+        tag_latency_s=args.sim_tag_latency,
+        feed_interval_s=feed_interval_s,
+    )
+    sim.start()
+    host, port = sim.serve()
+    print(f"[INFO] PLC simulator (Omron Matching_Code_10 + Siemens) on {host}:{port}")
+    if settings.pose_stream.enabled:
+        sim.start_pose_stream(settings.pose_stream.port)
+    return sim
+
+
+def _link(args: argparse.Namespace, settings: Settings, *, raise_errors: bool = True) -> Any:
+    from modules.comm.plc_link import PlcLink
+
+    return PlcLink(settings, args.ip, args.port, runlog=args.runlog, raise_errors=raise_errors)
+
+
+def _run_cli(args: argparse.Namespace, settings: Settings) -> None:
+    from modules.ui.cli import run_interactive
+
+    sim = None
+    if args.dummy:
+        sim = _start_plc_sim(args, settings)
+        args.ip, args.port = sim.address
+    link = _link(args, settings, raise_errors=False)
+    if not link.ok:
+        if sim is not None:
+            sim.shutdown()
         return
-
-    response_queue.put({"ok": True, "type": "connected", "req_id": None, "ip": ip, "port": port})
-
     try:
-        while True:
-            try:
-                message = command_queue.get(timeout=_KEEPALIVE_S)
-            except Empty:
-                # Idle keepalive: probe both connections to prevent firmware session timeouts.
-                try:
-                    gateway._probe_connection()
-                except Exception:
-                    pass
-                try:
-                    siemens_gateway.get_status()
-                except Exception:
-                    pass
-                continue
-
-            req_id = message.get("req_id")
-            message_type = message.get("type")
-
-            if message_type == "shutdown":
-                response_queue.put({"ok": True, "type": "shutdown", "req_id": req_id})
-                break
-
-            if message_type == "status":
-                try:
-                    status = gateway.get_package()
-                    if status is not None:
-                        try:
-                            s_status = siemens_gateway.get_status()
-                            if s_status is not None:
-                                rotate_wire = s_status.get("rotate_current")
-                                status.update({
-                                    # Wire degrees [-359,359] feedback -> R-frame
-                                    # DEGREES, verbatim (identity zero, no wrap so
-                                    # the true PLC angle shows). Human-readable for
-                                    # logs/dashboard; radians live only inside the
-                                    # scheduler algorithm.
-                                    "rotate_current": (
-                                        math.degrees(wire_deg_to_robot_rad(rotate_wire))
-                                        if rotate_wire is not None else None
-                                    ),
-                                    "speed_current": s_status.get("speed_current"),
-                                    "siemens_task_doing": s_status.get("task_doing"),
-                                    "siemens_task_state": s_status.get("task_state"),
-                                    "conveyor_position": s_status.get("conveyor_position"),
-                                })
-                        except Exception as s_exc:
-                            print(f"[WARN] Failed to query Siemens status: {s_exc}")
-                    response_queue.put({"ok": True, "type": "status", "req_id": req_id, "data": status})
-                except Exception as exc:
-                    response_queue.put({"ok": False, "type": "error", "req_id": req_id, "error": str(exc)})
-                continue
-
-            if message_type == "send":
-                try:
-                    pkg = message["package"]
-                    cmd_id = pkg.get("commandID")
-                    if cmd_id in (7, 8, 9):
-                        # Siemens command. rotate_absolute (7) carries an R-frame
-                        # angle in RADIANS: convert VERBATIM to wire degrees
-                        # [-359,359] (identity zero, no wrap) on the wire only
-                        # (echo the original radian pkg back to the caller).
-                        if cmd_id == 7:
-                            wire_pkg = dict(pkg)
-                            wire_pkg["rotate"] = robot_rad_to_wire_deg(
-                                pkg.get("rotate", 0.0)
-                            )
-                        else:
-                            wire_pkg = pkg
-                        s_status = siemens_gateway.send_package(wire_pkg)
-                        response_queue.put(
-                            {
-                                "ok": True,
-                                "type": "sent",
-                                "req_id": req_id,
-                                "commandID": cmd_id,
-                                "package": pkg,
-                                "status": s_status,
-                            }
-                        )
-                    else:
-                        # Omron command
-                        package = gateway.send_package(pkg)
-                        status = gateway.get_package()
-                        response_queue.put(
-                            {
-                                "ok": True,
-                                "type": "sent",
-                                "req_id": req_id,
-                                "commandID": package.get("commandID"),
-                                "package": package,
-                                "status": status,
-                            }
-                        )
-                except Exception as exc:
-                    response_queue.put({"ok": False, "type": "error", "req_id": req_id, "error": str(exc)})
-                continue
-
-            response_queue.put(
-                {
-                    "ok": False,
-                    "type": "error",
-                    "req_id": req_id,
-                    "error": f"Unknown message type: {message_type}",
-                }
-            )
+        run_interactive(link.dispatch, link.request_status, settings, prompt=args.prompt)
     finally:
-        gateway.disconnect()
-        siemens_gateway.disconnect()
+        link.close()
+        if sim is not None:
+            sim.shutdown()
 
 
-def _wait_for_response(
-    response_queue: mp.Queue,
-    expected_id: int | None,
-    timeout: float = 5.0,
-) -> dict[str, Any] | None:
-    """Drain queue until we get the response with req_id == expected_id.
+def _dashboard(args: argparse.Namespace, settings: Settings) -> Any:
+    from modules.ui.dashboard import DashboardServer
 
-    Responses with a different (older) req_id are discarded with a warning.
-    Returns None on timeout.
-    """
-    import time
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        try:
-            resp = response_queue.get(timeout=remaining)
-        except Empty:
-            return None
-        if resp.get("req_id") == expected_id:
-            return resp
-        # Stale response from a previous timed-out request.
-        print(f"[WARN] discarding stale IPC response (req_id={resp.get('req_id')}, expected={expected_id})")
+    port = args.interface_port if args.interface_port is not None else settings.interface.port
+    return DashboardServer(port=port, mjpeg_fps=settings.interface.mjpeg_fps)
 
 
-def _start_worker(
-    ctx: Any,
-    command_queue: mp.Queue,
-    response_queue: mp.Queue,
-    args: argparse.Namespace,
-) -> "mp.Process | None":
-    """Start the PLC worker and wait for connection confirmation.
+def _run_scheduler(args: argparse.Namespace, settings: Settings) -> None:
+    from modules.runtime.scenarios import SCENARIOS, run_scenario
 
-    Returns the Process on success, None if connection failed.
-    """
-    worker = ctx.Process(
-        target=_worker,
-        args=(command_queue, response_queue, args.ip, args.port, args.interpolar_points),
-        daemon=True,
-    )
-    worker.start()
-    startup = _wait_for_response(response_queue, expected_id=None, timeout=10.0)
-    if startup is None:
-        print("[ERROR] PLC worker did not report readiness in time — aborting.")
-        worker.terminate()
-        worker.join(timeout=2.0)
-        return None
-    if not startup.get("ok"):
-        print(f"[ERROR] Worker failed to connect: {startup.get('error')}")
-        worker.join(timeout=2.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=2.0)
-        return None
-    print(f"[INFO] Worker connected to {startup.get('ip')}:{startup.get('port')}")
-    return worker
-
-
-def _stop_worker(worker: "mp.Process", command_queue: mp.Queue, response_queue: mp.Queue, req_counter: Any) -> None:
-    req_id = next(req_counter)
-    command_queue.put({"type": "shutdown", "req_id": req_id})
-    _wait_for_response(response_queue, expected_id=req_id, timeout=5.0)
-    worker.join(timeout=5.0)
-    if worker.is_alive():
-        worker.terminate()
-        worker.join(timeout=5.0)
-
-
-def _start_dummy_plc(interpolar_points: int) -> "tuple[str, int, Any, Any]":
-    """Start an in-process fake PLC (modules.test_module) for `--cli --dummy`.
-
-    Binds an ephemeral localhost port so it never clashes with a separately
-    running test_module. The worker's localhost branch then routes both the
-    Omron mock (pylogix MockPLC) and the Siemens mock to this one JSON-lines
-    socket. Returns (host, port, server, motion_stop_event).
-    """
-    import threading
-    from pathlib import Path
-
-    from modules.test_module import FakePLCState, ThreadedFakePLCServer
-
-    config = load_config()
-    scheduler_raw = getattr(config, "scheduler", {}) or {}
-    raw_home = scheduler_raw.get("home_position", [0.0, 0.0, -300.0])
-    state = FakePLCState(
-        interpolar_points=interpolar_points,
-        log_path=Path("test_module.log"),
-        sample_period_s=0.05,
-        home_position=(float(raw_home[0]), float(raw_home[1]), float(raw_home[2])),
-    )
-    stop_event = threading.Event()
-    threading.Thread(
-        target=state.run_motion_loop, args=(stop_event,), daemon=True
-    ).start()
-    server = ThreadedFakePLCServer(("127.0.0.1", 0), state)
-    threading.Thread(
-        target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True
-    ).start()
-    host, port = server.server_address
-    print(f"[INFO] --dummy: in-process fake PLC on {host}:{port} (log: test_module.log)")
-    return host, port, server, stop_event
-
-
-def _run_cli(args: argparse.Namespace) -> None:
-    dummy_server = None
-    dummy_stop = None
-    if getattr(args, "dummy", False):
-        args.ip, args.port, dummy_server, dummy_stop = _start_dummy_plc(
-            args.interpolar_points
-        )
-
-    ctx = mp.get_context("spawn")
-    command_queue: mp.Queue = ctx.Queue()
-    response_queue: mp.Queue = ctx.Queue()
-    req_counter = itertools.count(1)
-
-    worker = _start_worker(ctx, command_queue, response_queue, args)
-    if worker is None:
-        if dummy_server is not None:
-            dummy_stop.set()
-            dummy_server.shutdown()
-            dummy_server.server_close()
-        return
-
-    def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
-        req_id = next(req_counter)
-        command_queue.put({"type": "send", "package": package, "req_id": req_id})
-        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
-        if response is None:
-            print("[WARN] no response from PLC worker")
-            return None
-        if not response.get("ok", False):
-            print(f"[ERROR] {response.get('error')}")
-            return None
-        return response.get("status")
-
-    def request_status() -> dict[str, Any] | None:
-        req_id = next(req_counter)
-        command_queue.put({"type": "status", "req_id": req_id})
-        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
-        if response is None:
-            print("[WARN] no response from PLC worker")
-            return None
-        if not response.get("ok", False):
-            print(f"[ERROR] {response.get('error')}")
-            return None
-        return response.get("data")
-
+    sim = None
+    link = None
+    server = None
+    image_source = None
+    virtual_feed = SCENARIOS[args.scenario].feed == "virtual"
     try:
-        run_interactive(
-            dispatch,
-            request_status,
-            interpolar_points=args.interpolar_points,
-            prompt=args.prompt,
-        )
-    finally:
-        _stop_worker(worker, command_queue, response_queue, req_counter)
-        if dummy_server is not None:
-            dummy_stop.set()
-            dummy_server.shutdown()
-            dummy_server.server_close()
-
-
-def _start_interface(args: argparse.Namespace) -> "tuple[DashboardServer | None, dict[str, Any]]":
-    """Start the web dashboard if --interface was passed.
-
-    Returns (server, kwargs) where kwargs are forwarded to run_scheduler_scenario
-    to wire structured events + the camera MJPEG source and suppress the native
-    cv2 window. When --interface is off, returns (None, {}).
-    """
-    if not getattr(args, "interface", False):
-        return None, {}
-    config = load_config()
-    iface_cfg = getattr(config, "interface", {}) or {}
-    port = args.interface_port if args.interface_port is not None else int(iface_cfg.get("port", 8000))
-    mjpeg_fps = float(iface_cfg.get("mjpeg_fps", 15))
-    server = DashboardServer(port=port, mjpeg_fps=mjpeg_fps)
-    server.start()
-    return server, {
-        "event_sink": server.emit,
-        "frame_register": server.attach_camera,
-        "disable_native_window": True,
-    }
-
-
-def _run_scheduler(args: argparse.Namespace) -> None:
-    if args.simulate_executor:
-        server, iface_kwargs = _start_interface(args)
-        try:
-            run_scheduler_scenario(
-                args.scenario,
-                duration_s=args.duration,
-                interpolar_points=args.interpolar_points,
-                **iface_kwargs,
-            )
-        finally:
-            if server is not None:
-                server.stop()
-        return
-
-    ctx = mp.get_context("spawn")
-    command_queue: mp.Queue = ctx.Queue()
-    response_queue: mp.Queue = ctx.Queue()
-    req_counter = itertools.count(1)
-
-    worker = _start_worker(ctx, command_queue, response_queue, args)
-    if worker is None:
-        return
-
-    def dispatch(package: dict[str, Any]) -> dict[str, Any] | None:
-        req_id = next(req_counter)
-        command_queue.put({"type": "send", "package": package, "req_id": req_id})
-        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
-        if response is None:
-            raise TimeoutError("no response from PLC worker while sending scheduler package")
-        if not response.get("ok", False):
-            raise RuntimeError(str(response.get("error")))
-        return response.get("status")
-
-    def request_status() -> dict[str, Any] | None:
-        req_id = next(req_counter)
-        command_queue.put({"type": "status", "req_id": req_id})
-        response = _wait_for_response(response_queue, expected_id=req_id, timeout=10.0)
-        if response is None:
-            raise TimeoutError("no response from PLC worker while polling status")
-        if not response.get("ok", False):
-            raise RuntimeError(str(response.get("error")))
-        return response.get("data")
-
-    config = load_config()
-    scheduler_config = getattr(config, "scheduler", {}) or {}
-    wait_margin_s = float(scheduler_config.get("execution_margin_s", 0.3))
-    status_poll_interval_s = float(scheduler_config.get("poll_interval_s", 0.05))
-    pick_arrival_tolerance_mm = float(scheduler_config.get("pick_arrival_tolerance_mm", 5.0))
-    # Speed-mapped arrival tolerance ceiling (defaults to the floor = static
-    # behavior), anchored on the adaptive belt speed range.
-    pick_arrival_tolerance_max_mm = float(
-        scheduler_config.get("pick_arrival_tolerance_max_mm", pick_arrival_tolerance_mm)
-    )
-    belt_speed_min_mm_s = float(scheduler_config.get("belt_speed_min_mm_s", 50.0))
-    belt_speed_max_mm_s = float(scheduler_config.get("belt_speed_max_mm_s", 120.0))
-    if args.scenario == "test_vision_only":
-        # Connect the full PLC (Omron + Siemens) for live belt feedback, but keep
-        # the robot idle: NullExecutor reads conveyor_position and sends the belt
-        # speed command without dispatching any Omron trajectory.
-        executor = NullExecutor(dispatch=dispatch, request_status=request_status)
-    elif args.scenario in _ACCURACY_SCENARIOS:
-        # test_accuracy/test_acceptance grip static fake objects, not a moving belt
-        # — no live position gate needed. EvaluateExecutor (the same real-hardware
-        # backend the 'evaluate' scenario uses) dispatches each phase and waits for
-        # real pos_EE convergence, and accumulates per-phase wall-clock timing.
-        executor = EvaluateExecutor(
-            dispatch,
-            request_status,
-            interpolar_points=args.interpolar_points,
-            position_tolerance_mm=float(scheduler_config.get("evaluate_position_tolerance_mm", 0.01)),
-            status_poll_interval_s=status_poll_interval_s,
-            wait_timeout_s=float(scheduler_config.get("evaluate_wait_timeout_s", 10.0)),
-            stability_window_s=float(scheduler_config.get("evaluate_stability_window_s", 0.4)),
-            stability_mm=float(scheduler_config.get("evaluate_stability_mm", 0.3)),
-            stability_arm_mm=float(scheduler_config.get("evaluate_stability_arm_mm", 3.0)),
-        )
-    else:
-        executor = RealtimePickExecutor(
-            dispatch,
-            request_status,
-            interpolar_points=args.interpolar_points,
-            wait_margin_s=wait_margin_s,
-            status_poll_interval_s=status_poll_interval_s,
-            position_tolerance_mm=pick_arrival_tolerance_mm,
-            position_tolerance_max_mm=pick_arrival_tolerance_max_mm,
-            tolerance_speed_min_mm_s=belt_speed_min_mm_s,
-            tolerance_speed_max_mm_s=belt_speed_max_mm_s,
-            rotate_home_tolerance_deg=float(
-                scheduler_config.get("rotate_home_tolerance_deg", 0.0)
-            ),
-            rotate_offset_rad=math.radians(
-                float(scheduler_config.get("rotate_offset_deg", 0.0))
-            ),
-            rotate_sign=float(scheduler_config.get("rotate_sign", 1.0)),
-            rotate_refresh_max_delta_deg=float(
-                scheduler_config.get("rotate_refresh_max_delta_deg", 15.0)
-            ),
-        )
-
-    server, iface_kwargs = _start_interface(args)
-    try:
-        run_scheduler_scenario(
-            args.scenario,
+        if args.sim:
+            # A virtual feed brings its own parts: the simulator's boards would be invisible.
+            sim = _start_plc_sim(args, settings, feed_interval_s=None if virtual_feed else args.sim_feed)
+            args.ip, args.port = sim.address
+            image_source = sim.camera()
+        if not args.no_plc:
+            link = _link(args, settings)
+            if not link.ok:
+                return
+        iface: dict[str, Any] = {}
+        if args.interface:
+            server = _dashboard(args, settings)
+            server.start()
+            iface = {"event_sink": server.emit, "frame_register": server.attach_camera,
+                     "disable_native_window": True}
+        run_scenario(
+            args.scenario, settings,
+            dispatch=link.dispatch if link is not None else None,
+            request_status=link.request_status if link is not None else None,
             duration_s=args.duration,
-            interpolar_points=args.interpolar_points,
-            executor=executor,
-            **iface_kwargs,
+            image_source=image_source,
+            record_dir=args.runlog.dir if args.runlog is not None else None,
+            record_meta={"sim": bool(args.sim), "overrides": list(args.set)},
+            **iface,
         )
     finally:
         if server is not None:
             server.stop()
-        if hasattr(executor, "close"):
-            executor.close()
-        _stop_worker(worker, command_queue, response_queue, req_counter)
+        if link is not None:
+            link.close()
+        if sim is not None:
+            print("[SIM]", sim.summary())
+            sim.shutdown()
+
+
+def _run_console(args: argparse.Namespace, settings: Settings) -> None:
+    """Operator console: web UI with manual control and scenario switching.
+
+    Starts idle — no scenario runs until the operator starts one from the page.
+    """
+    from modules.ui.supervisor import Supervisor
+
+    sim = None
+    if args.sim:
+        sim = _start_plc_sim(args, settings, feed_interval_s=args.sim_feed)
+        args.ip, args.port = sim.address
+    link = _link(args, settings)
+    if not link.ok:
+        if sim is not None:
+            sim.shutdown()
+        return
+
+    server = _dashboard(args, settings)
+    sim_camera = sim.camera() if sim is not None else None
+    supervisor = Supervisor(link.dispatch, link.request_status, settings, emit=server.emit,
+                            attach_camera=server.attach_camera, sim=sim, sim_camera=sim_camera,
+                            record_root=args.runlog.dir if args.runlog is not None else None)
+    server.set_api_handler(supervisor.handle_api)
+    server.start()
+    if sim_camera is not None:
+        server.attach_camera(sim_camera)
+    supervisor.start()
+    print(f"[INFO] Operator console at http://localhost:{server.port}  (Ctrl-C to quit)")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        import signal
+
+        # A second Ctrl-C must not cut the shutdown short (belt stop, worker exit).
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        supervisor.shutdown()
+        server.stop()
+        link.close()
+        if sim is not None:
+            print("[SIM]", sim.summary())
+            sim.shutdown()
+
+
+def _parse_overrides(pairs: list[str]) -> dict[str, Any]:
+    from ruamel.yaml import YAML
+
+    yaml = YAML(typ="safe")
+    overrides: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key:
+            raise SettingsError(f"--set expects key=value, got {pair!r}")
+        overrides[key.strip()] = yaml.load(raw) if raw.strip() else None
+    return overrides
+
+
+def _open_runlog(args: argparse.Namespace, settings: Settings, console: bool) -> Any:
+    """Open log/<timestamp>_<mode>/ unless disabled in config or with --no-log."""
+    if args.no_log or not settings.logging.enabled:
+        return None
+    from dataclasses import asdict
+
+    from modules.runlog import RunLog
+
+    if console:
+        mode = "console"
+    elif args.cli:
+        mode = "cli"
+    else:
+        mode = f"scheduler-{args.scenario}"
+    if args.sim or args.dummy:
+        mode += "-sim"
+    return RunLog.open(settings.logging.dir, mode, {"plc_ip": args.ip, "pose_stream": asdict(settings.pose_stream),
+                                                    "overrides": args.set})
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Delta robot command line entrypoint")
-    config = load_config()
-    default_interpolar_points = int(getattr(config, "interpolar_points", 4))
+    from modules.runtime.scenarios import SCENARIOS
 
-    parser.add_argument(
-        "--cli",
-        action="store_true",
-        help="Run the interactive CLI mode",
-    )
-    parser.add_argument(
-        "--scheduler",
-        action="store_true",
-        help="Run the offline scheduler simulator/benchmark mode",
-    )
-    parser.add_argument("--ip", default=config.ip_address, help="PLC IP address")
-    parser.add_argument("--port", type=int, default=config.port, help="PLC port")
-    parser.add_argument(
-        "--interpolar-points",
-        type=int,
-        default=default_interpolar_points,
-        help="Fixed number of array elements that must match the PLC struct",
-    )
+    parser = argparse.ArgumentParser(description="Delta robot command line entrypoint")
+    parser.add_argument("--cli", action="store_true", help="Run the interactive CLI mode")
+    parser.add_argument("--scheduler", action="store_true", help="Run a scenario (see --scenario)")
+    parser.add_argument("--scenario", default="production", choices=sorted(SCENARIOS),
+                        help="Scenario to run with --scheduler")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Scenario runtime in seconds. Omit for a continuous run.")
+    parser.add_argument("--ip", default=None, help="Omron PLC IP address (default: plc.omron.ip)")
+    parser.add_argument("--port", type=int, default=None, help="Omron PLC port (default: plc.omron.port)")
     parser.add_argument("--prompt", default="robot> ", help="CLI prompt text")
-    parser.add_argument(
-        "--dummy",
-        action="store_true",
-        help="CLI only: spin up an in-process fake PLC (modules.test_module) and "
-             "connect the CLI to it — no real hardware needed.",
-    )
-    parser.add_argument(
-        "--scenario",
-        default="test_throughput",
-        choices=sorted(SCENARIO_NAMES),
-        help="Scheduler scenario name",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=None,
-        help="Optional scheduler runtime in seconds. Omit for continuous run.",
-    )
-    parser.add_argument(
-        "--simulate-executor",
-        action="store_true",
-        help="Run scheduler without sending PickPlan trajectories to the PLC",
-    )
-    parser.add_argument(
-        "--interface",
-        action="store_true",
-        help="Serve a live web dashboard (events + annotated camera MJPEG) instead "
-             "of the native cv2 window. Open http://localhost:<port>. For real-camera "
-             "scenarios this suppresses the native cv2 window to avoid GUI conflicts.",
-    )
-    parser.add_argument(
-        "--interface-port",
-        type=int,
-        default=None,
-        help="Web dashboard port (default: config.interface.port or 8000).",
-    )
+    parser.add_argument("--dummy", action="store_true",
+                        help="CLI only: connect to the in-process PLC simulator instead of hardware.")
+    parser.add_argument("--no-plc", action="store_true",
+                        help="Scheduler only, for scenarios that do not move the arm: run without a PLC "
+                             "(static belt).")
+    parser.add_argument("--interface", action="store_true",
+                        help="Serve the live web dashboard instead of the native cv2 window. On its own "
+                             "(no --cli/--scheduler): operator console with manual control and scenario "
+                             "start/stop.")
+    parser.add_argument("--interface-port", type=int, default=None,
+                        help="Web dashboard port (default: interface.port).")
+    parser.add_argument("--sim", action="store_true",
+                        help="Scheduler / console: run against the in-process PLC simulator "
+                             "(scan-accurate Omron Matching_Code_10, Siemens belt, boards, camera).")
+    parser.add_argument("--sim-feed", type=float, default=2.5,
+                        help="--sim: seconds between boards fed onto the belt.")
+    parser.add_argument("--sim-servo-tau", type=float, default=0.0,
+                        help="--sim / --dummy: first-order servo lag per axis in seconds (0 = ideal).")
+    parser.add_argument("--sim-tag-latency", type=float, default=0.002,
+                        help="--sim / --dummy: simulated round trip per Omron tag request in seconds.")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override one config value for this run, e.g. --set speed.law=predictive_rank")
+    parser.add_argument("--no-log", action="store_true",
+                        help="Do not write a run log under logging.dir.")
     args = parser.parse_args()
 
-    if args.interpolar_points <= 0:
-        parser.error("--interpolar-points must be a positive integer.")
-
-    if args.cli == args.scheduler:
-        parser.error("Choose exactly one mode: --cli or --scheduler.")
-
+    console = args.interface and not args.cli and not args.scheduler
+    if not console and args.cli == args.scheduler:
+        parser.error("Choose one mode: --cli, --scheduler, or --interface on its own (operator console).")
     if args.dummy and not args.cli:
         parser.error("--dummy only applies to --cli.")
+    if args.sim and not (args.scheduler or console):
+        parser.error("--sim applies to --scheduler and to the operator console (use --dummy with --cli).")
+    if args.no_plc and (not args.scheduler or args.sim or SCENARIOS[args.scenario].moves_arm):
+        parser.error("--no-plc applies to --scheduler scenarios that do not move the arm, without --sim.")
 
-    if args.cli:
-        _run_cli(args)
-        return
+    try:
+        settings = load_settings()
+        if args.set:
+            settings = with_overrides(settings, _parse_overrides(args.set))
+    except SettingsError as exc:
+        parser.error(str(exc))
+    args.ip = args.ip or settings.plc.omron.ip
+    args.port = args.port or settings.plc.omron.port
 
-    _run_scheduler(args)
+    args.runlog = _open_runlog(args, settings, console)
+    try:
+        if console:
+            _run_console(args, settings)
+        elif args.cli:
+            _run_cli(args, settings)
+        else:
+            _run_scheduler(args, settings)
+    finally:
+        if args.runlog is not None:
+            args.runlog.close()
 
 
 if __name__ == "__main__":

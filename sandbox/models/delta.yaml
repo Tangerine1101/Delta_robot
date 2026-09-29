@@ -1,0 +1,51 @@
+# The cell's delta arm, as the sandbox simulates it.
+#
+# `cell` is the robot / conveyor / object_types / pick_gate of modules/config.yaml, copied so the
+# sandbox has its own configuration. `python3 -m sandbox check` lists every value that differs
+# from the operational file; differences are allowed (an idealised arm for theory runs, a
+# candidate calibration), but they should be deliberate.
+#
+# `params` are the model's own parameters; `plant` holds dotted overrides that turn the model
+# (what the scheduler believes) into the plant (what the simulated arm does), e.g.
+#   plant: {pick_gate.robot_movement_delay_s: 0.20}   # the real delay is longer than modelled
+model: delta
+params:
+  gate_sampling_latency_s: 0.0  # the sandbox evaluates the gate exactly; the robot budgets 0.0375 s
+plant: {}
+cell:
+  robot:
+    limits: {radius_xy_mm: 180.0, z_min_mm: -305.0, z_max_mm: -220.0}
+    home_position: [0.0, 0.0, -290.0]
+    heights: {clearance: -265.0, slope_transition: -275.0, pre_pick: -287.0, pickup: -300.0, place: -280.0}
+    corner_blend_xy: 25.0
+    interpolator: {v_max: 300.0, a_max: 1000.0, d_max: 1000.0, soft_start_s: 0.08, scurve_shape_factor: 1.5}
+    packet_time: {nominal_xy_speed: 220.0, nominal_z_speed: 220.0, release_descent_time_s: 0.14}
+    rotation: {offset_deg: -62.0, sign: 1, home_tolerance_deg: 0.0, refresh_max_delta_deg: 15.0}
+  conveyor:
+    position_scale_mm: 1.0
+    velocity_ema_alpha: 0.4
+    accel_mm_s2: 22.31
+    hw_max_mm_s: 200.0
+    frame:
+      theta_deg: 28.0
+      robot_origin_uv: [287.0, 88.0]
+    camera_window_uv: [0.0, 110.0, 0.0, 125.0]
+    workspace_window_uv: [188.0, 363.0, 0.0, 125.0]
+  object_types:
+    QFP:
+      bin: [149.65, -13.07, -280.0]
+      w: 25.4
+      h: 25.4
+      marker_class: marker_QFP
+      symmetry_deg: 90
+      heading_offset_deg: 0.0
+    TQFP:
+      bin: [116.8, 48.735, -280.0]
+      w: 46.0
+      h: 38.0
+      marker_class: marker_TQFP
+      symmetry_deg: 180
+      heading_offset_deg: 0.0
+  pick_gate: {robot_movement_delay_s: 0.17, ethernet_delay_s: 0.016, pick_descent_time_s: 0.0, late_abort_mm: 12.0, 
+      arrival_tolerance_mm: 15.0, arrival_tolerance_max_mm: 50.0, arrival_timeout_margin_s: 1, oblique_descent_enabled: 
+      false, intercept_lead_time_s: 0.8}

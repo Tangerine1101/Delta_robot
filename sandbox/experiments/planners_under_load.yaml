@@ -1,0 +1,10 @@
+# Every sequence planner and the SPT rule against the load, at a constant belt speed.
+description: planners under Poisson load, constant 60 mm/s
+base:
+  sim.duration_s: 600
+  speed.law: constant
+  speed.static_mm_s: 60
+seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+grid:
+  scheduling.planner: [kim, kim_release, drop_longest, cardinality_arrival, dp, spt, spt_rollout, edd_rollout]
+  feeder.poisson.rate_per_min: [18, 24, 30]
