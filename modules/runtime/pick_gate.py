@@ -18,6 +18,8 @@ from modules.settings import Point
 
 # The pose must be this far into a vertical final segment to count as arrived.
 FINAL_SEGMENT_ENTRY_MM = 0.5
+# Longest a belt sample is extrapolated forward; an older sample is used as it is.
+MAX_EXTRAPOLATION_S = 0.2
 
 
 def belt_lead_offset_mm(belt_speed_mm_s: float, lead_s: float) -> float:
@@ -32,18 +34,29 @@ def find_tracked_object(tracker: BeltTracker, object_id: str) -> TrackedObject |
     return None
 
 
-def object_gate_status(state: RealtimeState, plan: PickPlan, lead_s: float) -> dict[str, Any] | None:
-    """Where the part is relative to the gate threshold, or None when its track is gone."""
+def object_gate_status(state: RealtimeState, plan: PickPlan, lead_s: float,
+                       now: float | None = None, offset_mm: float = 0.0) -> dict[str, Any] | None:
+    """Where the part is relative to the gate threshold, or None when its track is gone.
+
+    With `now`, the belt position of the latest perception sample (up to one tick old) is
+    extrapolated to `now` at the sampled speed, so the gate sees where the part is rather
+    than where it was. `offset_mm` (`pick_gate.gate_offset_mm`) moves the threshold upstream
+    (> 0, earlier) or downstream (< 0, later) by a fixed distance."""
     with state.state_lock:
         obj = find_tracked_object(state.tracker, plan.object_id)
         if obj is None:
             return None
         p_now = state.belt_position_mm
         speed = state.belt_speed_mm_s
+        sample = state.latest_speed
+        if now is not None and sample is not None:
+            age = now - sample.timestamp
+            if 0.0 < age <= MAX_EXTRAPOLATION_S:
+                p_now = sample.position_mm + sample.speed_uv * age
         u_now, _ = obj.current_uv(p_now)
         u_pick, _ = state.frame.to_conveyor(plan.predicted_pick_position_2d[0],
                                             plan.predicted_pick_position_2d[1])
-    threshold = u_pick - belt_lead_offset_mm(speed, lead_s)
+    threshold = u_pick - belt_lead_offset_mm(speed, lead_s) - offset_mm
     return {"reached": u_now >= threshold, "object_u": u_now, "pick_u": u_pick,
             "threshold_u": threshold}
 

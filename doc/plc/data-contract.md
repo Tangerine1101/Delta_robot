@@ -23,6 +23,7 @@ matter — but **every tag name Python touches must exist**, or the write fails.
 | `argument_time` | ARRAY[0..6] OF REAL | **removed** | **yes → fails on target** |
 | `argument_e` | ARRAY[0..6] OF INT | ARRAY[0..31] OF INT | yes, 0/1 |
 | `bit_doing` | INT | INT | yes, `1`, written **last** |
+| `conveyor_speed` | REAL (added with `Section_Conveyor`) | — | yes, command 8 only (mm/s ≥ 0) |
 
 ### 1.2. `plc_package : From_plc` (PLC → PC)
 
@@ -37,6 +38,13 @@ matter — but **every tag name Python touches must exist**, or the write fails.
 | `current_step` | — | INT | **never written** | no |
 | `n_points_ack` | — | INT | **never written** | no |
 | `end_effector` | — | — | does not exist in either struct | **yes** — that element fails; the read still succeeds because `_response_has_success` accepts any successful element |
+| `conveyor_velocity` | REAL (added with `Section_Conveyor`) | — | `-MC_Conveyor.Act.Vel`, mm/s, positive along the belt | yes, every poll |
+| `conveyor_position` | REAL (added) | — | `-MC_Conveyor.Act.Pos`, mm, increasing along the belt | yes, every poll |
+| `conveyor_state` | INT (added) | — | 0 stopped, 1 ramping, 2 at speed, 3 error, 4 servo off | yes, every poll |
+
+The belt members were added at the end of both structs of the deployed program, together with
+`Section_Conveyor` (axis `MC_Conveyor`, EtherCAT servo, unit mm); the `.smc2` in `OMRON/matching
+code/` predates them. The target program has none of them yet.
 
 ## 2. Omron handshake semantics
 
@@ -47,8 +55,11 @@ matter — but **every tag name Python touches must exist**, or the write fails.
    * command 2 → `task_state` 2 then 1 when `Goto_Abs.Done`;
    * command 4 → 2 then 1 on `Home_Done`;
    * command 3 → 2 and **never changes** (no rung maps sequencer completion);
-   * commands 5/6 → 1 immediately (and have no physical effect, `program-main.md` rung 13).
-4. Python does not read `bit_doing` back and does not use `task_state` for command 3. It
+   * commands 5/6 → 1 immediately (and have no physical effect, `program-main.md` rung 13);
+   * command 8 (belt speed) → `task_doing` / `task_state` untouched, so a belt command never
+     masks the state of a running arm command; the belt reports through `conveyor_state`.
+4. Python reads `bit_doing` back only after a command 8 (≤ 0.1 s, so the next command cannot
+   overwrite `commandID` before the PLC scanned it) and does not use `task_state` for command 3. It
    detects arrival from `pos_EE` (must first leave, then re-enter a tolerance around the last
    waypoint) with a deadline of `Σ argument_time + execution_margin_s`
    (`RealtimePickExecutor._wait_for_arm_arrival`).
@@ -60,10 +71,11 @@ matter — but **every tag name Python touches must exist**, or the write fails.
 
 ## 3. Siemens S7-1200 — DB contract
 
-The Siemens program is unchanged. Its DB1 (12 bytes, PC → PLC: `CommandID`, `rotate`,
-`speed`) and DB2 (20 bytes, PLC → PC: `rotate_current`, `speed_current`, `task_doing`,
-`task_state`, `conveyor_position` in mm) offset tables are kept in one place only:
-[`../basis-programming.md`](../basis-programming.md) §3.2.
+The Siemens program is unchanged; the PC uses it for the cup rotation only (commands 7, 9).
+Its DB1 (12 bytes, PC → PLC: `CommandID`, `rotate`, `speed`) and DB2 (20 bytes, PLC → PC:
+`rotate_current`, `speed_current`, `task_doing`, `task_state`, `conveyor_position`) offset
+tables are kept in one place only: [`../basis-programming.md`](../basis-programming.md) §3.2.
+The belt fields of both DBs are no longer used by the PC; the layout is kept.
 
 Each send is `db_write(DB1)` followed by `db_read(DB2)`. DB1 has no handshake bit
 (`open-issues.md` L5); DB2 `task_state` is unusable (L3).
@@ -79,8 +91,8 @@ Each send is `db_write(DB1)` followed by `db_read(DB2)`. DB1 has no handshake bi
 | 4 | calibrate | Omron | homing + calibration |
 | 5 / 6 | pick / release | Omron | none (pump overwritten each scan) |
 | 7 | rotate_absolute | Siemens | cup rotation |
-| 8 | change_speed | Siemens | belt speed |
-| 9 | plan_siemen | Siemens | — |
+| 8 | change_speed | Omron (deployed program) | belt speed, `pc_package.conveyor_speed` |
+| 9 | plan_siemen | Siemens | rotation (the CLI `plan_siemen` sends 7 + 8) |
 | 10 | enable | Omron | none |
 
 Suction is controlled only through `argument_e` of a command 3.
@@ -98,3 +110,6 @@ are applied:
 | 4 | Read `n_points_ack`, `current_step`, `task_state` (once patched) and only dispatch the pick phase after the goto phase has been **accepted and completed** by the PLC | otherwise the pick phase can be silently discarded (**P4**) |
 | 5 | Remove `end_effector` from the status tags (or add it to `From_plc`) | read of a non-existent member |
 | 6 | Re-derive the PC trajectory-time model (`core/motion`: `corner_v_end`, `segment_profile_time`, `trajectory_time`) from the PLC as patched — the target FB has no cosine corner law | gate lead / ETAs |
+
+On the PLC side the target program also needs the belt section of the deployed one
+(`open-issues.md` **P14**); the PC side of the belt contract is unchanged by the switch.

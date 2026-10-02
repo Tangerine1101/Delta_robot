@@ -7,7 +7,8 @@ so that figure is the SUM of both network paths. Only the Omron path actually
 gates a pick dispatch (the pick command goes to the Omron), so the Siemens
 latency inflates the number the scheduler calibrates against.
 
-This tool times each PLC's read-only status call individually, plus the
+This tool times each PLC's read-only status call individually (and the Omron
+belt-only read), plus the
 sequential Omron->Siemens combo the worker performs, and reports
 min/mean/median/p95/max for each. It then suggests an ``ethernet_delay_s`` from
 the Omron-only mean.
@@ -127,6 +128,8 @@ def run(target: str, count: int, warmup: int) -> int:
         omron_stats: dict[str, float] = {}
         if want_omron and omron is not None:
             omron_stats = _measure("omron get_package", omron.get_package, count, warmup)
+            # The belt-only read of a poll while the UDP pose stream is fresh.
+            _measure("omron get_conveyor", omron.get_conveyor, count, warmup)
         if want_siemens and siemens is not None:
             _measure("siemens get_status", siemens.get_status, count, warmup)
 

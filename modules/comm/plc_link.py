@@ -1,8 +1,10 @@
 """The PLC link: a worker process that owns both PLC connections, and its handle in the main
 process.
 
-The worker serialises every request through one command queue, converts the rotation angle
-verbatim at the wire (modules/core/angles.py) and scales the real belt feedback to true mm. The
+The worker serialises every request through one command queue, routes each command to its PLC
+(rotation 7/9 to the Siemens, everything else including the belt speed 8 to the Omron), converts
+the rotation angle verbatim at the wire (modules/core/angles.py) and scales the real belt
+feedback to true mm. The
 main process talks to it only through `PlcLink.dispatch` / `PlcLink.request_status`; the UDP
 pose stream and the run log hang off the same handle.
 """
@@ -28,10 +30,15 @@ NO_STREAM_WARN_S = 2.0
 # EtherNet/IP and snap7 sessions from being dropped by firmware keep-alive timers.
 _KEEPALIVE_S = 25.0
 
-# Status fields filled from the Siemens PLC; everything else in a status dict is Omron's.
-_SIEMENS_STATUS_KEYS = frozenset({
-    "rotate_current", "speed_current", "siemens_task_doing", "siemens_task_state",
-    "conveyor_position", "conveyor_position_raw", "speed_current_raw",
+# Commands the Siemens PLC executes; every other command ID goes to the Omron.
+_SIEMENS_COMMANDS = (7, 9)
+
+# Status fields read on every poll (belt feedback from the Omron, rotation from the Siemens);
+# the rest of a status dict is the Omron block that may be served from cache.
+_FAST_STATUS_KEYS = frozenset({
+    "rotate_current", "siemens_task_doing", "siemens_task_state",
+    "speed_current", "speed_current_raw", "conveyor_position", "conveyor_position_raw",
+    "conveyor_state",
 })
 
 
@@ -55,7 +62,7 @@ def _worker(
     if ip in ("127.0.0.1", "localhost"):
         siemens_ip = ip
         siemens_port = port
-        # The simulator reports the belt in true mm; the scale corrects the real encoder only.
+        # The simulator reports the belt in true mm; the scale corrects the real feedback only.
         belt_scale = 1.0
     else:
         siemens_ip = settings.plc.siemens.ip
@@ -100,9 +107,14 @@ def _worker(
             if message_type == "status":
                 try:
                     # omron=False: the robot pose comes from the UDP stream, so only the
-                    # Siemens DB is read; the caller merges its cached Omron fields.
-                    status = gateway.get_package() if message.get("omron", True) else {}
+                    # belt feedback and the Siemens DB are read; the caller merges its
+                    # cached Omron fields.
+                    if message.get("omron", True):
+                        status = gateway.get_package()
+                    else:
+                        status = gateway.get_conveyor()
                     if status is not None:
+                        _belt_feedback(status, belt_scale)
                         try:
                             s_status = siemens_gateway.get_status()
                             if s_status is not None:
@@ -117,14 +129,8 @@ def _worker(
                                         math.degrees(wire_deg_to_robot_rad(rotate_wire))
                                         if rotate_wire is not None else None
                                     ),
-                                    # Belt feedback in true mm and mm/s from here on;
-                                    # the PLC's raw values are kept for the run log.
-                                    "speed_current": _scaled(s_status.get("speed_current"), belt_scale),
-                                    "speed_current_raw": s_status.get("speed_current"),
                                     "siemens_task_doing": s_status.get("task_doing"),
                                     "siemens_task_state": s_status.get("task_state"),
-                                    "conveyor_position": _scaled(s_status.get("conveyor_position"), belt_scale),
-                                    "conveyor_position_raw": s_status.get("conveyor_position"),
                                 })
                         except Exception as s_exc:
                             print(f"[WARN] Failed to query Siemens status: {s_exc}")
@@ -137,7 +143,7 @@ def _worker(
                 try:
                     pkg = message["package"]
                     cmd_id = pkg.get("commandID")
-                    if cmd_id in (7, 8, 9):
+                    if cmd_id in _SIEMENS_COMMANDS:
                         # Siemens command. rotate_absolute (7) carries an R-frame
                         # angle in RADIANS: convert VERBATIM to wire degrees
                         # [-359,359] (identity zero, no wrap) on the wire only
@@ -161,9 +167,11 @@ def _worker(
                             }
                         )
                     else:
-                        # Omron command
+                        # Omron command (arm, suction, belt speed)
                         package = gateway.send_package(pkg)
                         status = gateway.get_package()
+                        if status is not None:
+                            _belt_feedback(status, belt_scale)
                         response_queue.put(
                             {
                                 "ok": True,
@@ -193,6 +201,17 @@ def _worker(
 
 def _scaled(value: Any, scale: float) -> float | None:
     return None if value is None else float(value) * scale
+
+
+def _belt_feedback(status: dict[str, Any], scale: float) -> None:
+    """Rename the Omron belt members to the status keys the rest of the code reads, in true
+    mm and mm/s; the PLC's raw values are kept for the run log."""
+    velocity = status.pop("conveyor_velocity", None)
+    position = status.get("conveyor_position")
+    status["speed_current"] = _scaled(velocity, scale)
+    status["speed_current_raw"] = velocity
+    status["conveyor_position"] = _scaled(position, scale)
+    status["conveyor_position_raw"] = position
 
 
 def _wait_for_response(
@@ -273,7 +292,8 @@ class PlcLink:
 
     `request_status` takes the robot pose from the UDP stream while it is fresh; the Omron
     status block (task_state, bit_doing, end_effector) is then re-read only every
-    `omron_status_period_s` and merged from cache, and each poll reads just the Siemens DB.
+    `omron_status_period_s` and merged from cache, and each poll reads just the Omron belt
+    feedback and the Siemens DB.
     When the stream is missing or stale every poll reads both PLCs, as before.
     """
 
@@ -378,7 +398,7 @@ class PlcLink:
         data = response.get("data")
         if data is not None:
             if read_omron:
-                self._omron_cache = {k: v for k, v in data.items() if k not in _SIEMENS_STATUS_KEYS}
+                self._omron_cache = {k: v for k, v in data.items() if k not in _FAST_STATUS_KEYS}
                 self._omron_read_at = t_done
             else:
                 merged = dict(self._omron_cache or {})

@@ -1,6 +1,6 @@
 """The PLC simulator node: Omron (Matching_Code_10) + Siemens + parts, in real time.
 
-``PLCSim`` scans the Omron port every 4 ms in a thread and serves the JSON-lines
+``PLCSim`` scans the Omron port (arm and belt) every 4 ms in a thread and serves the JSON-lines
 protocol that ``comm.omron.MockPLC`` and the mock ``SiemensGateway`` already speak
 when the PLC address is ``127.0.0.1`` — so ``main.py`` and the scheduler run
 unmodified against it. ``SimCamera`` feeds the vision interface of the production
@@ -47,8 +47,9 @@ class PLCSim:
         home = self.settings.robot.home_position
         _, start_angles, _ = calc_inverse_kinematics(*home)
         self.omron = OmronPLC(quirks, patches=patches, start_angles_deg=start_angles,
-                              servo_tau_s=servo_tau_s)
-        self.siemens = SiemensPLC(belt_accel_mm_s2=self.settings.conveyor.accel_mm_s2)
+                              servo_tau_s=servo_tau_s,
+                              conveyor_accel_mm_s2=self.settings.conveyor.accel_mm_s2)
+        self.siemens = SiemensPLC()
         self.frame = ConveyorFrame.from_settings(self.settings.conveyor)
         self.world = World.from_settings(self.settings, self.frame)
         self.feeder = None
@@ -134,18 +135,19 @@ class PLCSim:
         """One 4 ms scan of both PLCs and the plant (caller holds ``lock``)."""
         self.omron.scan()
         self.siemens.step(SCAN_S)
-        self.world.update(now, self.siemens.position_mm, self.omron._fk_xyz, self.omron.pump_out)
-        if self.feeder is not None and self.siemens.speed_current > 1.0:
-            self.feeder.tick(now, self.world, self.siemens.position_mm)
+        belt = self.omron.conveyor
+        self.world.update(now, belt.position, self.omron._fk_xyz, self.omron.pump_out)
+        if self.feeder is not None and belt.velocity > 1.0:
+            self.feeder.tick(now, self.world, belt.position)
         self._hist_t.append(now)
-        self._hist_p.append(self.siemens.position_mm)
+        self._hist_p.append(belt.position)
 
     # ---- queries ----------------------------------------------------------------------
     def belt_position_at(self, t: float) -> float:
         with self.lock:
             times, pos = list(self._hist_t), list(self._hist_p)
         if not times:
-            return self.siemens.position_mm
+            return self.omron.conveyor.position
         i = bisect.bisect_left(times, t)
         if i <= 0:
             return pos[0]
@@ -161,8 +163,8 @@ class PLCSim:
                 "pump": self.omron.pump_out,
                 "chain_states": self.omron.chain_states,
                 "task_state": self.omron.plc_package["task_state"],
-                "belt_speed_mm_s": round(self.siemens.speed_current, 1),
-                "belt_position_mm": round(self.siemens.position_mm, 1),
+                "belt_speed_mm_s": round(self.omron.conveyor.velocity, 1),
+                "belt_position_mm": round(self.omron.conveyor.position, 1),
                 "rotate_deg": round(self.siemens.rotate_current, 1),
                 "world": self.world.counts(),
                 "plc_events": dict(self.omron.event_counts),
@@ -287,12 +289,12 @@ class SimCamera:
             return None
         sim = self.sim
         with sim.lock:
-            belt = sim.siemens.position_mm
+            belt = sim.omron.conveyor.position
             boards = [(b.u_at(belt), b.v, b.board_type, b.state, b.xy) for b in sim.world.boards
                       if b.state in ("belt", "held")]
             tcp = sim.omron.pos_ee
             pump = sim.omron.pump_out
-            speed = sim.siemens.speed_current
+            speed = sim.omron.conveyor.velocity
             counts = sim.world.counts()
         width, height, u0, u1, v0, v1 = 800, 330, -20.0, 420.0, -150.0, 170.0
         img = np.full((height, width, 3), 24, np.uint8)

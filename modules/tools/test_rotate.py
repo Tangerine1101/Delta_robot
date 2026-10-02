@@ -17,11 +17,12 @@ Omron arm is never moved):
    WATCH it during the sweep. If +90 turns the cup clockwise from above, set
    ``scheduler.rotate_sign: -1``.
 4. **Retrigger semantics** — DB1 has no handshake and both production rotate
-   commands are CommandID=7. If the ST program edge-triggers on a CommandID
-   *change*, a second consecutive cmd-7 is silently dropped (production's
-   post-grip rotate would only work when an adaptive change_speed happened to
-   interleave). The probe sends back-to-back cmd-7 pairs with and without an
-   interleaved no-op change_speed and compares.
+   commands are CommandID=7. The belt speed now goes to the Omron, so nothing
+   else is ever written to DB1 between them: if the ST program edge-triggers on
+   a CommandID *change*, every post-grip rotate is silently dropped. The probe
+   sends back-to-back cmd-7 pairs with and without an interleaved Siemens
+   CommandID=8 (the Siemens program's own belt command, which drives no belt
+   any more) and compares.
 
 Usage:
     python3 -m modules.tools.test_rotate                     # full sequence
@@ -68,7 +69,8 @@ def _send_rotate(siemens: SiemensGateway, target_deg: float) -> bool:
 
 
 def _send_speed_noop(siemens: SiemensGateway) -> bool:
-    """Interleave a change_speed that re-sends the measured belt speed (no-op)."""
+    """Interleave a Siemens CommandID=8 that re-sends the Siemens' own speed reading (no-op;
+    the belt itself is driven by the Omron)."""
     status = siemens.get_status()
     speed = 0.0
     if status is not None and status.get("speed_current") is not None:

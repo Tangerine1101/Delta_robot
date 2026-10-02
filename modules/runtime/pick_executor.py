@@ -17,7 +17,7 @@ from collections import deque
 from typing import Any, Callable
 
 from modules.comm.packets import COMMAND_ID
-from modules.core.delta import DeltaArm
+from modules.core.delta import GATE_POLL_S, DeltaArm
 from modules.runtime.pick_gate import (
     find_tracked_object,
     in_final_segment,
@@ -512,7 +512,8 @@ class RealtimePickExecutor:
         late_abort_mm = self.arm.gate.late_abort_mm
         while True:
             now = time.monotonic()
-            gate = object_gate_status(state, plan, self.arm.gate_lead_s)
+            gate = object_gate_status(state, plan, self.arm.gate_lead_s, now,
+                                      self.arm.gate.gate_offset_mm)
             if gate is None:
                 print(
                     "[WARN]",
@@ -564,4 +565,4 @@ class RealtimePickExecutor:
                 )
                 plan.debug_info["abort_reason"] = "object_stalled"
                 return False
-            time.sleep(self.status_poll_interval_s)
+            time.sleep(GATE_POLL_S)

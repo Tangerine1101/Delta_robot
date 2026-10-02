@@ -187,7 +187,9 @@ class PlanDescent(unittest.TestCase):
     def test_descend_time_is_the_vertical_model(self):
         cfg, _, arm, _, plan = _fixture(time.monotonic())
         self.assertFalse(cfg.pick_gate.oblique_descent_enabled)
-        self.assertAlmostEqual(plan.trajectory_pick[0].time_s, 0.08, places=6)
+        h, pt = cfg.robot.heights, cfg.robot.packet_time
+        self.assertAlmostEqual(plan.trajectory_pick[0].time_s,
+                               max(0.08, (h.pre_pick - h.pickup) / pt.nominal_z_speed), places=6)
         self.assertAlmostEqual(plan.descend_time_s, arm.vertical_descent_time_s(), places=12)
         self.assertEqual(plan.debug_info["contact_position_3d"], plan.debug_info["pick_position_3d"])
 

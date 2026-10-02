@@ -256,9 +256,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="b" onclick="teach()">Save current position</button>
       </div>
       <table><tbody id="teachlist"></tbody></table>
-      <div class="note" style="margin-top:6px">Kept in this browser only. Copy the JSON into
-        <span class="mono">config.yaml</span> by hand.</div>
-      <div id="teachjson" class="mono"></div>
+      <div class="note" style="margin-top:6px">Saved in <span class="mono">config.yaml</span>
+        › <span class="mono">interface.teach_points</span> (robot frame, mm).</div>
     </div>
   </div>
 </div>
@@ -471,24 +470,36 @@ function runSettings(){
 async function stopScenario(){ const j = await api("/api/scenario/stop", {}); if(j) toast(j.stopping?"stopping…":"nothing running"); }
 $("stopbtn").onclick = async () => { const j = await api("/api/stop", {}); if(j) toast("STOP sent: belt stopped, run ending"); };
 
-// ---------------------------------------------------------------- teach points (browser-local)
-function teachLoad(){ try{ return JSON.parse(localStorage.getItem("delta_teach")||"{}"); }catch(_){ return {}; } }
-function teachSave(o){ try{ localStorage.setItem("delta_teach", JSON.stringify(o)); }catch(_){} }
-function teachRender(){
-  const o=teachLoad(), keys=Object.keys(o);
-  $("teachlist").innerHTML = keys.map(k=>`<tr><td>${k}</td><td class="mono">${o[k].map(v=>v.toFixed(2)).join(", ")}</td>`
-    +`<td><button class="b man" onclick="teachGo('${k}')">Go</button> <button class="b" onclick="teachDel('${k}')">✕</button></td></tr>`).join("");
-  $("teachjson").textContent = keys.length ? JSON.stringify(o) : "";
+// ---------------------------------------------------------------- teach points (config.yaml, via the console)
+let teachPoints = {}, teachKeys = [], teachShown = null;
+function teachRender(points){
+  const json = JSON.stringify(points||{});
+  if(json===teachShown) return;
+  teachShown = json; teachPoints = points||{}; teachKeys = Object.keys(teachPoints);
+  const esc = t => t.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  $("teachlist").innerHTML = teachKeys.map((k,i)=>`<tr><td>${esc(k)}</td><td class="mono">${teachPoints[k].map(v=>(+v).toFixed(2)).join(", ")}</td>`
+    +`<td><button class="b man" onclick="teachGo(${i})">Go</button> <button class="b" onclick="teachDel(${i})">✕</button></td></tr>`).join("");
   applyEnable();
 }
-function teach(){
+async function teach(){
   const name=$("teachname").value.trim(); if(!name){ toast("give the point a name", true); return; }
-  if(!pose){ toast("no position yet", true); return; }
-  const o=teachLoad(); o[name]=pose.map(v=>Math.round(v*100)/100); teachSave(o); teachRender(); toast("saved "+name);
+  const j = await api("/api/teach/save", {name}); if(j){ $("teachname").value=""; toast("saved "+name); }
 }
-function teachDel(k){ const o=teachLoad(); delete o[k]; teachSave(o); teachRender(); }
-async function teachGo(k){ const p=teachLoad()[k]; if(!p) return;
+async function teachDel(i){ const k=teachKeys[i]; const j = await api("/api/teach/delete", {name:k}); if(j) toast("deleted "+k); }
+async function teachGo(i){ const k=teachKeys[i], p=teachPoints[k]; if(!p) return;
   const j = await api("/api/manual/goto", {x:p[0], y:p[1], z:p[2]}); if(j) toast("goto "+k); }
+// Points saved by older pages in this browser's localStorage are moved to the config once.
+async function teachMigrate(){
+  let old = {};
+  try{ old = JSON.parse(localStorage.getItem("delta_teach")||"{}"); }catch(_){ return; }
+  const names = Object.keys(old).filter(k=>!(k in teachPoints));
+  for(const k of names){
+    const p = old[k];
+    if(!await api("/api/teach/save", {name:k, x:p[0], y:p[1], z:p[2]})) return;
+  }
+  try{ localStorage.removeItem("delta_teach"); }catch(_){}
+  if(names.length) toast("moved "+names.length+" browser teach point(s) to config.yaml");
+}
 
 // ---------------------------------------------------------------- enable/disable
 function applyEnable(){
@@ -572,6 +583,9 @@ function apply(type, d){
       sel.innerHTML = d.scenarios.map(s=>`<option ${s==="production"?"selected":""}>${s}</option>`).join("");
     }
     fillRunForm(d);
+    const firstTeach = teachShown===null;
+    teachRender(d.teach_points);
+    if(firstTeach) teachMigrate();
     if(!$("presets").dataset.done){
       $("presets").innerHTML = Object.keys(d.presets).map(k=>`<button class="b man" onclick="preset('${k}')">${k}</button>`).join("");
       $("presets").dataset.done="1";
@@ -868,7 +882,6 @@ function connect(){
 }
 // Console events arrive at >= 1 Hz; silence means the page no longer reflects the cell.
 setInterval(()=>{ if(sup!==null && live && Date.now()-lastEvent > 4000) setLive(false); }, 1000);
-teachRender();
 applyEnable();
 connect();
 </script>

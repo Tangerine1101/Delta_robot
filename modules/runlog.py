@@ -44,7 +44,7 @@ STATUS_FIELDS = (
     "t_mono", "t_wall", "rtt_s", "omron_read", "pose_source", "pose_age_s",
     "x", "y", "z", "conveyor_position", "speed_current", "rotate_current",
     "task_doing", "task_state", "bit_doing", "end_effector", "siemens_task_doing",
-    "siemens_task_state", "conveyor_position_raw", "speed_current_raw",
+    "siemens_task_state", "conveyor_position_raw", "speed_current_raw", "conveyor_state",
 )
 
 

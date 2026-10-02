@@ -31,7 +31,8 @@ def _wait(pred, timeout_s: float) -> bool:
 class ConsoleAgainstSimulator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        settings = load_settings()
+        # Hand-set hardware corrections off: the simulator has no error for them to correct.
+        settings = load_settings(**{"pick_gate.gate_offset_mm": 0.0, "feeder.detection_latency_s": 0.0})
         cls.sim = PLCSim(settings=settings, tag_latency_s=0.0, feed_interval_s=2.5)
         cls.sim.start()
         host, port = cls.sim.serve()
@@ -44,7 +45,7 @@ class ConsoleAgainstSimulator(unittest.TestCase):
         def dispatch(pkg):
             with lock:
                 cmd = pkg.get("commandID")
-                if cmd in (7, 8, 9):
+                if cmd in (7, 9):
                     wire = dict(pkg)
                     if cmd == 7:
                         wire["rotate"] = robot_rad_to_wire_deg(pkg.get("rotate", 0.0))
@@ -56,8 +57,7 @@ class ConsoleAgainstSimulator(unittest.TestCase):
             with lock:
                 status = omron.get_package()
                 s = siemens.get_status() or {}
-                status.update({"speed_current": s.get("speed_current"),
-                               "conveyor_position": s.get("conveyor_position"),
+                status.update({"speed_current": status.pop("conveyor_velocity", None),
                                "rotate_current": s.get("rotate_current")})
                 return status
 
@@ -129,7 +129,7 @@ class ConsoleAgainstSimulator(unittest.TestCase):
 
     def test_4_belt_and_rotation(self):
         self.assertEqual(self.api("/api/belt", {"speed": 50.0})[0], 200)
-        self.assertTrue(_wait(lambda: self.sim.siemens.speed_current > 10.0, 3.0))
+        self.assertTrue(_wait(lambda: self.sim.omron.conveyor.velocity > 10.0, 3.0))
         self.assertEqual(self.api("/api/belt", {"speed": 0.0})[0], 200)
         self.assertEqual(self.api("/api/rotate", {"deg": 45.0})[0], 200)
         self.assertTrue(_wait(lambda: abs(self.sim.siemens.rotate_current - 45.0) < 0.5, 3.0))
@@ -184,6 +184,34 @@ class ConsoleAgainstSimulator(unittest.TestCase):
             "feeder_kind": "periodic", "feeder_rate": 30}})
         self.assertEqual(code, 400, r)
         self.assertEqual(self.sup.mode, "idle")
+
+    def test_8_teach_points_persist_in_the_config(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from modules.config_io import CONFIG_PATH, read_config
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "config.yaml"
+        shutil.copy(CONFIG_PATH, path)
+        self.sup.config_path = path
+        before = self.sup.teach_points
+        self.addCleanup(setattr, self.sup, "teach_points", before)
+        self._idle()
+        code, r = self.api("/api/teach/save", {"name": "here"})          # current pose
+        self.assertEqual(code, 200, r)
+        code, r = self.api("/api/teach/save", {"name": "C - 1, 2", "x": 1.0, "y": 2.0, "z": -290.0})
+        self.assertEqual(code, 200, r)
+        saved = read_config(path)["interface"]["teach_points"]
+        self.assertEqual(saved["C - 1, 2"], [1.0, 2.0, -290.0])
+        self.assertEqual(len(saved["here"]), 3)
+        self.assertIn("C - 1, 2", self.sup.state()["teach_points"])
+        self.assertEqual(self.api("/api/teach/delete", {"name": "here"})[0], 200)
+        self.assertNotIn("here", read_config(path)["interface"]["teach_points"])
+        self.assertEqual(self.api("/api/teach/save", {"name": "  "})[0], 400)
+        self.assertEqual(read_config(path)["vision"], read_config(CONFIG_PATH)["vision"])
 
 
 if __name__ == "__main__":

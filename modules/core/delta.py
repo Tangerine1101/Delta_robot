@@ -25,9 +25,11 @@ from modules.core.motion import segment_profile_time, trajectory_time
 from modules.core.trajectory import goto_waypoints, pick_waypoints
 from modules.settings import PickGateSettings, Point, RobotSettings, Settings
 
-# Period of the realtime perception thread (s). Half of it is part of the gate's sampling
-# staleness, so it lives with the model that budgets for it.
+# Period of the realtime perception thread (s).
 PERCEPTION_PERIOD_S = 0.025
+# Period of the pick gate's wait loop (s). The gate extrapolates the belt position to the
+# instant it looks, so its only staleness is when inside a poll it fires.
+GATE_POLL_S = 0.005
 
 # Iteration budgets and tolerances of the intercept solver.
 _EARLIEST_ITERATIONS = 6
@@ -36,10 +38,11 @@ _PARK_ITERATIONS = 4
 _PARK_TOL_S = 1e-3
 
 
-def gate_sampling_latency_s(poll_interval_s: float, perception_period_s: float = PERCEPTION_PERIOD_S) -> float:
-    """Average staleness of a part's u as the gate sees it: half the gate poll plus half the
-    perception tick."""
-    return poll_interval_s / 2.0 + perception_period_s / 2.0
+def gate_sampling_latency_s(gate_poll_s: float = GATE_POLL_S) -> float:
+    """Average lateness of the gate firing: half its poll period. The belt position the gate
+    reads is extrapolated to the present (`runtime/pick_gate.object_gate_status`), so the
+    perception tick adds nothing."""
+    return gate_poll_s / 2.0
 
 
 class DeltaArm:
@@ -67,7 +70,7 @@ class DeltaArm:
             settings.pick_gate,
             frame or ConveyorFrame.from_settings(settings.conveyor),
             settings.conveyor.workspace_window_uv,
-            gate_sampling_latency_s(settings.runtime.poll_interval_s),
+            gate_sampling_latency_s(),
         )
 
     # ---- geometry and time ------------------------------------------------------------

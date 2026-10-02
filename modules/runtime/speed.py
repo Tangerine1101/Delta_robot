@@ -13,7 +13,7 @@ import math
 import time
 from typing import Any, Callable
 
-from modules.comm.packets import COMMAND_ID
+from modules.comm.packets import change_speed_packet
 from modules.core.forecast import BeltForecast
 from modules.runtime.planning import SLOW_DECISION_WARN_S, PickPlanner
 from modules.runtime.state import RealtimeState
@@ -21,11 +21,6 @@ from modules.scheduling.commit import CommitPolicy, commit_step
 from modules.scheduling.registry import BoundPlanner, get_planner, get_speed_law
 from modules.scheduling.types import ScheduledPick, SpeedDecision, SpeedView
 from modules.settings import Settings
-
-
-def change_speed_packet(speed_mm_s: float) -> dict[str, Any]:
-    return {"commandID": COMMAND_ID["change_speed"], "CommandID": COMMAND_ID["change_speed"],
-            "rotate": 0.0, "speed": float(speed_mm_s)}
 
 
 class SpeedController:

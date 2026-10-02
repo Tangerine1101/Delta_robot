@@ -4,8 +4,8 @@
 > **Read this file first** (per `CLAUDE.md` §1 / `AGENTS.md` §1) before any other file.
 
 This project is a Delta-robot pick-and-place sorting cell: a Python control PC coordinates an
-Omron NX1P2 PLC (arm + suction motion) and a Siemens S7-1200 PLC (conveyor speed + 4th-DOF
-rotation), with a real-time vision pipeline (YOLO-OBB) tracking parts on a moving belt.
+Omron NX1P2 PLC (arm + suction motion + the EtherCAT belt servo) and a Siemens S7-1200 PLC
+(4th-DOF rotation), with a real-time vision pipeline (YOLO-OBB) tracking parts on a moving belt.
 
 ---
 
@@ -89,8 +89,8 @@ Delta_robot/
 │   ├── vision/                # PyAV capture, YOLO-OBB pipeline, board heading, ROI, centroid tracker
 │   ├── ui/                    # Web dashboard, operator console back-end, interactive CLI
 │   ├── tools/                 # Probes: latency, rotation, angle sweep, frame converter, rank bounds, UDP;
-│   │                          #   flow_report (input vs throughput across runs)
-│   └── plc_sim/               # PLC simulator (Omron Matching_Code_10 port, Siemens, boards, camera)
+│   │                          #   flow_report (input vs throughput across runs), pick_timing (gate latency, belt scale)
+│   └── plc_sim/               # PLC simulator (Omron Matching_Code_10 port + belt, Siemens, boards, camera)
 │
 ├── sandbox/                   # Offline algorithm bench: config, arm models, feeders, sweeps (README.md)
 ├── tests/                     # Unit and integration tests: python3 -m unittest discover -s tests -t .

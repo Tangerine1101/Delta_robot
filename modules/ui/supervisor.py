@@ -27,7 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from modules.comm.packets import COMMAND_ID, RobotPacket
+from modules.comm.packets import COMMAND_ID, RobotPacket, change_speed_packet
+from modules.config_io import CONFIG_PATH, read_config, write_config
 from modules.core.feeders import FEEDERS, RATE_FIELDS
 from modules.core.frames import ConveyorFrame
 from modules.core.kinematics import calc_inverse_kinematics
@@ -59,6 +60,7 @@ class Supervisor:
         sim: Any = None,
         sim_camera: Any = None,
         record_root: Path | None = None,
+        config_path: Path = CONFIG_PATH,
     ) -> None:
         self._dispatch_raw = dispatch
         self._status_raw = request_status
@@ -88,6 +90,10 @@ class Supervisor:
         self.presets: dict[str, tuple[float, float, float]] = {"home": settings.robot.home_position}
         for name, spec in settings.object_types.items():
             self.presets[f"bin {name}"] = (spec.bin[0], spec.bin[1], clearance)
+        # Teach points live in config.yaml (interface.teach_points) so they survive restarts.
+        self.config_path = Path(config_path)
+        self.teach_points: dict[str, tuple[float, float, float]] = dict(settings.interface.teach_points)
+        self._teach_lock = threading.Lock()
 
         self.mode = IDLE
         self.scenario: str | None = None
@@ -213,6 +219,7 @@ class Supervisor:
             "scenarios": sorted(SCENARIOS),
             "scenario_feeds": {name: sc.feed for name, sc in SCENARIOS.items()},
             "presets": {k: [round(c, 2) for c in v] for k, v in self.presets.items()},
+            "teach_points": {k: [round(c, 2) for c in v] for k, v in self.teach_points.items()},
             "limits": self.limits,
             "plugins": self.plugins,
             "feeders": sorted(FEEDERS),
@@ -284,6 +291,8 @@ class Supervisor:
             ("POST", "/api/manual/goto"): self._api_goto,
             ("POST", "/api/manual/jog"): self._api_jog,
             ("POST", "/api/manual/preset"): self._api_preset,
+            ("POST", "/api/teach/save"): self._api_teach_save,
+            ("POST", "/api/teach/delete"): self._api_teach_delete,
             ("POST", "/api/manual/pump"): self._api_pump,
             ("POST", "/api/manual/home"): self._api_home,
             ("POST", "/api/belt"): self._api_belt,
@@ -384,6 +393,41 @@ class Supervisor:
         x, y, z = self.presets[name]
         return self._manual(f"goto preset '{name}'", lambda: self._goto(x, y, z))
 
+    def _api_teach_save(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Save a named point: the given x/y/z, or the current pose when none is given."""
+        name = str(body.get("name", "")).strip()
+        if not name:
+            raise ValueError("give the point a name")
+        if all(k in body for k in ("x", "y", "z")):
+            point = (float(body["x"]), float(body["y"]), float(body["z"]))
+        else:
+            point = self._current_pose()
+        point = tuple(round(c, 2) for c in point)
+        with self._teach_lock:
+            points = dict(self.teach_points)
+            points[name] = point
+            self._write_teach_points(points)
+        self._log("info", f"teach point '{name}' saved: ({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})")
+        self.emit("sup", self.state())
+        return {"name": name, "point": list(point)}
+
+    def _api_teach_delete(self, body: dict[str, Any]) -> dict[str, Any]:
+        name = str(body.get("name", ""))
+        with self._teach_lock:
+            if name not in self.teach_points:
+                raise ValueError(f"unknown teach point '{name}'")
+            points = {k: v for k, v in self.teach_points.items() if k != name}
+            self._write_teach_points(points)
+        self._log("info", f"teach point '{name}' deleted")
+        self.emit("sup", self.state())
+        return {}
+
+    def _write_teach_points(self, points: dict[str, tuple[float, float, float]]) -> None:
+        raw = read_config(self.config_path)
+        raw.setdefault("interface", {})["teach_points"] = {k: list(v) for k, v in points.items()}
+        write_config(raw, self.config_path)
+        self.teach_points = points
+
     def _api_pump(self, body: dict[str, Any]) -> dict[str, Any]:
         on = 1 if bool(body.get("on")) else 0
 
@@ -415,7 +459,7 @@ class Supervisor:
 
         return self._manual("homing (command 4)", act)
 
-    def _siemens(self, label: str, package: dict[str, Any]) -> dict[str, Any]:
+    def _belt_or_cup(self, label: str, package: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             if self.mode in (RUNNING, STOPPING):
                 raise Busy(f"scenario '{self.scenario}' owns the belt and the cup — stop it first")
@@ -428,15 +472,13 @@ class Supervisor:
         if not 0.0 <= speed <= self.limits["belt_max"]:
             raise ValueError(f"belt speed must be in [0, {self.limits['belt_max']:.0f}] mm/s")
         self.belt_cmd = speed
-        return self._siemens(f"belt speed {speed:.0f} mm/s", {
-            "commandID": COMMAND_ID["change_speed"], "CommandID": COMMAND_ID["change_speed"],
-            "rotate": 0.0, "speed": speed})
+        return self._belt_or_cup(f"belt speed {speed:.0f} mm/s", change_speed_packet(speed))
 
     def _api_rotate(self, body: dict[str, Any]) -> dict[str, Any]:
         deg = float(body["deg"])
         if abs(deg) > 359.0:
             raise ValueError("rotation must be within ±359°")
-        return self._siemens(f"cup rotation {deg:.1f}°", {
+        return self._belt_or_cup(f"cup rotation {deg:.1f}°", {
             "commandID": COMMAND_ID["rotate_absolute"], "CommandID": COMMAND_ID["rotate_absolute"],
             "rotate": math.radians(deg), "speed": 0.0})
 
@@ -511,8 +553,7 @@ class Supervisor:
                 with self.sim.lock:
                     self.sim.feeder = paused_feeder
             try:  # the belt keeps its last commanded speed otherwise
-                self.dispatch({"commandID": COMMAND_ID["change_speed"],
-                               "CommandID": COMMAND_ID["change_speed"], "rotate": 0.0, "speed": 0.0})
+                self.dispatch(change_speed_packet(0.0))
                 self.belt_cmd = 0.0
             except Exception as exc:
                 self._log("error", f"belt stop after run failed: {exc}")
@@ -537,8 +578,7 @@ class Supervisor:
     def _api_emergency_stop(self, body: dict[str, Any]) -> dict[str, Any]:
         self.stop_scenario(reason="STOP button")
         try:
-            self.dispatch({"commandID": COMMAND_ID["change_speed"], "CommandID": COMMAND_ID["change_speed"],
-                           "rotate": 0.0, "speed": 0.0})
+            self.dispatch(change_speed_packet(0.0))
             self.belt_cmd = 0.0
         except Exception as exc:
             self._log("error", f"belt stop failed: {exc}")

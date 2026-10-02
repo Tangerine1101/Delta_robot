@@ -31,16 +31,16 @@ The last two options also apply to `--dummy`.
 main.py ── IPC worker ── MockPLC / SiemensGateway (mock) ──JSON-lines TCP──► PLCSim.handle
                                                                               │ 4 ms scan thread
   production loop ◄── SimCamera.poll ◄── World (boards, feeder, scoring) ◄───┤
-                                                                              ├─ OmronPLC   (omron_core.py)
+                                                                              ├─ OmronPLC   (omron_core.py, incl. ConveyorAxis)
                                                                               ├─ ServoAxis ×3 (plant.py)
                                                                               └─ SiemensPLC (siemens_core.py)
 ```
 
 | File | Content |
 |---|---|
-| `omron_core.py` | Scan-by-scan port of `Program0` rungs 1–21, the six chained `MC_Inter_Curve_Vel` instances, IK/FK, `Goto_Absolute`, homing and the pump state machine. Also the per-instance `MC_SyncMoveAbsolute` hand-over by multi-execution. `REAL` fields are rounded to float32 as on the PLC. |
+| `omron_core.py` | Scan-by-scan port of `Program0` rungs 1–21, the six chained `MC_Inter_Curve_Vel` instances, IK/FK, `Goto_Absolute`, homing and the pump state machine. Also the per-instance `MC_SyncMoveAbsolute` hand-over by multi-execution. `REAL` fields are rounded to float32 as on the PLC. The belt servo (`ConveyorAxis`, command 8, `Section_Conveyor`): ramp at `conveyor.accel_mm_s2`, clamp 300 mm/s, stop below 0.5 mm/s, `conveyor_velocity` / `conveyor_position` (mm) / `conveyor_state` in `plc_package`. |
 | `plant.py` | Setpoint → `Act.Pos` servo model (first-order lag). |
-| `siemens_core.py` | Commands 7/8/9. Belt ramps at `belt_accel_mm_s2`. `conveyor_position` in **mm**. Rotation slews at 180 °/s. |
+| `siemens_core.py` | Commands 7/9: rotation slews at 180 °/s. DB2 `speed_current` / `conveyor_position` stay 0. |
 | `world.py` | Boards on the belt, the feeder, grip/place scoring. |
 | `sim.py` | `PLCSim`: the real-time scan loop, the protocol server, `SimCamera` (detections stamped with the capture time) and a JPEG top view. |
 
@@ -56,6 +56,7 @@ main.py ── IPC worker ── MockPLC / SiemensGateway (mock) ──JSON-line
 | `MC_Stop` / home switches | Axes frozen while a switch is active; no deceleration profile. |
 | Homing | Compressed to its timing (search, calibration move, 5 s window). |
 | Siemens program | Only its PC-visible effects. Command-drop behaviour (L5) and `task_state` (L3) are unknown. |
+| Belt servo | Ideal linear ramp, no belt slip, no servo lag; `Act.Vel` filter not modelled. |
 | Vision | Perfect detections: 90 ms latency, 30 fps, no noise, no misses. |
 | Suction | A board is gripped if the cup comes down with the pump on within 12.7 mm of its centre. It is placed if released within 30 mm of its bin. |
 | Clock | Wall-clock real time; the scan thread counts overruns. |

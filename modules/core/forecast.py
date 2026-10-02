@@ -6,7 +6,7 @@ live belt. The assumption — the setpoint then holds — is made true by the sp
 which never moves the setpoint between goto dispatch and cup contact (doc/basis-theory.md §7.4,
 open-issues L9).
 
-The drive ramps linearly at `accel_mm_s2` (the Siemens belt and the PLC simulator both use a
+The drive ramps linearly at `accel_mm_s2` (the Omron belt servo and the PLC simulator both use a
 constant acceleration). With jerk enabled the S-curve is replaced by its chord: exact across a
 whole ramp, approximate inside one.
 """

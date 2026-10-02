@@ -156,6 +156,29 @@ is). The static-point accuracy runs they offered are the calibration procedures 
 `basis-programming.md` §9.2 now. Only `production` and `test_vision_only` remain, in a scenario
 registry that admits new scenarios.
 
+### 1.15. Belt on the Siemens (PTO + encoder HSC) — replaced by the Omron belt servo (2026-10-02)
+
+**Was**: command 8 went to the Siemens S7-1200 (DB1 `speed`, through a speed-regression of the
+PTO drive), and the belt feedback was DB2 `speed_current` / `conveyor_position`. That feedback
+read ≈ 2× the true belt motion (one stopwatch measurement gave `position_scale_mm = 0.5`; the
+cause inside the PLC scaling was never found), and the speed controller's forecasts assumed
+the drive's 22.31 mm/s² ramp.
+
+**Now**: the belt is the EtherCAT servo `MC_Conveyor` on the Omron (unit mm, one direction,
+`Section_Conveyor` in the deployed program). Command 8 writes `pc_package.conveyor_speed` and
+does not touch `task_doing` / `task_state`; the feedback is `plc_package.conveyor_velocity` /
+`conveyor_position` / `conveyor_state`, read on every poll (the UDP fast path reads these three
+members plus the Siemens DB). `PLCGateway` waits for the PLC to clear `bit_doing` after a
+command 8 so a goto sent right after cannot overwrite it. The belt tracker takes the servo's
+filtered `Act.Vel` instead of differentiating the position; `conveyor.accel_mm_s2` became the
+PLC's `Conv_Acc` (500 mm/s²) in the config and both sandbox models; the simulator's belt moved
+from `siemens_core` to `omron_core.ConveyorAxis`. The CLI `plan_siemen` sends a rotation (7)
+and a belt command (8). The Siemens DB layouts are unchanged; their belt fields are unused.
+
+**Closed with it**: the Siemens half of open issue C8 (the unexplained 2× feedback scale). C8
+now covers the servo's unit conversion. Opened: P14 (target program lacks the belt section)
+and D10 (the belt section is not in the exported Sysmac project).
+
 ---
 
 ## 2. Calibrations already applied
@@ -168,6 +191,44 @@ registry that admits new scenarios.
   is still open — see `open-issues.md` G6.)*
 * `belt_speed_static_mm_s` raised to 120 mm/s; `belt_speed_min/max_mm_s` rebalanced to
   30–100 mm/s. *(This is what created the inconsistency logged as G1.)*
+
+### 2026-10-02 — pick gate latency and timing (closes C2, T1)
+
+Hardware runs `run03_172250_production` (30 mm/s) and `run05_172657_production` (40 mm/s)
+picked late by ≈ 10 and 15 mm along the belt. Measured from the same log
+(`modules/tools/pick_timing`, 25 pick phases):
+
+* command-3 send → arm moves 0.104 s, → lowest z **0.224 ± 0.006 s**; the command-3 dispatch
+  round trip is 0.066 s, of which ≈ 0.020 s is the worker's status read after the write.
+  `pick_gate.ethernet_delay_s` 0.016 → **0.046** (the write), `robot_movement_delay_s`
+  0.17 → **0.182** (PLC receipt → lowest z). The old sum, 0.186 s, was 0.04 s short.
+* The gate waited in the executor's 50 ms loop on a belt sample up to one 25 ms perception
+  tick old; the model budgeted the average (0.0375 s) but the firing jitter was ±25 ms. The
+  gate now polls every 5 ms and extrapolates the latest belt sample to the present, so its
+  sampling term is 2.5 ms.
+* Detections were stamped at decode time minus half the exposure. The uvcvideo
+  start-of-exposure stamp (frame pts, `CLOCK_MONOTONIC`) is 40.7 ms earlier; frames are now
+  stamped with it plus half the exposure.
+* The `[GATE]` log's `dispatch_to_contact_s` read 0.2004 s on nearly every pick: the 50 ms
+  poll of the arrival loop, not a measurement. The earlier C2 procedure (subtract
+  `t_d_model_s` from it) is replaced by the pose-stream measurement.
+* Not timing: the camera sees parts travel 1.070 × the encoder's displacement, ≈ 7 mm of
+  the along-belt error at u_pick = 188 mm. Left open as C8 until a tape measurement says
+  which side is wrong.
+
+T1 (whether the descent needs its own lead term) is settled by the same measurement: the
+lead is the measured send → lowest z, so `pick_descent_time_s` stays 0.
+
+Later the same day (log `20261002-184443_console`, 99 picks): the operator set
+`vision.pixels_per_mm` 6.1 (camera / encoder ratio 1.070 → 1.005), `pick_gate.gate_offset_mm`
+15 and `robot.heights.pickup` −305. The arm cycle was measured from 135 pick cycles:
+`setup_time_s` 0 → 0.064, `arm_cycle.grab_worst_s` 1.817 → 1.551, `occupancy_worst_s`
+3.282 → 2.779 (were model worst cases; the goto model is 3–6 % short, the pick model ±2 %).
+
+Added for what the logs cannot settle: `vision.latency_offset_s` (default 0, open-issues C9)
+and the `test_camera_latency` scenario that measures it from the offset jump at belt starts and
+stops (`core/latency.py`; 4 unit tests, ≈ 0 ms on the PLC simulator, whose camera stamps
+exactly).
 
 ---
 

@@ -15,9 +15,9 @@
 
 | PLC | Program | Source in repo | Status |
 |---|---|---|---|
-| Omron NX1P2 (arm, suction) | `Matching_Code_10` ("matching code") | `OMRON/matching code/` (`.smc2` + ST/ladder exports) | **Deployed**: runs on the cell with the current Python ([`program-old.md`](program-old.md)) |
+| Omron NX1P2 (arm, suction, belt servo) | `Matching_Code_10` ("matching code") + `Section_Conveyor` | `OMRON/matching code/` (`.smc2` + ST/ladder exports; the belt section is not in the exported project) | **Deployed**: runs on the cell with the current Python ([`program-old.md`](program-old.md); belt contract in [`data-contract.md`](data-contract.md) §1) |
 | Omron NX1P2 | `delta_paper_0_2` | `OMRON/delta_paper_0_2/` | **Target** (phase MID): not yet validated on hardware; needs the patches in `version-diff-and-defects.md` §4 |
-| Siemens S7-1200 (belt speed, 4th-DOF rotation) | unchanged | not in repo (TIA Portal) | DB contract in [`data-contract.md`](data-contract.md) §3 |
+| Siemens S7-1200 (4th-DOF rotation) | unchanged | not in repo (TIA Portal) | DB contract in [`data-contract.md`](data-contract.md) §3 |
 
 The authoritative source is each `.smc2` project, which is a zip of XML: variable
 declarations, ST bodies, and ladder rungs as JSON. The `.md` files and screenshots under

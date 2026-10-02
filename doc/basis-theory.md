@@ -186,7 +186,8 @@ This bounds centripetal acceleration and mechanical shock at corner transitions
 ### 4.1. Encoder-anchored dead-reckoning
 
 Integrating velocity over time drifts and fails under speed changes. Instead, each detected
-object is anchored to the absolute belt encoder position $p(t)$ (mm, from the Siemens PLC)
+object is anchored to the absolute belt encoder position $p(t)$ (mm, the belt servo's
+position reported by the Omron PLC)
 at its detection instant:
 
 $$u(t) = u_{\text{anchor}} + \big(p(t) - p_{\text{anchor}}\big)$$
@@ -199,12 +200,23 @@ speed variation.
 The anchor is only drift-free if $p_{\text{anchor}}$ is the belt position **at frame capture**,
 not at ingest. Exposure + decode + YOLO + poll ≈ 80–150 ms, during which the belt advances
 $v_{\text{belt}} \cdot \Delta t_{\text{lat}}$ — anchoring stale detections to the *current*
-belt position injects that as a fixed upstream error. Solution: stamp each frame with its
-decode time backdated by half the exposure (photons integrate over the exposure window), keep
-a $(t, p)$ ring buffer, and anchor at the interpolated capture-time position:
+belt position injects that as a fixed upstream error. Solution: stamp each frame with the
+middle of its exposure (photons integrate over the exposure window), keep a $(t, p)$ ring
+buffer, and anchor at the interpolated capture-time position:
 
 $$p_{\text{anchor}} = p(t_{\text{cap}}), \qquad
-t_{\text{cap}} = t_{\text{decode}} - \tfrac{1}{2} t_{\text{exposure}}$$
+t_{\text{cap}} = t_{\text{SOE}} + \tfrac{1}{2} t_{\text{exposure}}$$
+
+$t_{\text{SOE}}$ is the start-of-exposure stamp uvcvideo puts on each V4L2 buffer
+(`CLOCK_MONOTONIC`, carried by FFmpeg as the frame pts). It precedes the decode by ≈ 40 ms
+on the cell (USB transfer + MJPEG decode). When a frame carries no usable stamp,
+$t_{\text{cap}} = t_{\text{decode}} - \tfrac{1}{2} t_{\text{exposure}}$.
+
+Any latency the stamp still misses (the uvc clock conversion, sensor readout) is
+`vision.latency_offset_s`, subtracted from every stamp. It is measured at belt starts and stops:
+the tracked offset $u - p$ of a visible part is continuous across a speed change only if the
+stamp is right, and jumps by $-\Delta\,(v_\text{after} - v_\text{before})$ for a stamp late by
+$\Delta$ (`core/latency.py`, scenario `test_camera_latency`).
 
 Falls back to the current position when history is unavailable (static/simulated belt).
 Implementation: `BeltPositionTracker.position_at` (`modules/core/tracking.py`), `_capture_loop`
@@ -239,15 +251,25 @@ $$u_{\text{now}} \ge u_{\text{pick}} - \text{offset}(v_{\text{belt}})$$
 
 **Lead offset.** Between gate-true and physical suction contact lies
 $T_{\text{delay}} =$ `pick_gate.robot_movement_delay_s` + `ethernet_delay_s` + `pick_descent_time_s`
-(+ sampling latency ≈ gate poll/2 + perception tick/2). `robot_movement_delay_s` is the
-empirical dispatch→contact delay and already contains the deployed PLC's State-10 descent
-(≈ 0.08 s ramp to `Pos[0]`); `pick_descent_time_s` (default 0) is an explicit extra term for
+(+ sampling latency = half the 5 ms gate poll). The gate extrapolates the latest belt sample
+to the instant it looks ($p + v \cdot$ age, `runtime/pick_gate.object_gate_status`), so the
+25 ms perception tick adds no staleness. `ethernet_delay_s` is the command-3 write and
+`robot_movement_delay_s` PLC receipt → lowest z, both measured from the pose stream
+(`modules/tools/pick_timing`); the latter already contains the deployed PLC's State-10
+descent (≈ 0.08 s ramp to `Pos[0]`); `pick_descent_time_s` (default 0) is an explicit extra term for
 a vertical descent, used only if a stationary-belt measurement shows contact later than that.
 With the oblique descent on it is not added (the slanted contact absorbs the travel, §4.5).
 The object moves $v_{\text{belt}} \cdot T_{\text{delay}}$ downstream in that window, so the
-gate fires early by exactly that displacement:
+gate fires early by exactly that displacement (plus `pick_gate.gate_offset_mm`, a fixed
+empirical correction, below):
 
 $$\text{offset}(v_{\text{belt}}) = v_{\text{belt}} \cdot T_{\text{delay}}$$
+
+`pick_gate.gate_offset_mm` shifts the threshold by a fixed distance: positive fires earlier
+($u_{\text{pick}} - v_{\text{belt}} T_{\text{delay}} - d_{\text{gate}}$), negative later. It is an
+empirical correction of a measured along-belt pick error, not part of the timing model; a
+belt-scale error (C8) produces an error of this kind, proportional to how far the part is
+dead-reckoned rather than to belt speed. The sandbox's gate does not apply it.
 
 The general accelerating-belt forms (belt mid-ramp at gate time) are derived by splitting the
 window at the ramp end $T_{\text{accel}} = |v_{sp} - v_c| / a_{\text{nom}}$:
@@ -281,9 +303,10 @@ harmless only once the last chain instance is running.
 (`modules/core/kinematics.ik_reachable`, joint limit included) before the object is
 claimed; the deployed IK reports a joint-limit trip as success (**O1**).
 
-$T_{\text{delay}}$ is calibrated from the per-pick `[GATE]` log (`dispatch_to_contact_s`,
-with `t_d_model_s` reporting the vertical descent model) and `modules/tools/latency_probe.py`; the
-terms are **currently uncalibrated estimates** (`open-issues.md` **C2**, **T3**).
+$T_{\text{delay}}$ is calibrated from the pose stream of a run with picks
+(`modules/tools/pick_timing`: command-3 send → lowest z, 0.224 s on 2026-10-02) plus the few
+ms from the gate to the send. The `[GATE]` log's `dispatch_to_contact_s` is quantised by the
+executor's 50 ms poll and is not used for it.
 
 ### 4.5. Oblique intercept (belt-tracking descent, opt-in)
 

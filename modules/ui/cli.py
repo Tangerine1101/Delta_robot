@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from modules.comm.packets import COMMAND_ID, RobotPacket
+from modules.comm.packets import COMMAND_ID, RobotPacket, change_speed_packet
 from modules.settings import Settings
 
 
@@ -219,14 +219,16 @@ def _parse_plan(
     if command == "setspeed":
         if len(tokens) != 2:
             raise ValueError("setspeed expects 1 speed value: setspeed <speed>")
-        return CommandPlan(
-            packages=[{"commandID": COMMAND_ID["change_speed"], "CommandID": COMMAND_ID["change_speed"], "rotate": 0.0, "speed": float(tokens[1])}]
-        )
+        return CommandPlan(packages=[change_speed_packet(float(tokens[1]))])
     if command == "plan_siemen":
+        # The rotation goes to the Siemens (7), the belt speed to the Omron (8).
         if len(tokens) != 3:
             raise ValueError("plan_siemen expects 2 values: plan_siemen <rotate> <speed>")
         return CommandPlan(
-            packages=[{"commandID": COMMAND_ID["plan_siemen"], "CommandID": COMMAND_ID["plan_siemen"], "rotate": float(tokens[1]), "speed": float(tokens[2])}]
+            packages=[
+                {"commandID": COMMAND_ID["rotate_absolute"], "CommandID": COMMAND_ID["rotate_absolute"], "rotate": math.radians(float(tokens[1])), "speed": 0.0},
+                change_speed_packet(float(tokens[2])),
+            ]
         )
     if command == "grab":
         print("[WARN] grab/place do not actuate suction on the real PLC — known limitation")
@@ -498,8 +500,8 @@ def _print_help() -> None:
         "  goto <x> <y> <z>                     # absolute Cartesian move\n"
         "  go_trajectory <demo|square|home>\n"
         "  rotate <angle>                       # Siemens EE suction rotation (R-frame deg, verbatim [-359,359])\n"
-        "  setspeed <speed>                     # Siemens conveyor speed\n"
-        "  plan_siemen <rotate> <speed>         # Siemens plan\n"
+        "  setspeed <speed>                     # conveyor speed (Omron, mm/s >= 0)\n"
+        "  plan_siemen <rotate> <speed>         # rotate (R-frame deg) + setspeed\n"
         "  grab <object> <x> <y> <z> [rotate]   # manual grab sequence\n"
         "  place <object> <x> <y> <z> [rotate]  # manual place sequence\n"
         "  jog <x|y|z> <distance>               # jog axis\n"

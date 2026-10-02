@@ -45,6 +45,25 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 
+# A kernel frame stamp further than this from the decode time is not trusted.
+_MAX_FRAME_STAMP_AGE_S = 0.5
+
+
+def _start_of_exposure(frame: Any, decoded_at: float) -> float | None:
+    """The V4L2 buffer timestamp of `frame` on time.monotonic()'s clock, or None.
+
+    uvcvideo stamps buffers with the start of exposure on CLOCK_MONOTONIC and FFmpeg's
+    v4l2 input keeps that clock in pts (microsecond time base). A stamp that is not
+    shortly before the decode time (another clock, or a driver without stamps) is
+    rejected."""
+    if frame.pts is None or frame.time_base is None:
+        return None
+    stamp = float(frame.pts * frame.time_base)
+    if 0.0 <= decoded_at - stamp <= _MAX_FRAME_STAMP_AGE_S:
+        return stamp
+    return None
+
+
 class VisionImageProcessing:
     """Real-time YOLO-OBB detection with a PyAV capture backend.
 
@@ -164,17 +183,20 @@ class VisionImageProcessing:
         apply_v4l2_controls(device_path, controls)
 
         # Camera-latency compensation: a detection's true capture instant is the
-        # MIDDLE of the exposure window, but the frame is only handed over after
-        # the exposure completes. V4L2 exposure_time_absolute is in units of
-        # 100 µs, so half the exposure (seconds) backdates the emitted timestamp
-        # toward the true capture time. The rest of the latency (decode + YOLO +
-        # poll) is absorbed downstream by anchoring to the belt position AT this
-        # backdated timestamp (see BeltPositionTracker.position_at).
+        # MIDDLE of the exposure window. uvcvideo stamps each buffer with the
+        # START of exposure on CLOCK_MONOTONIC, which FFmpeg passes through as the
+        # frame pts; the capture time is that stamp plus half the exposure. When
+        # the stamp is unusable the decode time minus half the exposure is used,
+        # which misses the transfer + decode time (~40 ms measured on the cell).
+        # V4L2 exposure_time_absolute is in units of 100 µs. The rest of the
+        # latency (YOLO + poll) is absorbed downstream by anchoring to the belt
+        # position AT this timestamp (see BeltPositionTracker.position_at).
         try:
             exposure_units = float(controls.get("exposure_time_absolute", 0) or 0)
         except (TypeError, ValueError):
             exposure_units = 0.0
         self._half_exposure_s = exposure_units * 100e-6 / 2.0
+        self._latency_offset_s = float(vision.latency_offset_s)
 
         self._cv2 = cv2
         self._np = np
@@ -210,7 +232,8 @@ class VisionImageProcessing:
         # Latest captured frame, published by the capture thread.
         self._latest_frame = None
         self._latest_frame_id = 0
-        self._latest_frame_ts = 0.0   # monotonic time the frame was decoded
+        self._latest_frame_ts = 0.0   # capture time of the frame (see _frame_time)
+        self._frame_ts_is_soe = False  # True: _latest_frame_ts is the start of exposure
         self._frame_lock = threading.Lock()
 
         # Annotated frame for the main-thread GUI.
@@ -257,6 +280,7 @@ class VisionImageProcessing:
                     break
                 img = frame.to_ndarray(format="bgr24")
                 t = time.monotonic()
+                t_soe = _start_of_exposure(frame, t)
                 if last_t is not None:
                     dt = t - last_t
                     if dt > 0.0:
@@ -264,7 +288,8 @@ class VisionImageProcessing:
                 last_t = t
                 with self._frame_lock:
                     self._latest_frame = img
-                    self._latest_frame_ts = t
+                    self._latest_frame_ts = t if t_soe is None else t_soe
+                    self._frame_ts_is_soe = t_soe is not None
                     self._latest_frame_id += 1
         except Exception as exc:
             print(f"[VISION] Capture error: {exc}")
@@ -395,14 +420,17 @@ class VisionImageProcessing:
         scheduler re-anchors the same object from the camera while it is visible
         and dead-reckons from belt position once it leaves the camera zone.
 
-        `capture_ts` is the monotonic time the frame was decoded; the emitted
-        timestamp is backdated by half the exposure so the scheduler can anchor
-        the object to the belt position at its true capture instant.
+        `capture_ts` is the frame's start of exposure (kernel stamp) or, when
+        that is unavailable, its decode time; the emitted timestamp is moved to
+        the middle of the exposure so the scheduler can anchor the object to the
+        belt position at its true capture instant.
         """
-        detect_ts = (
-            (capture_ts - self._half_exposure_s)
-            if capture_ts is not None else time.monotonic()
-        )
+        if capture_ts is None:
+            detect_ts = time.monotonic()
+        elif self._frame_ts_is_soe:
+            detect_ts = capture_ts + self._half_exposure_s - self._latency_offset_s
+        else:
+            detect_ts = capture_ts - self._half_exposure_s - self._latency_offset_s
         for trk in active.values():
             if not pcb_dets:
                 continue
@@ -557,6 +585,11 @@ class VisionImageProcessing:
         if not ok:
             return None
         return buf.tobytes()
+
+    @property
+    def ready(self) -> bool:
+        """The YOLO model is loaded and warmed up: detections can arrive from now on."""
+        return self._model_ready.is_set()
 
     def stop(self) -> None:
         self._stop_event.set()

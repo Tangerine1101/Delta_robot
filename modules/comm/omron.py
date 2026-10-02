@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from typing import Any
 
 from modules.comm.packets import (
@@ -25,6 +26,16 @@ except ImportError:  # pragma: no cover - handled at runtime
 # must therefore be checked against the physical reach limit. goto_relative (1)
 # holds relative/joint deltas, not an absolute position, so it is excluded.
 _ABSOLUTE_POSITION_COMMANDS = (COMMAND_ID["goto_absolute"], COMMAND_ID["go_trajectory"])
+
+# Belt feedback members of plc_package (Section4 telemetry of MC_Conveyor): velocity in
+# mm/s and position in mm, both positive along the belt; conveyor_state 0 stopped,
+# 1 ramping, 2 at speed, 3 error, 4 servo off.
+CONVEYOR_STATUS_FIELDS = ("conveyor_velocity", "conveyor_position", "conveyor_state")
+
+# How long send_package waits for the PLC to consume a belt command (bit_doing back to 0)
+# before the next command may overwrite pc_package.commandID.
+_CONVEYOR_ACK_TIMEOUT_S = 0.1
+_CONVEYOR_ACK_POLL_S = 0.002
 
 
 class WorkspaceLimitError(ValueError):
@@ -172,7 +183,10 @@ class PLCGateway:
             f"{self.tag_read}.task_doing",
             f"{self.tag_read}.task_state",
             f"{self.tag_read}.end_effector",
-        ]
+        ] + self._conveyor_tags()
+
+    def _conveyor_tags(self) -> list[str]:
+        return [f"{self.tag_read}.{name}" for name in CONVEYOR_STATUS_FIELDS]
 
     def _probe_tags(self) -> list[str]:
         return [
@@ -353,6 +367,9 @@ class PLCGateway:
         if not self.connected:
             self.connect()
 
+        if not isinstance(package, RobotPacket) and package.get("commandID") == COMMAND_ID["change_speed"]:
+            return self._send_conveyor_speed(float(package.get("speed", 0.0)))
+
         normalized = self._normalize_package(package)
         self._check_workspace_limit(normalized)
         normalized["bit_doing"] = 1
@@ -370,6 +387,52 @@ class PLCGateway:
 
         self._write_tags(tags_and_values)
         return normalized
+
+    def _send_conveyor_speed(self, speed_mm_s: float) -> dict[str, Any]:
+        """Command 8: belt speed in mm/s. Only conveyor_speed, commandID and bit_doing are
+        written, so the trajectory arguments of a running command 3 are left alone.
+
+        The PLC dispatches one command per scan through a single commandID, so this
+        waits until it has consumed the belt command; otherwise a command sent right
+        after (a goto at arm_free) could overwrite commandID before the PLC read it.
+        """
+        if speed_mm_s < 0.0:
+            raise ValueError(f"conveyor speed must be >= 0 mm/s (the belt runs one way), got {speed_mm_s}")
+        self._write_tags([
+            (f"{self.tag_write}.conveyor_speed", float(speed_mm_s)),
+            (f"{self.tag_write}.commandID", COMMAND_ID["change_speed"]),
+            (f"{self.tag_write}.bit_doing", 1),
+        ])
+        deadline = time.monotonic() + _CONVEYOR_ACK_TIMEOUT_S
+        while True:
+            response = self._read_tags([f"{self.tag_write}.bit_doing"])
+            value = getattr(response[0], "Value", None) if response else None
+            if value is not None and int(value) == 0:
+                break
+            if time.monotonic() >= deadline:
+                print(f"[WARN] PLC did not acknowledge conveyor command within "
+                      f"{_CONVEYOR_ACK_TIMEOUT_S * 1000:.0f} ms (bit_doing={value})")
+                break
+            time.sleep(_CONVEYOR_ACK_POLL_S)
+        return {"commandID": COMMAND_ID["change_speed"], "conveyor_speed": float(speed_mm_s)}
+
+    def get_conveyor(self) -> dict[str, Any] | None:
+        """The belt feedback alone: conveyor_velocity, conveyor_position, conveyor_state."""
+        if not self.connected:
+            self.connect()
+        try:
+            response = self._read_tags(self._conveyor_tags())
+        except Exception as exc:
+            self.connected = False
+            print(f"[ERROR] Unable to read PLC conveyor status: {exc}")
+            return None
+        values = {}
+        for item in response:
+            status = getattr(item, "Status", None)
+            if status is not None and str(status).lower() != "success":
+                continue
+            values[getattr(item, "TagName", "").split(".")[-1]] = getattr(item, "Value", None)
+        return values or None
 
     def get_package(self) -> dict[str, Any] | None:
         if not self.connected:

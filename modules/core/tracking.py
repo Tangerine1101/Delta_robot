@@ -1,8 +1,9 @@
 """Belt position and the parts riding on it.
 
-* `BeltPositionTracker` holds the belt position (mm) reported by the Siemens PLC
-  (`conveyor_position`) and derives its velocity; it keeps a short history so a detection can
-  be anchored to the belt position at its capture instant.
+* `BeltPositionTracker` holds the belt position (mm) reported by the Omron PLC
+  (`conveyor_position`) and its velocity (the PLC's measured velocity, or the derivative of
+  the position when none is given); it keeps a short history so a detection can be anchored
+  to the belt position at its capture instant.
 * `BeltTracker` holds every part currently on the belt, anchored in belt coordinates and dead
   reckoned from the belt position once the camera no longer sees it.
 """
@@ -40,13 +41,13 @@ class ObjectDetection:
 
 
 class BeltPositionTracker:
-    """Track belt position (mm) and derive velocity from a pre-decoded position.
+    """Track belt position (mm) and velocity (mm/s).
 
-    The Siemens program now sends the belt position directly (field
-    `conveyor_position`, in mm), so no quadrature decoding is needed here. Feed
-    `update(position_mm, now)` with the position already converted to mm; the
-    tracker stores it and computes velocity as the time derivative with a small
-    EMA filter to smooth polling jitter.
+    The PLC sends the belt position in mm (`conveyor_position`, the belt servo's
+    `Act.Pos`) and its velocity (`Act.Vel`, filtered in the PLC). Feed
+    `update(position_mm, now, velocity_mm_s)`; when the velocity is missing it is
+    computed as the time derivative of the position with a small EMA filter to
+    smooth polling jitter.
     """
 
     def __init__(
@@ -66,8 +67,10 @@ class BeltPositionTracker:
         # at the 25 ms perception tick ≈ 5 s of history.
         self._history: deque[tuple[float, float]] = deque(maxlen=history_len)
 
-    def update(self, position_mm: float, now: float) -> None:
+    def update(self, position_mm: float, now: float, velocity_mm_s: float | None = None) -> None:
         new_position = float(position_mm)
+        if velocity_mm_s is not None:
+            self._velocity_mm_per_s = float(velocity_mm_s)
 
         if not self._initialised:
             self._position_mm = new_position
@@ -79,7 +82,7 @@ class BeltPositionTracker:
 
         last_ts = self._last_timestamp if self._last_timestamp is not None else now
         dt = max(0.0, now - last_ts)
-        if dt > 0.0 and self._last_position_mm is not None:
+        if velocity_mm_s is None and dt > 0.0 and self._last_position_mm is not None:
             instantaneous = (new_position - self._last_position_mm) / dt
             self._velocity_mm_per_s = (
                 self.velocity_ema_alpha * instantaneous

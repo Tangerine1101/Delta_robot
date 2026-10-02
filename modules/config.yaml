@@ -50,7 +50,7 @@ robot:
     clearance: -265.0           # travel height between picks. open-issues G7 (joint limit binds here)
     slope_transition: -275.0    # where the slanted approach turns vertical
     pre_pick: -287.0            # park height above the part before the pick phase
-    pickup: -300.0              # suction-cup contact height
+    pickup: -303.0              # suction-cup contact height
     place: -280.0               # release height over the bin
   corner_blend_xy: 25.0         # XY corner blend radius of the 7-point template (mm)
   # PLC S-curve trajectory-time model: the scheduler's estimate of every processing time.
@@ -76,21 +76,21 @@ robot:
 
 # Conveyor belt and frame transforms (doc/basis-theory.md §1)
 conveyor:
-  # Real Siemens belt feedback -> true units: multiplies conveyor_position AND speed_current at
-  # the PLC worker, so tracking, the dashboard chart and the run log all see mm and mm/s.
-  # 0.5: commanded 40 mm/s, belt measured 165 mm in 4 s (41 mm/s) while the PLC reported
-  # ~81 mm/s. Not applied under --sim / --dummy. open-issues C8 (one short measurement).
+  # Real belt feedback (Omron MC_Conveyor Act.Pos / Act.Vel, already in mm via the axis unit
+  # conversion) -> true units: multiplies conveyor_position AND speed_current at the PLC
+  # worker. 1.0 unless a tape measurement disagrees with the axis' mm/rev. Not applied under
+  # --sim / --dummy. open-issues C8.
   position_scale_mm: 1.0
-  velocity_ema_alpha: 0.4       # EMA smoothing of the measured belt velocity (0..1, higher = less smoothing)
-  accel_mm_s2: 22.31            # belt acceleration; drives forecasts and the simulator ramp
-  hw_max_mm_s: 200.0            # drive hardware maximum (mm/s)
+  velocity_ema_alpha: 0.4       # EMA of the belt velocity derived from position; used only when the PLC sends no velocity
+  accel_mm_s2: 500.0            # belt ramp = Conv_Acc / Conv_Dec of Section_Conveyor; drives forecasts and the simulator ramp
+  hw_max_mm_s: 200.0            # drive hardware maximum (mm/s); the PLC clamps at Conv_Vel_Max = 300
   # C-frame (belt u,v) -> R-frame (robot x,y) rigid transform. open-issues C6: no automated
   # calibration procedure.
   frame:
     theta_deg: 28.0             # rotation of the belt axis in the robot frame (deg)
-    robot_origin_uv: [287.0, 88.0]  # robot origin expressed in belt coordinates (mm)
-  camera_window_uv: [0.0, 110.0, 0.0, 125.0]       # [u_min, u_max, v_min, v_max] seen by the camera (mm)
-  workspace_window_uv: [188.0, 363.0, 0.0, 125.0]  # [u_min, u_max, v_min, v_max] the arm may pick in (mm)
+    robot_origin_uv: [287.0, 93.0]  # robot origin expressed in belt coordinates (mm)
+  camera_window_uv: [0.0, 95.0, 0.0, 125.0]       # [u_min, u_max, v_min, v_max] seen by the camera (mm)
+  workspace_window_uv: [200.0, 390.0, 0.0, 125.0]  # [u_min, u_max, v_min, v_max] the arm may pick in (mm)
 
 # Part classes: everything about a class in one place. `bin` is the drop position in the robot
 # frame [x, y, z] mm; w/h the board footprint (simulator, vision tooling); `marker_class` the
@@ -98,8 +98,8 @@ conveyor:
 # (open-issues C4); `symmetry_deg` its rotational symmetry. `model_class` (the YOLO class
 # name) defaults to the type's own name.
 object_types:
-  QFP: {bin: [149.65, -13.07, -280.0], w: 25.4, h: 25.4, marker_class: marker_QFP, symmetry_deg: 90, heading_offset_deg: 0.0}
-  TQFP: {bin: [116.8, 48.735, -280.0], w: 46.0, h: 38.0, marker_class: marker_TQFP, symmetry_deg: 180, heading_offset_deg: 0.0}
+  QFP: {bin: [149.65, -13.07, -280.0], w: 30.7, h: 30.7, marker_class: marker_QFP, symmetry_deg: 90, heading_offset_deg: 0.0}
+  TQFP: {bin: [116.8, 48.735, -280.0], w: 47.0, h: 38.0, marker_class: marker_TQFP, symmetry_deg: 180, heading_offset_deg: 0.0}
 
 # Vision pipeline: YOLO-OBB inference + PyAV capture (doc/basis-programming.md §2)
 vision:
@@ -124,12 +124,13 @@ vision:
     exposure_dynamic_framerate: 0
     auto_exposure: 0
     exposure_time_absolute: 100
-  pixels_per_mm: 3.0592         # image scale (written by camera_calibrate.py)
+  pixels_per_mm: 6.1         # image scale (written by camera_calibrate.py)
+  latency_offset_s: 0.0         # capture latency beyond the frame's kernel stamp (s); measured by the test_camera_latency scenario
   roi:
     enabled: true               # ignore detections outside the polygon
-    polygon: [[549, 99], [1320, 92], [1323, 766], [558, 783]]    # image-space ROI (px)
+    polygon: [[549, 192], [1323, 182], [1312, 764], [561, 784]]  # image-space ROI (px)
   trigger_line:
-    y_px: 342                   # reference line drawn by camera_calibrate.py
+    y_px: 214                   # reference line drawn by camera_calibrate.py
     direction: down             # image direction the belt moves in
     min_conf: 0.6               # confidence a board needs before it is handed to the scheduler
   # Marker-based board heading (doc/basis-theory.md §5); per-class data lives in object_types
@@ -149,10 +150,15 @@ vision:
 
 # Pick gate and pick executor (doc/basis-theory.md §4.4)
 pick_gate:
-  # Dispatch -> motion latency. Their sum is the pick gate's lead offset. open-issues C2, T3.
-  robot_movement_delay_s: 0.17
-  ethernet_delay_s: 0.016
+  # Gate -> cup contact latency; their sum is the pick gate's lead offset. Measured 2026-10-02
+  # (25 picks, pose stream): command-3 write 0.046 s, PLC receipt -> lowest z 0.182 s
+  # (send -> bottom 0.224 +- 0.006 s, plus ~0.004 s gate -> send). `python3 -m modules.tools.pick_timing`.
+  robot_movement_delay_s: 0.182
+  ethernet_delay_s: 0.046
   pick_descent_time_s: 0.0      # extra gate lead for the vertical descent (s). open-issues T1
+  # Fire the gate this much earlier (> 0) or later (< 0) along the belt (mm): an empirical
+  # correction of late picks, not a measured latency. open-issues C10.
+  gate_offset_mm: 15.0
   late_abort_mm: 12.0           # abort (and re-queue) when the gate fires this late; <= 0 disables
   # Arm-arrival tolerance, linear in belt speed from the floor (at speed.band.min_mm_s) to the
   # ceiling (at speed.band.max_mm_s). open-issues G6 (widened as a symptom treatment).
@@ -177,14 +183,17 @@ runtime:
 scheduling:
   planner: drop_longest
   safety_margin_s: 0.1          # margin on every deadline (s)
-  setup_time_s: 0.0             # per-pick executor overhead beyond the trajectory model (s). UNMEASURED
+  setup_time_s: 0.064           # per-pick executor overhead: bin arrival -> next goto send, back-to-back median of 88 cycles (2026-10-02)
   # What the speed laws assume about one pick cycle. open-issues G2, C7
   arm_cycle:
     cycle_s: 3                  # calibrated arm cycle t_pick (s). open-issues G2
-    # Model-derived worst cases (python3 -m modules.tools.derive_rank_bounds), not measured; with
-    # queue_depth_k = 1 they cap predictive_rank's band at ~34 mm/s. open-issues C7
-    occupancy_worst_s: 3.282
-    grab_worst_s: 1.817
+    # Measured worst cases, 135 hardware pick cycles of 2026-10-02 (picks at u = 188-359 mm), no
+    # waiting for the part: grab = goto send -> contact, occupancy = goto send -> bin + setup.
+    # The model sweep (python3 -m modules.tools.derive_rank_bounds) gives 1.909 / 3.458 at the far
+    # corner u = 390, v = 0, never picked in those runs. With queue_depth_k = 1 and L = 190 mm:
+    # v_max = 190 / (2.779 + 1.551) = 43.9 mm/s. open-issues C7
+    occupancy_worst_s: 2.4
+    grab_worst_s: 1.2
 
 # Which belt speed (modules/scheduling). `law` is any registered speed law (constant,
 # inverse_density, predictive_rank, ...); each law's own parameters sit under `laws`.
@@ -194,7 +203,7 @@ speed:
   static_mm_s: 10.0             # belt speed for `constant`; startup setpoint of the other laws. open-issues G1 (above max)
   control_period_s: 1.0         # re-decide this often while the gate stays open (s)
   band:
-    min_mm_s: 30.0              # lower bound for every law (mm/s)
+    min_mm_s: 5.0              # lower bound for every law (mm/s)
     max_mm_s: 100.0             # operational ceiling for every law (mm/s)
   commit:
     deadband_mm_s: 5.0          # target changes smaller than this are not sent (mm/s)
@@ -222,7 +231,7 @@ feeder:
   seed: 1
   max_parts: 0                  # stop after this many parts; 0 = no limit
   schedule_s: 3600.0            # arrivals drawn for this long when the run has no --duration (s)
-  detection_latency_s: 0.0      # capture delay the virtual camera reports (s)
+  detection_latency_s: 0.011     # capture delay the virtual camera reports (s)
   position_noise_mm: 0.0        # Gaussian noise on each virtual detection (mm)
   kinds:
     periodic: {interval_s: 2.5, types: [QFP, TQFP], lanes: [20.0, 60.0, 100.0]}
@@ -232,5 +241,14 @@ feeder:
 
 # Operator console (main.py --interface)
 interface:
-  port: 8000                    # HTTP port
+  port: 8067                    # HTTP port
   mjpeg_fps: 15                 # camera stream frame rate
+  # Teach points: name -> robot frame [x, y, z] (mm). Written by the console's Teach points card
+  # (save / delete). "C - <u>, <v>" are the corners of conveyor.workspace_window_uv converted with
+  # modules.tools.frame_convert, at pre_pick height.
+  teach_points:
+    "C - 188, 0": [-31.222, -128.725, -287.0]
+    "C - 188, 125": [79.147, -70.041, -287.0]
+    "C - 363, 125": [-3.011, 84.474, -287.0]
+    "C - 363, 0": [-113.379, 25.791, -287.0]
+    home: [0.0, 0.0, -240.0]

@@ -154,11 +154,11 @@ class ConveyorSettings:
     frame: FrameSettings
     camera_window_uv: UVWindow            # region the camera sees (belt frame, mm)
     workspace_window_uv: UVWindow         # region the arm may pick in (belt frame, mm)
-    # Real Siemens belt feedback -> true mm and mm/s (open-issues C8). Not applied to the
-    # simulator.
+    # Real belt feedback (Omron MC_Conveyor) -> true mm and mm/s (open-issues C8). Not
+    # applied to the simulator.
     position_scale_mm: float = 1.0
-    velocity_ema_alpha: float = 0.4       # EMA of the measured belt velocity
-    accel_mm_s2: float = 22.31            # drive ramp; forecasts and the simulator use it
+    velocity_ema_alpha: float = 0.4       # EMA of the position-derived velocity (fallback)
+    accel_mm_s2: float = 500.0            # PLC Conv_Acc; forecasts and the simulator use it
     hw_max_mm_s: float = 200.0            # drive hardware maximum
 
 
@@ -233,6 +233,9 @@ class VisionSettings:
     show_window: bool = True
     mjpeg_jpeg_quality: int = 80
     pixels_per_mm: float = 4.0
+    # Capture latency beyond the frame's start-of-exposure stamp (s), subtracted from every
+    # detection's timestamp. Measured by the test_camera_latency scenario.
+    latency_offset_s: float = 0.0
     capture: CaptureSettings = CaptureSettings()
     v4l2_controls: dict[str, int] | None = None
     roi: RoiSettings = RoiSettings()
@@ -246,10 +249,14 @@ class VisionSettings:
 class PickGateSettings:
     """Everything the pick gate and the pick executor read (basis-theory §4.4)."""
 
-    # Dispatch -> motion latency; their sum is the gate's lead offset (open-issues C2).
+    # Command-3 write and PLC receipt -> cup contact; their sum is the gate's lead offset
+    # (measured with modules.tools.pick_timing).
     robot_movement_delay_s: float
     ethernet_delay_s: float
     pick_descent_time_s: float = 0.0      # extra lead for the vertical descent (T1)
+    # Fixed distance (mm) the gate fires earlier (> 0) or later (< 0) than its timing model:
+    # an empirical correction of the along-belt pick error (open-issues C10).
+    gate_offset_mm: float = 0.0
     late_abort_mm: float = 12.0           # abort and re-queue a gate this late; <= 0 disables
     # Arm-arrival tolerance, linear in belt speed between speed.band.min_mm_s and
     # speed.band.max_mm_s (open-issues G6). None = the floor everywhere.
@@ -343,6 +350,8 @@ class FeederSettings:
 class InterfaceSettings:
     port: int = 8000
     mjpeg_fps: float = 15.0
+    # Named robot-frame points [x, y, z] (mm) offered as goto buttons on the console.
+    teach_points: dict[str, Point] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

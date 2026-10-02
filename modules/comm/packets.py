@@ -52,6 +52,12 @@ COMMAND_ID = {
 }
 
 COMMAND_NAME = {value: key for key, value in COMMAND_ID.items()}
+
+
+def change_speed_packet(speed_mm_s: float) -> dict[str, Any]:
+    """Command 8, belt speed in mm/s (>= 0: the belt runs one way). Executed by the Omron,
+    which reads only `speed` (written to `pc_package.conveyor_speed`)."""
+    return {"commandID": COMMAND_ID["change_speed"], "speed": float(speed_mm_s)}
 ARRAY_FIELDS = ("argument_x", "argument_y", "argument_z", "argument_e", "argument_time")
 
 

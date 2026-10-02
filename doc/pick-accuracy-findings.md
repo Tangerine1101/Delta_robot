@@ -1,5 +1,10 @@
 # Pick-Accuracy Investigation — Gate/Timing Defects
 
+> **Status (2026-10-02).** The gate latency is measured and calibrated from the pose stream
+> (command-3 send → lowest z 0.224 s; C2 and T1 closed, `decision-log.md`), and the gate now
+> extrapolates the belt to the present. The references below to C2 and to
+> `robot_movement_delay_s = 0.17` describe the state before that.
+>
 > **Status (2026-09-16).** T2 and T6–T9 are fixed in code. **T1's conclusion did not survive
 > the PLC simulator**: with an ideal (no servo lag) port of `Matching_Code_10`, the existing
 > gate lead lands centred up to 120 mm/s, and adding the modelled descent misses every pick.

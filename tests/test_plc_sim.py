@@ -11,7 +11,7 @@ import time
 import unittest
 
 from modules.comm.omron import PLCGateway, WorkspaceLimitError
-from modules.comm.packets import COMMAND_ID, RobotPacket
+from modules.comm.packets import COMMAND_ID, RobotPacket, change_speed_packet
 from modules.comm.siemens import SiemensGateway
 from modules.core.kinematics import calc_forward_kinematic, calc_inverse_kinematics
 from modules.plc_sim.omron_core import OmronPLC, Patches
@@ -193,6 +193,54 @@ class Defects(unittest.TestCase):
         self.assertLess(math.dist(plc.pos_ee, LINE[-1]), 0.01)
 
 
+class Conveyor(unittest.TestCase):
+    """Command 8 / Section_Conveyor: ramp, clamp, deadband, and the robot's status untouched."""
+
+    @staticmethod
+    def _belt(plc: OmronPLC, speed: float) -> None:
+        plc.write_tag("pc_package.conveyor_speed", speed)
+        plc.write_tag("pc_package.commandID", COMMAND_ID["change_speed"])
+        plc.write_tag("pc_package.bit_doing", 1)
+
+    def test_ramp_clamp_and_deadband(self):
+        plc = OmronPLC()
+        plc.plc_package["task_doing"], plc.plc_package["task_state"] = 3, 2
+        self._belt(plc, 100.0)
+        plc.scan()
+        self.assertEqual((plc.pc_package["bit_doing"], plc.pc_package["commandID"]), (0, -1))
+        self.assertEqual(plc.read_tag("plc_package.conveyor_state")[1], 1)
+        plc.run_for(0.4)                                    # 100 mm/s at 500 mm/s^2 = 0.2 s
+        self.assertAlmostEqual(plc.read_tag("plc_package.conveyor_velocity")[1], 100.0, places=3)
+        self.assertEqual(plc.read_tag("plc_package.conveyor_state")[1], 2)
+        self.assertGreater(plc.read_tag("plc_package.conveyor_position")[1], 10.0)
+        self.assertEqual((plc.plc_package["task_doing"], plc.plc_package["task_state"]), (3, 2))
+        self._belt(plc, 1000.0)
+        plc.run_for(1.0)
+        self.assertEqual(plc.conveyor.velocity, 300.0)
+        self._belt(plc, 0.3)                                # below the deadband: stop
+        plc.run_for(1.0)
+        self.assertEqual((plc.conveyor.velocity, plc.conveyor.state), (0.0, 0))
+
+    def test_worker_maps_belt_feedback(self):
+        from modules.comm.plc_link import _belt_feedback
+
+        status = {"conveyor_velocity": 50.0, "conveyor_position": 200.0, "conveyor_state": 2}
+        _belt_feedback(status, 0.5)
+        self.assertEqual(status, {"speed_current": 25.0, "speed_current_raw": 50.0,
+                                  "conveyor_position": 100.0, "conveyor_position_raw": 200.0,
+                                  "conveyor_state": 2})
+
+    def test_tracker_prefers_the_plc_velocity(self):
+        from modules.core.tracking import BeltPositionTracker
+
+        tracker = BeltPositionTracker()
+        tracker.update(0.0, 0.0, 40.0)
+        tracker.update(1.0, 0.1, 41.0)                      # derivative would say 10 mm/s
+        self.assertEqual(tracker.velocity_mm_per_s, 41.0)
+        tracker.update(3.0, 0.2)                            # no PLC velocity: derivative + EMA
+        self.assertAlmostEqual(tracker.velocity_mm_per_s, 0.4 * 20.0 + 0.6 * 41.0)
+
+
 class WorkspaceEnvelope(unittest.TestCase):
     """PLCGateway.send_package rejects any goto/trajectory point outside robot_limits."""
 
@@ -254,13 +302,22 @@ class Protocol(unittest.TestCase):
                 time.sleep(0.05)
                 status = omron.get_package()
             self.assertLess(math.dist(status["pos_EE"][:3], pts[-1]), 0.5)
+            # The belt is the Omron's (command 8); the robot's task_doing is left alone.
+            task_doing = status["task_doing"]
+            omron.send_package(change_speed_packet(100.0))
+            time.sleep(1.0)
+            s = omron.get_package()
+            self.assertGreater(s["conveyor_velocity"], 15.0)
+            self.assertGreater(s["conveyor_position"], 5.0)      # mm, not cm
+            self.assertEqual(s["conveyor_state"], 2)
+            self.assertEqual(s["task_doing"], task_doing)
+            with self.assertRaises(ValueError):
+                omron.send_package(change_speed_packet(-10.0))
             siemens = SiemensGateway(host, port)
             siemens.connect()
-            siemens.send_package({"CommandID": COMMAND_ID["change_speed"], "speed": 100.0})
-            time.sleep(1.0)
-            s = siemens.get_status()
-            self.assertGreater(s["speed_current"], 15.0)
-            self.assertGreater(s["conveyor_position"], 5.0)      # mm, not cm
+            siemens.send_package({"CommandID": COMMAND_ID["rotate_absolute"], "rotate": 30.0})
+            time.sleep(0.5)
+            self.assertAlmostEqual(siemens.get_status()["rotate_current"], 30.0, places=3)
         finally:
             sim.shutdown()
 

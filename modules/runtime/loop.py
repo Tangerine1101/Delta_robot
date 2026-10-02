@@ -45,6 +45,7 @@ class RunContext:
     round_trip_s: Callable[[], float] = lambda: 0.0
     record_dir: Path | None = None           # where the part record is written at the end
     record_meta: dict[str, Any] = field(default_factory=dict)
+    dispatch: Callable[[dict[str, Any]], Any] | None = None   # PLC commands (belt-driving scenarios)
 
     def perception(self) -> Perception:
         return Perception(self.settings, self.state, self.planner, self.speed_source,
@@ -169,3 +170,166 @@ def run_observe_loop(run: RunContext) -> None:
     finally:
         run.close(perception)
     print("[INFO] Scheduler metrics:", json.dumps(run.planner.metrics.as_dict(), ensure_ascii=True))
+
+
+# test_camera_latency: belt on for BELT_STEP_ON_S, off for BELT_STEP_OFF_S, repeated. Both are
+# the shortest the fits of core/latency allow (1.0 s before a change, up to 1.4 s after it).
+BELT_STEP_ON_S = 1.6
+BELT_STEP_OFF_S = 1.6
+# Sampling period of the scenario's own recorder (s): finer than the perception tick, so no
+# perception sample is missed.
+LATENCY_SAMPLE_S = 0.005
+# Longest wait for a part in the camera window once the model is ready (s); the cycle then
+# starts anyway (a simulated feeder only brings parts while the belt moves).
+LATENCY_PART_WAIT_S = 20.0
+
+
+def run_belt_step_loop(run: RunContext) -> None:
+    """Measure the camera latency the detection stamps leave out (core/latency.py).
+
+    The arm stays idle; the belt runs at `speed.static_mm_s` for BELT_STEP_ON_S and stops for
+    BELT_STEP_OFF_S, repeatedly, so every part in the camera window sees several starts and
+    stops. Each perception sample's belt position and each visible part's offset u - p are
+    recorded; at the end the jump of the offset at every start / stop gives the latency.
+
+    The belt only starts when the most downstream part in view, moved by one on-phase, still
+    lies wholly inside the camera window (its centre at least half the largest board size
+    from the edge). Otherwise the run ends with the belt stopped, the parts still in view."""
+    from modules.comm.packets import change_speed_packet
+    from modules.core.frames import ConveyorFrame
+    from modules.core.latency import change_lags, median_lag_s
+
+    settings = run.settings
+    state = run.state
+    if run.dispatch is None:
+        raise RuntimeError("test_camera_latency drives the belt and needs a live PLC link")
+    speed = settings.speed.static_mm_s
+    if not 5.0 <= speed <= 40.0:
+        print(f"[WARN] speed.static_mm_s = {speed} mm/s: 15-30 mm/s keeps a part in the camera "
+              "window across several starts and stops")
+    camera_window = settings.conveyor.camera_window_uv
+    step_mm = speed * BELT_STEP_ON_S
+    edge_margin_mm = max((max(t.w, t.h) for t in settings.object_types.values()), default=0.0) / 2.0
+    u_limit = camera_window[1] - edge_margin_mm
+    room = u_limit - camera_window[0] - edge_margin_mm
+    if step_mm > room:
+        print(f"[WARN] one on-phase moves the belt {step_mm:.0f} mm but the camera window only has "
+              f"{room:.0f} mm of room: lower speed.static_mm_s to <= {room / BELT_STEP_ON_S:.0f} mm/s")
+    else:
+        print(f"[LATENCY] {step_mm:.0f} mm per on-phase: a part placed at the upstream edge sees "
+              f"{int(room // step_mm)} start/stop pairs")
+    belt: list[tuple[float, float, float]] = []
+    offsets: dict[str, list[tuple[float, float]]] = {}
+    last_sample_t: float | None = None
+
+    perception = run.perception()
+    perception.start()
+    belt_on = False
+    cycle_started: float | None = None
+    next_toggle = 0.0
+    next_hint = 0.0
+    model_ready_at: float | None = None
+    print(f"[LATENCY] belt {speed:.0f} mm/s, {BELT_STEP_ON_S:.1f} s on / {BELT_STEP_OFF_S:.1f} s off; "
+          "waiting for the vision model and for a part in the camera window")
+    try:
+        while not state.stop_event.is_set():
+            now = time.monotonic()
+            if run.stop_event is not None and run.stop_event.is_set():
+                break
+            if not run.pump_window():
+                break
+            if cycle_started is None:
+                # The belt stays still until the model detects and a part sits in the camera
+                # window; --duration counts from then, so loading the model costs nothing.
+                if model_ready_at is None and _vision_ready(run.image_source):
+                    model_ready_at = now
+                if model_ready_at is not None and _part_in_window(state, camera_window):
+                    cycle_started = next_toggle = now
+                    print("[LATENCY] part in view: belt cycle starts")
+                elif model_ready_at is not None and now - model_ready_at >= LATENCY_PART_WAIT_S:
+                    cycle_started = next_toggle = now
+                    print(f"[WARN] no part in the camera window after {LATENCY_PART_WAIT_S:.0f} s: "
+                          "belt cycle starts anyway; only parts seen across a start/stop count")
+                elif now >= next_hint:
+                    waiting = "the vision model" if not _vision_ready(run.image_source) else "a part in the camera window"
+                    print(f"[LATENCY] waiting for {waiting}")
+                    next_hint = now + 5.0
+                time.sleep(LATENCY_SAMPLE_S)
+                continue
+            if run.duration_s is not None and now >= cycle_started + run.duration_s:
+                break
+            if now >= next_toggle:
+                if not belt_on:
+                    lead = _lead_part_u(state, camera_window)
+                    if lead is not None and lead + step_mm > u_limit:
+                        print(f"[LATENCY] the next step would carry the lead part (u = {lead:.0f} mm) "
+                              f"out of the camera window: ending with the belt stopped")
+                        break
+                belt_on = not belt_on
+                run.dispatch(change_speed_packet(speed if belt_on else 0.0))
+                next_toggle = now + (BELT_STEP_ON_S if belt_on else BELT_STEP_OFF_S)
+            with state.state_lock:
+                sample = state.latest_speed
+                if sample is not None and sample.timestamp != last_sample_t:
+                    last_sample_t = sample.timestamp
+                    belt.append((sample.timestamp, sample.position_mm, sample.speed_uv))
+                    for obj in state.tracker.objects():
+                        u, v = obj.current_uv(sample.position_mm)
+                        if ConveyorFrame.is_in_window_uv(u, v, camera_window):
+                            offsets.setdefault(obj.object_id, []).append(
+                                (sample.timestamp, u - sample.position_mm))
+            time.sleep(LATENCY_SAMPLE_S)
+    except KeyboardInterrupt:
+        print("\n[INFO] Scenario interrupted by user")
+    finally:
+        try:
+            run.dispatch(change_speed_packet(0.0))
+        except Exception as exc:
+            print(f"[WARN] belt stop failed: {exc}")
+        run.close(perception)
+
+    lags = change_lags(belt, offsets)
+    for lag in lags:
+        print("[LATENCY]", json.dumps({
+            "t": round(float(lag["t"]) - run.start_time, 2), "part": lag["part"],
+            "v_before": round(float(lag["v_before"]), 1), "v_after": round(float(lag["v_after"]), 1),
+            "jump_mm": round(float(lag["jump_mm"]), 2), "lag_ms": round(float(lag["lag_s"]) * 1000, 1),
+        }, ensure_ascii=True))
+    lag_s = median_lag_s(lags)
+    if lag_s is None:
+        print("[LATENCY] no start/stop with a part in the camera window on both sides; "
+              "place parts upstream in the window and run longer")
+        return
+    current = settings.vision.latency_offset_s
+    spread = (max(float(x["lag_s"]) for x in lags) - min(float(x["lag_s"]) for x in lags)) * 1000
+    print("[LATENCY-RESULT]", json.dumps({
+        "samples": len(lags), "unmodelled_lag_ms": round(lag_s * 1000, 1), "range_ms": round(spread, 1),
+        "latency_offset_s_now": current, "latency_offset_s_suggested": round(current + lag_s, 3),
+    }, ensure_ascii=True))
+    print(f"[LATENCY] set vision.latency_offset_s: {current + lag_s:.3f} "
+          f"(> 0 = detections were stamped {lag_s * 1000:.0f} ms after the true capture)")
+
+
+def _vision_ready(image_source: Any) -> bool:
+    """The camera pipeline has its model loaded (sources without a model are always ready)."""
+    return bool(getattr(image_source, "ready", True))
+
+
+def _lead_part_u(state: RealtimeState, window: Any) -> float | None:
+    """u of the most downstream part inside the camera window, or None."""
+    from modules.core.frames import ConveyorFrame
+
+    with state.state_lock:
+        position = state.belt_position_mm
+        us = [u for u, v in (obj.current_uv(position) for obj in state.tracker.objects())
+              if ConveyorFrame.is_in_window_uv(u, v, window)]
+    return max(us) if us else None
+
+
+def _part_in_window(state: RealtimeState, window: Any) -> bool:
+    from modules.core.frames import ConveyorFrame
+
+    with state.state_lock:
+        position = state.belt_position_mm
+        return any(ConveyorFrame.is_in_window_uv(*obj.current_uv(position), window)
+                   for obj in state.tracker.objects())

@@ -23,7 +23,7 @@ from modules.core.delta import DeltaArm
 from modules.core.frames import ConveyorFrame
 from modules.core.tracking import BeltPositionTracker, BeltTracker
 from modules.runtime.cell_view import layout
-from modules.runtime.loop import RunContext, run_observe_loop, run_pick_loop
+from modules.runtime.loop import RunContext, run_belt_step_loop, run_observe_loop, run_pick_loop
 from modules.runtime.outcomes import PartLedger
 from modules.runtime.pick_executor import RealtimePickExecutor
 from modules.runtime.planning import PickPlanner
@@ -43,6 +43,7 @@ class Scenario:
     run: Callable[..., None]
     moves_arm: bool                 # needs the pick executor (and so a live PLC)
     feed: str = "camera"            # camera (or the PLC simulator's camera) | virtual
+    drives_belt: bool = False       # sends belt commands itself (needs a live PLC)
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -59,6 +60,13 @@ SCENARIOS: dict[str, Scenario] = {
         "test_vision_only",
         "Camera, tracking and belt feedback only: the arm stays idle, no belt command is sent.",
         run_observe_loop, moves_arm=False),
+    "test_camera_latency": Scenario(
+        "test_camera_latency",
+        "Arm idle; once the model is ready and a part is in view, the belt runs at "
+        "speed.static_mm_s for 1.6 s and stops for 1.6 s, until the next step would carry a part "
+        "out of the camera window. Gives the capture latency the detection stamps leave out "
+        "(suggests vision.latency_offset_s). Use ~12 mm/s.",
+        run_belt_step_loop, moves_arm=False, drives_belt=True),
 }
 
 
@@ -97,6 +105,8 @@ def run_scenario(
     validate_plugin_config(settings)
     if scenario.moves_arm and (dispatch is None or request_status is None):
         raise RuntimeError(f"Scenario '{name}' moves the arm and needs a live PLC link.")
+    if scenario.drives_belt and (dispatch is None or request_status is None):
+        raise RuntimeError(f"Scenario '{name}' drives the belt and needs a live PLC link.")
 
     start_time = time.monotonic()
     started_iso = datetime.now().isoformat(timespec="seconds")
@@ -155,6 +165,7 @@ def run_scenario(
         round_trip_s=(lambda: executor.round_trip.average_s) if executor is not None else (lambda: 0.0),
         record_dir=record_dir,
         record_meta=meta,
+        dispatch=dispatch,
     )
     print(f"[INFO] Running scenario: {name} — {scenario.description}")
     print(f"[INFO] Fixed PLC slot count: {settings.plc.interpolar_points}")

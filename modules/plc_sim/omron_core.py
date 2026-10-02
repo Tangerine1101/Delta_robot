@@ -11,6 +11,9 @@ O1 silent joint-limit IK, O2 command 3 on a running chain, O3 zero-length stall,
 O5 stale pump-release time, P2 sticky IK error, P5 no completion report, P7 no
 backward pass / braking sign, P11 State-10 ramp, P12 junction stalls.
 
+The belt servo ``MC_Conveyor`` (command 8, ``Section_Conveyor``) is modelled by
+:class:`ConveyorAxis`: an ideal velocity ramp, no belt slip.
+
 :class:`Patches` switches on the proposed PLC fixes for A/B runs; :class:`Quirks`
 holds the two Sysmac run-time behaviours the project file cannot settle.
 """
@@ -36,6 +39,12 @@ HOME_CALIB_DEG_S, HOME_CALIB_ACC = 10.0, 20.0
 HOME_DONE_WINDOW_S = 5.0
 # Goto_Absolute: MC_MoveAbsolute per axis.
 GOTO_DEG_S, GOTO_ACC = 15.0, 30.0
+# Section_Conveyor constants: Conv_Vel_Max, Conv_Vel_Deadband, Conv_Acc (= Conv_Dec).
+CONV_VEL_MAX = 300.0
+CONV_VEL_DEADBAND = 0.5
+CONV_ACC = 500.0
+# conveyor_state codes reported in plc_package.
+CONV_STOPPED, CONV_RAMPING, CONV_AT_SPEED, CONV_ERROR, CONV_SERVO_OFF = 0, 1, 2, 3, 4
 
 
 @dataclass
@@ -361,6 +370,41 @@ class InterCurveVel:
         return min(s, self.L)
 
 
+class ConveyorAxis:
+    """``MC_Conveyor`` under ``Section_Conveyor``: MC_MoveVelocity / MC_Stop with a
+    symmetric ramp. Velocity and position are reported positive along the belt (the
+    PLC negates the servo's negative-direction ``Act.Vel`` / ``Act.Pos``)."""
+
+    def __init__(self, accel_mm_s2: float = CONV_ACC, servo_on: bool = True) -> None:
+        self.accel_mm_s2 = max(float(accel_mm_s2), 0.0)
+        self.servo_on = servo_on
+        self.target = 0.0
+        self.velocity = 0.0
+        self.position = 0.0
+
+    def command(self, speed_mm_s: float) -> None:
+        v = min(max(float(speed_mm_s), 0.0), CONV_VEL_MAX)
+        self.target = 0.0 if v < CONV_VEL_DEADBAND else v
+
+    def step(self, dt: float) -> None:
+        target = self.target if self.servo_on else 0.0
+        error = target - self.velocity
+        dv = self.accel_mm_s2 * dt
+        if self.accel_mm_s2 <= 0.0 or abs(error) <= dv:
+            self.velocity = target
+        else:
+            self.velocity += math.copysign(dv, error)
+        self.position += self.velocity * dt
+
+    @property
+    def state(self) -> int:
+        if not self.servo_on:
+            return CONV_SERVO_OFF
+        if self.velocity != self.target:
+            return CONV_RAMPING
+        return CONV_AT_SPEED if self.target > 0.0 else CONV_STOPPED
+
+
 # ---------------------------------------------------------------------------
 # Program0
 # ---------------------------------------------------------------------------
@@ -369,7 +413,7 @@ def _zero_pc() -> dict[str, Any]:
         "commandID": 0, "argument_number": 0,
         "argument_x": [0.0] * N_POINTS, "argument_y": [0.0] * N_POINTS,
         "argument_z": [0.0] * N_POINTS, "argument_time": [0.0] * N_POINTS,
-        "argument_e": [0] * N_POINTS, "bit_doing": 0,
+        "argument_e": [0] * N_POINTS, "bit_doing": 0, "conveyor_speed": 0.0,
     }
 
 
@@ -377,10 +421,11 @@ def _zero_plc() -> dict[str, Any]:
     return {
         "pos_angular": [0.0] * 3, "pos_EE": [0.0] * N_POINTS,
         "task_doing": 0, "task_state": 0, "Total_Time_Estimate": [0.0] * N_POINTS,
+        "conveyor_velocity": 0.0, "conveyor_position": 0.0, "conveyor_state": CONV_STOPPED,
     }
 
 
-_REAL_FIELDS = {"argument_x", "argument_y", "argument_z", "argument_time"}
+_REAL_FIELDS = {"argument_x", "argument_y", "argument_z", "argument_time", "conveyor_speed"}
 _TAG_RE = re.compile(r"^(pc_package|plc_package)\.(\w+)(?:\[(\d+)\])?$")
 
 
@@ -403,10 +448,12 @@ class OmronPLC:
         servo_tau_s: float = 0.0,
         servo_on: bool = True,
         max_joint_speed_deg_s: float = 1800.0,
+        conveyor_accel_mm_s2: float = CONV_ACC,
     ) -> None:
         self.quirks = quirks or Quirks()
         self.patches = patches or Patches()
         self.axes = [ServoAxis(a, servo_tau_s) for a in start_angles_deg]
+        self.conveyor = ConveyorAxis(conveyor_accel_mm_s2, servo_on=servo_on)
         self.max_joint_speed_deg_s = max_joint_speed_deg_s
         self.time_s = 0.0
         self.pc_package = _zero_pc()
@@ -465,7 +512,7 @@ class OmronPLC:
         else:
             if idx is not None:
                 return False
-            self.pc_package[member] = int(value)
+            self.pc_package[member] = f32(value) if member in _REAL_FIELDS else int(value)
         return True
 
     def read_tag(self, tag: str) -> tuple[bool, Any]:
@@ -487,6 +534,7 @@ class OmronPLC:
     def scan(self) -> None:
         self._rung1_limit_stop()
         self._rung4_dispatch()
+        self._section_conveyor()
         self._rungs5_8_homing()
         self._rung9_fk()
         self._rungs11_12_goto()
@@ -554,7 +602,14 @@ class OmronPLC:
             self.pump_ext = False
             plc["task_doing"], plc["task_state"] = 6, 1
             pc["commandID"] = -1
+        elif cmd == 8:
+            # Belt speed: task_doing / task_state are left to the robot.
+            self.conveyor.command(pc["conveyor_speed"])
+            pc["commandID"] = -1
         pc["bit_doing"] = 0
+
+    def _section_conveyor(self) -> None:
+        self.conveyor.step(SCAN_S)
 
     def _rungs5_8_homing(self) -> None:
         if self.mc_on_btn_flag and self.mc_home_ext:
@@ -647,6 +702,9 @@ class OmronPLC:
             plc["pos_EE"][i] = f32(self._fk_xyz[i])
         for i in range(N_POINTS):
             plc["Total_Time_Estimate"][i] = f32(self.icv_t[i])
+        plc["conveyor_velocity"] = f32(self.conveyor.velocity)
+        plc["conveyor_position"] = f32(self.conveyor.position)
+        plc["conveyor_state"] = self.conveyor.state
 
     def _watch_setpoints(self) -> None:
         for i, ax in enumerate(self.axes):

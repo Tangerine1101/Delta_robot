@@ -10,9 +10,14 @@ from modules.core.tracking import BeltPositionTracker
 from modules.runtime.state import SpeedSample
 
 
+# conveyor_state values the belt cannot move in (plc_package, Section_Conveyor).
+_CONVEYOR_FAULT_STATES = {3: "an axis error", 4: "servo OFF"}
+
+
 class ConveyorSpeedSource:
-    """Belt position and speed from the Siemens `conveyor_position` field (true mm: the PLC
-    worker has already applied `conveyor.position_scale_mm`)."""
+    """Belt position and speed from the Omron belt feedback, `conveyor_position` and
+    `speed_current` (true mm and mm/s: the PLC worker has already applied
+    `conveyor.position_scale_mm`)."""
 
     def __init__(
         self,
@@ -23,7 +28,8 @@ class ConveyorSpeedSource:
         self.request_status = request_status
         self.frame = frame
         self.decoder = decoder
-        # Latest raw PLC status (pose, end effector, Siemens feedback), cached so the
+        self._conveyor_state: int | None = None
+        # Latest raw PLC status (pose, end effector, belt and rotation feedback), cached so the
         # perception tick reads the robot pose without a second PLC round trip.
         self.last_status: dict[str, Any] | None = None
 
@@ -42,9 +48,12 @@ class ConveyorSpeedSource:
         self.last_status = status
 
         if status is not None:
+            self._note_conveyor_state(status.get("conveyor_state"))
             conveyor_position = status.get("conveyor_position")
             if conveyor_position is not None:
-                self.decoder.update(float(conveyor_position), now)
+                velocity = status.get("speed_current")
+                self.decoder.update(float(conveyor_position), now,
+                                    None if velocity is None else float(velocity))
 
         scalar = self.decoder.velocity_mm_per_s
         vx, vy = self.frame.velocity_to_robot(scalar)
@@ -55,6 +64,17 @@ class ConveyorSpeedSource:
         """Belt position at a past capture time (camera-latency compensation); None when the
         history is too stale, so the caller falls back to the current position."""
         return self.decoder.position_at(t)
+
+    def _note_conveyor_state(self, state: Any) -> None:
+        if state is None:
+            return
+        state = int(state)
+        if state in _CONVEYOR_FAULT_STATES and state != self._conveyor_state:
+            print(f"[WARN] belt servo reports {_CONVEYOR_FAULT_STATES[state]} (conveyor_state={state}): "
+                  "speed commands have no effect until it is cleared on the PLC")
+        elif self._conveyor_state in _CONVEYOR_FAULT_STATES and state not in _CONVEYOR_FAULT_STATES:
+            print(f"[INFO] belt servo recovered (conveyor_state={state})")
+        self._conveyor_state = state
 
 
 class StaticSpeedSource:

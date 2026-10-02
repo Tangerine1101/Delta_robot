@@ -8,13 +8,13 @@ from __future__ import annotations
 import math
 import unittest
 
-from modules.core.delta import DeltaArm
+from modules.core.delta import GATE_POLL_S, DeltaArm
 from modules.core.forecast import steady
 from modules.core.frames import ConveyorFrame
 from modules.core.tracking import BeltTracker, TrackedObject
 from modules.runtime.pick_gate import in_final_segment, object_gate_status
 from modules.runtime.plan import PickPlan
-from modules.runtime.state import RealtimeState
+from modules.runtime.state import RealtimeState, SpeedSample
 from tests.helpers import settings
 
 
@@ -41,12 +41,35 @@ class GateThreshold(unittest.TestCase):
 
     def test_lead_is_the_delay_budget_times_belt_speed(self):
         gate = self.cfg.pick_gate
-        lead_s = (gate.robot_movement_delay_s + gate.ethernet_delay_s
-                  + self.cfg.runtime.poll_interval_s / 2.0 + 0.0125)
+        lead_s = gate.robot_movement_delay_s + gate.ethernet_delay_s + GATE_POLL_S / 2.0
         self.assertAlmostEqual(self.arm.gate_lead_s, lead_s, places=12)
         for belt in (0.0, 60.0, 120.0, 200.0):
             status = self._gate(0.0, belt)
             self.assertAlmostEqual(status["pick_u"] - status["threshold_u"], belt * lead_s, places=6)
+
+    def test_offset_moves_the_threshold(self):
+        """gate_offset_mm > 0 fires earlier (threshold upstream), < 0 later."""
+        self.tracker._objects.clear()
+        obj = TrackedObject("obj-1", "TQFP", (0.0, self.v_pick), belt_pos_anchor=0.0)
+        self.tracker._objects[obj.object_id] = obj
+        state = RealtimeState(tracker=self.tracker, frame=self.frame, belt_speed_mm_s=40.0)
+        lead = self.arm.gate_lead_s
+        base = object_gate_status(state, self.plan, lead)["threshold_u"]
+        self.assertAlmostEqual(object_gate_status(state, self.plan, lead, None, 10.0)["threshold_u"], base - 10.0)
+        self.assertAlmostEqual(object_gate_status(state, self.plan, lead, None, -5.0)["threshold_u"], base + 5.0)
+
+    def test_belt_is_extrapolated_to_now(self):
+        """A sample one tick old is advanced by speed x age; a stale one is used as it is."""
+        self.tracker._objects.clear()
+        obj = TrackedObject("obj-1", "TQFP", (100.0, self.v_pick), belt_pos_anchor=0.0)
+        self.tracker._objects[obj.object_id] = obj
+        state = RealtimeState(tracker=self.tracker, frame=self.frame, belt_position_mm=10.0,
+                              belt_speed_mm_s=40.0)
+        state.latest_speed = SpeedSample(vx=0.0, vy=0.0, timestamp=5.0, position_mm=10.0, speed_uv=40.0)
+        lead = self.arm.gate_lead_s
+        self.assertAlmostEqual(object_gate_status(state, self.plan, lead, 5.025)["object_u"], 111.0)
+        self.assertAlmostEqual(object_gate_status(state, self.plan, lead)["object_u"], 110.0)
+        self.assertAlmostEqual(object_gate_status(state, self.plan, lead, 6.0)["object_u"], 110.0)
 
     def test_status_is_one_sided(self):
         """The raw status only asks "has it got here yet?"; the late bound is the executor's."""

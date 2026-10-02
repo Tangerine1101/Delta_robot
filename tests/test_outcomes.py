@@ -122,7 +122,8 @@ class _Belt:
 class VirtualFeeder(unittest.TestCase):
     def setUp(self):
         self.settings = load_settings(**{"feeder.kind": "poisson", "feeder.seed": 11,
-                                         "feeder.kinds.poisson.rate_per_min": 30.0})
+                                         "feeder.kinds.poisson.rate_per_min": 30.0,
+                                         "feeder.detection_latency_s": 0.0})
 
     def test_same_seed_same_arrivals(self):
         a = arrival_schedule(self.settings, 120.0)

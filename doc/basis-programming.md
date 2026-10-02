@@ -82,15 +82,17 @@ graph TD
 ### 2.1. Threads and processes of a `production` run
 
 1. **PLC worker** (`comm/plc_link._worker`, a spawned process): the single gateway for snap7 and
-   pylogix I/O. Every dispatch/status round trip goes through its queue. It converts the
-   rotation angle verbatim at the wire (`core/angles`) and scales the real belt feedback by
-   `conveyor.position_scale_mm`. The main process talks to it through `PlcLink`, which also owns
+   pylogix I/O. Every dispatch/status round trip goes through its queue. It routes the rotation
+   commands (7, 9) to the Siemens and every other command, the belt speed (8) included, to the
+   Omron; it converts the rotation angle verbatim at the wire (`core/angles`) and scales the
+   real belt feedback (Omron `conveyor_velocity` / `conveyor_position`, renamed
+   `speed_current` / `conveyor_position` in the status dict) by `conveyor.position_scale_mm`. The main process talks to it through `PlcLink`, which also owns
    the UDP pose stream (§3.5) and the run log (§2.5).
 2. **Main thread — decision loop** (`runtime/loop.run_pick_loop`, §2.2) and the **pick
    executor** (`runtime/pick_executor.RealtimePickExecutor`) it calls. The executor's wait loops
    read arm and part state from `RealtimeState` and issue no status I/O of their own.
 3. **Perception thread** (`runtime/perception.Perception`, every 25 ms): the only regular status
-   read. Updates belt position/speed, pose and Siemens feedback, polls the image source,
+   read. Updates belt position/speed, pose and rotation feedback, polls the image source,
    ingests detections into the `BeltTracker` (anchored at their capture time) and prunes parts
    that left the belt, and emits the dashboard `status` / `detect` events. It decides nothing.
 4. **Vision threads** (`vision/pipeline`): PyAV capture and YOLO-OBB inference.
@@ -135,8 +137,9 @@ arm stays free   ─► speed.tick("idle"), re-plan every runtime.poll_interval_
    `_max_mm` between `speed.band.min_mm_s` and `max_mm_s`) **and** inside the final vertical
    segment (O2); time out after the packet's `argument_time` plus
    `pick_gate.arrival_timeout_margin_s`.
-3. **Pick gate**: fire once the part reaches `u_pick − v · lead`, `lead = command delay + gate
-   sampling latency + descent lead` (`core/delta.DeltaArm.gate_lead_s`). Abort (re-queue) if the
+3. **Pick gate**: poll every 5 ms (`core/delta.GATE_POLL_S`) with the belt position extrapolated
+   to the present, and fire once the part reaches `u_pick − v · lead`, `lead = command delay +
+   gate sampling latency + descent lead` (`core/delta.DeltaArm.gate_lead_s`). Abort (re-queue) if the
    part is already more than `pick_gate.late_abort_mm` past the threshold, or has not advanced
    for 3 s.
 4. Refresh the post-grip rotation from the part's latest heading (within
@@ -262,17 +265,17 @@ Structs exchanged with Siemens via `snap7` **must** use `ctypes.BigEndianStructu
 |---|---|---|---|
 | 0 | `CommandID` | DINT | Command ID (§3.4) |
 | 4 | `rotate` | REAL | Absolute rotation angle, 4th DOF, **degrees, verbatim** (`basis-theory.md` §5.2 Layer 3) |
-| 8 | `speed` | REAL | Requested conveyor speed (mm/s) |
+| 8 | `speed` | REAL | Unused: the PC writes 0 and sends the belt speed to the Omron (§3.3) |
 
 **DB2 (PLC → PC, 20 bytes):**
 
 | Offset | Field | Type | Description |
 |---|---|---|---|
 | 0 | `rotate_current` | REAL | Current suction cup rotation angle |
-| 4 | `speed_current` | REAL | Current conveyor belt speed (mm/s) |
+| 4 | `speed_current` | REAL | Unused by the PC: the belt is driven and reported by the Omron (§3.3) |
 | 8 | `task_doing` | DINT | Command ID currently executing |
 | 12 | `task_state` | DINT | Reports inconsistent values — unusable; use Omron's `bit_doing` handshake instead (`open-issues.md` **L3**) |
-| 16 | `conveyor_position` | REAL | Pre-decoded belt position in mm (`scale = 1.0`) |
+| 16 | `conveyor_position` | REAL | Unused by the PC: the belt is driven and reported by the Omron (§3.3) |
 
 > **Invariant** (from `CLAUDE.md`): never remove or reorder fields in `SiemensSendPacket` /
 > `SiemensReceivePacket` (`modules/comm/packets.py`) — the byte layout must match these DB
@@ -302,6 +305,27 @@ The array length must be padded to exactly `plc.interpolar_points` elements (7) 
 change this default without updating every downstream array that pads to it. `goto_absolute`
 commands require `argument_e` all-zero.
 
+**Belt (axis `MC_Conveyor`, EtherCAT servo, unit mm).** Command 8 writes only
+`pc_package.conveyor_speed` (REAL, mm/s ≥ 0), `commandID = 8` and `bit_doing = 1`, so the
+trajectory arguments are left untouched; the gateway rejects a negative speed (the belt runs
+one way, the servo's negative direction, fixed in the PLC). The PLC clamps the request to
+`Conv_Vel_Max` (300 mm/s), stops with `MC_Stop` below 0.5 mm/s, ramps at `Conv_Acc` = `Conv_Dec`
+= 500 mm/s², and does **not** write `task_doing` / `task_state`. Because all Omron commands
+share one `commandID`, `PLCGateway` waits (≤ 0.1 s) for `bit_doing` to return to 0 after a
+command 8, so a goto sent right after cannot overwrite it before the PLC scanned it.
+
+Belt feedback in `plc_package` (Section4 telemetry):
+
+| Member | Type | Meaning |
+|---|---|---|
+| `conveyor_velocity` | REAL | `-MC_Conveyor.Act.Vel` (mm/s, positive along the belt; 20 ms velocity filter in the axis) |
+| `conveyor_position` | REAL | `-MC_Conveyor.Act.Pos` (mm, increasing along the belt; linear count mode) |
+| `conveyor_state` | INT | 0 stopped, 1 ramping, 2 at speed, 3 error, 4 servo off |
+
+The worker renames `conveyor_velocity` to `speed_current`; the belt tracker
+(`core/tracking.BeltPositionTracker`) takes it as the belt velocity and differentiates the
+position only when it is missing.
+
 > The Omron firmware **ignores** `argument_time` — motors always run at the interpolator's
 > fixed limits, so PC-side times are approximations for logs/ETA only and the PC cannot
 > modulate execution speed. Command ID 1 (`goto_relative`) is likewise not implemented on the
@@ -320,8 +344,8 @@ COMMAND_ID = {
     "pick": 5,             # Omron
     "release": 6,          # Omron
     "rotate_absolute": 7,  # Siemens (4th DOF suction cup)
-    "change_speed": 8,     # Siemens (conveyor speed)
-    "plan_siemen": 9,      # Siemens (planning)
+    "change_speed": 8,     # Omron (conveyor speed, pc_package.conveyor_speed)
+    "plan_siemen": 9,      # Siemens (rotation; the CLI command sends 7 + 8)
     "enable": 10,          # Omron
 }
 ```
@@ -344,10 +368,11 @@ with the kernel receive time (`SO_TIMESTAMPNS`) converted to `time.monotonic()`.
 
 `PlcLink.request_status` merges it into every status dict: while the newest sample is younger
 than `pose_stream.stale_s`, `pos_EE` comes from the stream (`pose_source = "udp"`, plus
-`pos_EE_t` and `pose_age_s`), the worker reads only the Siemens DB, and the Omron block
-(`task_state`, `task_doing`, `bit_doing`, `end_effector`) is re-read at most every
-`pose_stream.omron_status_period_s` and merged from cache. Measured on the cell: a
-Siemens-only poll takes ≈ 9 ms against ≈ 26 ms with the Omron read. When the stream is silent
+`pos_EE_t` and `pose_age_s`), the worker reads only the three Omron belt members
+(`PLCGateway.get_conveyor`) and the Siemens DB, and the Omron block (`task_state`,
+`task_doing`, `bit_doing`, `end_effector`) is re-read at most every
+`pose_stream.omron_status_period_s` and merged from cache. `latency_probe` times the belt-only
+read (`omron get_conveyor`). When the stream is silent
 every poll reads both PLCs and `pos_EE` is the EtherNet/IP value (`pose_source = "omron"`).
 The PLC simulator sends the same datagrams to `127.0.0.1` under `--sim` / `--dummy`.
 
@@ -415,8 +440,9 @@ disable auto-exposure **before** writing the manual exposure value.
 
 The project captures frames with **PyAV** (FFmpeg-backed) in `modules/vision/pipeline.py`, bypassing
 OpenCV's V4L2 backend — the actual bottleneck behind 30 FPS at 1080p MJPG (not the model or
-GPU). `vision.v4l2_controls.exposure_time_absolute` also feeds the camera-latency backdating
-in `basis-theory.md` §4.2.
+GPU). Each frame is stamped with its V4L2 start-of-exposure time (the frame pts);
+`vision.v4l2_controls.exposure_time_absolute` moves that stamp to mid-exposure
+(`basis-theory.md` §4.2).
 
 ---
 
@@ -432,9 +458,10 @@ read the list from there.
 
 | Scenario | Arm | Belt command | Belt feedback | Parts seen by |
 |---|---|---|---|---|
-| `production` | picks (`RealtimePickExecutor`) | startup setpoint + speed law | Siemens `conveyor_position` | camera, or the simulator's under `--sim` |
-| `simulate_feeder` | picks | startup setpoint + speed law | Siemens `conveyor_position` | virtual feeder (`runtime/virtual_feed.py`) |
-| `test_vision_only` | idle | none | Siemens, or static with `--no-plc` | camera, or the simulator's under `--sim` |
+| `production` | picks (`RealtimePickExecutor`) | startup setpoint + speed law | Omron `conveyor_position` / `conveyor_velocity` | camera, or the simulator's under `--sim` |
+| `simulate_feeder` | picks | startup setpoint + speed law | Omron `conveyor_position` / `conveyor_velocity` | virtual feeder (`runtime/virtual_feed.py`) |
+| `test_vision_only` | idle | none | Omron, or static with `--no-plc` | camera, or the simulator's under `--sim` |
+| `test_camera_latency` | idle | `speed.static_mm_s` 1.6 s on / 1.6 s off, from the first part in view until the next step would carry a part out of the camera window | Omron | camera, or the simulator's under `--sim` |
 
 **`simulate_feeder`** replaces the camera with parts drawn before the run from `feeder.seed` by
 the feeder `feeder.kind` (`modules/core/feeders.py`, the sandbox's feeders) with the parameters
@@ -554,16 +581,16 @@ Keep strings that look like numbers quoted (`device: "0"`).
 | `pose_stream` | `enabled`, `port`, `stale_s`, `omron_status_period_s` (§3.5) | `comm/plc_link` |
 | `logging` | `enabled`, `dir` (§2.5) | `main`, `runlog` |
 | `robot` | `limits.{radius_xy_mm,z_min_mm,z_max_mm}` (§4.2); `home_position`; `heights.{clearance,slope_transition,pre_pick,pickup,place}`; `corner_blend_xy`; `interpolator.{v_max,a_max,d_max,soft_start_s,scurve_shape_factor}` (the PLC time model, `basis-theory.md` §3); `packet_time.{nominal_xy_speed,nominal_z_speed,release_descent_time_s}` (fills `argument_time`: ignored by the PLC, bounds the executor's arrival timeout); `rotation.{sign,offset_deg,home_tolerance_deg,refresh_max_delta_deg}` (`basis-theory.md` §5) | `core/delta`, `core/trajectory`, `runtime` |
-| `conveyor` | `position_scale_mm` (real belt feedback → true mm and mm/s, in the PLC worker; not applied to the simulator); `velocity_ema_alpha`; `accel_mm_s2` (forecasts, simulator ramp); `hw_max_mm_s`; `frame.{theta_deg,robot_origin_uv}` (`basis-theory.md` §1.1); `camera_window_uv`, `workspace_window_uv` | `core`, `runtime`, `plc_sim` |
+| `conveyor` | `position_scale_mm` (real belt feedback → true mm and mm/s, in the PLC worker; not applied to the simulator); `velocity_ema_alpha` (position-derived velocity, used only when the PLC sends none); `accel_mm_s2` (the PLC's `Conv_Acc`; forecasts, simulator ramp); `hw_max_mm_s`; `frame.{theta_deg,robot_origin_uv}` (`basis-theory.md` §1.1); `camera_window_uv`, `workspace_window_uv` | `core`, `runtime`, `plc_sim` |
 | `object_types.<type>` | `bin` (drop position, robot frame), `w`, `h`, `model_class` (YOLO class; default the type name), `marker_class`, `symmetry_deg`, `heading_offset_deg` | everywhere a class matters |
-| `vision` | `model_weights`, `imgsz`, `conf`, `conf_marker`, `iou`, `device`, `half`, `show_window`, `mjpeg_jpeg_quality`, `pixels_per_mm`, `capture.*`, `v4l2_controls.*` (manual exposure; `exposure_time_absolute` also feeds the latency backdating), `roi.{enabled,polygon}`, `trigger_line.{y_px,direction,min_conf}`, `orientation.{enabled,cross_check,marker_max_dist_mm}`, `tracker.*`, `belt_estimator.*` (informational) | `vision/pipeline`, `camera_calibrate.py` |
-| `pick_gate` | `robot_movement_delay_s`, `ethernet_delay_s` (their sum is the dispatch → motion delay of the gate lead); `pick_descent_time_s`; `late_abort_mm`; `arrival_tolerance_mm`, `arrival_tolerance_max_mm`, `arrival_timeout_margin_s`; `oblique_descent_enabled`; `intercept_lead_time_s` | `core/delta`, `runtime/pick_executor` |
+| `vision` | `model_weights`, `imgsz`, `conf`, `conf_marker`, `iou`, `device`, `half`, `show_window`, `mjpeg_jpeg_quality`, `pixels_per_mm`, `capture.*`, `v4l2_controls.*` (manual exposure; `exposure_time_absolute` also feeds the latency backdating), `latency_offset_s` (capture latency beyond the frame's kernel stamp, subtracted from every detection stamp; from `test_camera_latency`), `roi.{enabled,polygon}`, `trigger_line.{y_px,direction,min_conf}`, `orientation.{enabled,cross_check,marker_max_dist_mm}`, `tracker.*`, `belt_estimator.*` (informational) | `vision/pipeline`, `camera_calibrate.py` |
+| `pick_gate` | `robot_movement_delay_s`, `ethernet_delay_s` (their sum is the dispatch → motion delay of the gate lead); `pick_descent_time_s`; `gate_offset_mm` (fixed distance the gate fires earlier, > 0, or later, < 0); `late_abort_mm`; `arrival_tolerance_mm`, `arrival_tolerance_max_mm`, `arrival_timeout_margin_s`; `oblique_descent_enabled`; `intercept_lead_time_s` | `core/delta`, `runtime/pick_executor` |
 | `runtime` | `poll_interval_s`, `stale_timeout_s`, `speed_timeout_s`; `grip_tolerance_mm` (part record: gripped if the part centre is this close to the cup at contact, §2.6); `flow_bin_s` (bin of `flow.csv`) | `runtime` |
 | `scheduling` | `planner`; `safety_margin_s`; `setup_time_s`; `arm_cycle.{cycle_s,occupancy_worst_s,grab_worst_s}` (what speed laws assume about a pick cycle); `planners.<name>.*` | `scheduling`, `runtime/planning` |
 | `speed` | `law`; `setpoint_gate` (null = the law's default); `static_mm_s` (the `constant` speed, the startup setpoint of every law); `control_period_s`; `band.{min_mm_s,max_mm_s}`; `commit.{deadband_mm_s,max_step_mm_s}`; `laws.<name>.*` | `runtime/speed`, `scheduling` |
 | `plc_sim` | `feed_types`, `feed_lanes` (the simulator's feeder) | `plc_sim` |
 | `feeder` | `kind`, `seed`, `max_parts`, `schedule_s`, `detection_period_s`, `detection_latency_s`, `position_noise_mm`, `kinds.<kind>.*` (the feeder's own parameters) — the `simulate_feeder` scenario (§6) | `runtime/virtual_feed` |
-| `interface` | `port`, `mjpeg_fps` | `ui/dashboard` |
+| `interface` | `port`, `mjpeg_fps`; `teach_points` (name → robot-frame `[x, y, z]`; the console's *Teach points* card lists them and **writes this key** on save/delete through `config_io.write_config`, so they survive restarts; *Go* is IK-checked) | `ui/dashboard`, `ui/supervisor` |
 
 **Look-alike keys, disambiguated:** `robot.packet_time.*` (a rough ETA written into packets) ≠
 `robot.interpolator.*` (the timing model every prediction uses); `speed.band.max_mm_s` (the
@@ -621,24 +648,22 @@ python3 main.py --interface --sim
 ### 9.1. Calibration probes (see `open-issues.md` §A)
 
 ```bash
-# PLC round-trip latency -> pick_gate.ethernet_delay_s (C2). Siemens is the one that gates picks.
-python3 -m modules.tools.latency_probe --target siemens
+# PLC round-trip latency (read-only). The Omron carries both the pick commands and the belt feedback.
+python3 -m modules.tools.latency_probe --target omron
 
-# 4th-DOF rotation probe -> robot.rotation.sign (C1): remap/settle, implied axis speed,
-# visual direction check, cmd-7 retrigger test. REQUIRES HARDWARE.
-python3 -m modules.tools.test_rotate
+# From any run log with picks: send -> motion -> lowest z per pick phase (pose stream), i.e.
+# pick_gate.ethernet_delay_s + robot_movement_delay_s; and the camera / encoder travel ratio
+# (vision.pixels_per_mm vs the belt feedback, C8). The [GATE] dispatch_to_contact_s is quantised
+# by the executor's 50 ms poll; this is not.
+python3 -m modules.tools.pick_timing log/<run folder>
 
-# Offline sweep of the vision -> wire angle chain across headings and classes (no hardware)
-python3 -m modules.tools.rotate_sweep_sim --step-deg 0.5 --csv /tmp/rotate_sweep.csv
-
-# Model worst-case grab / occupancy times -> scheduling.arm_cycle (C7)
-python3 -m modules.tools.derive_rank_bounds
-
-# A point between the robot, belt, ROI-mm and pixel frames, with a round-trip check
-python3 -m modules.tools.frame_convert --conveyor 250 60
-
-# Whole-config consistency + workspace boundary check
-python3 calibrate_everything.py --check
+# Capture latency the detection stamps leave out -> vision.latency_offset_s. Put 3-5 boards at
+# the upstream edge of the camera window, arm idle. The belt waits for the vision model and a
+# part in view, then runs 1.6 s / stops 1.6 s; it ends stopped before a step would carry a board
+# (centre + half the largest board size) out of the window. ~12 mm/s gives 2 start/stop pairs
+# per board; move the boards back and repeat for more samples. Prints [LATENCY-RESULT].
+# --duration (optional) counts from the first belt step.
+python3 main.py --scheduler --scenario test_camera_latency --set speed.static_mm_s=12
 ```
 
 ### 9.2. Calibration order
