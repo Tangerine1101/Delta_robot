@@ -27,6 +27,9 @@ class ObjectDetection:
     timestamp: float
     confidence: float = 1.0
     angle_deg: float = 0.0
+    # Ids of the parts lying on this one's centre, as far as the camera can tell (the real
+    # camera reports none: open-issues S1).
+    covered_by: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +40,7 @@ class ObjectDetection:
             "timestamp": self.timestamp,
             "confidence": self.confidence,
             "angle_deg": self.angle_deg,
+            "covered_by": list(self.covered_by),
         }
 
 
@@ -149,6 +153,8 @@ class TrackedObject:
     h_mm: float = 0.0
     last_seen_at: float = 0.0
     confidence: float = 1.0
+    # Parts lying on this one's centre; only ever grows (a part on top does not slide off).
+    covered_by: frozenset[str] = frozenset()
 
     def current_uv(self, p_now: float) -> tuple[float, float]:
         """Current C-frame position given current belt encoder reading."""
@@ -210,6 +216,8 @@ class BeltTracker:
             obj.confidence = detection.confidence
             obj.rotation_rad = self.frame.vision_heading_to_robot_rad(detection.angle_deg)
             obj.vision_angle_deg = detection.angle_deg
+            if detection.covered_by:
+                obj.covered_by |= frozenset(detection.covered_by)
             return obj
 
         obj = TrackedObject(
@@ -223,6 +231,7 @@ class BeltTracker:
             h_mm=dims[1],
             last_seen_at=detection.timestamp,
             confidence=detection.confidence,
+            covered_by=frozenset(detection.covered_by),
         )
         self._objects[detection.object_id] = obj
         return obj

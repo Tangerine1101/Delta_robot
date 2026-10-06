@@ -89,7 +89,7 @@ Delta_robot/
 │   ├── vision/                # PyAV capture, YOLO-OBB pipeline, board heading, ROI, centroid tracker
 │   ├── ui/                    # Web dashboard, operator console back-end, interactive CLI
 │   ├── tools/                 # Probes: latency, rotation, angle sweep, frame converter, rank bounds, UDP;
-│   │                          #   flow_report (input vs throughput across runs), pick_timing (gate latency, belt scale)
+│   │                          #   flow_report (input vs throughput across runs), log_timeline / log_compare (throughput plots of one run / across set-ups), pick_timing (gate latency, belt scale)
 │   └── plc_sim/               # PLC simulator (Omron Matching_Code_10 port + belt, Siemens, boards, camera)
 │
 ├── sandbox/                   # Offline algorithm bench: config, arm models, feeders, sweeps (README.md)

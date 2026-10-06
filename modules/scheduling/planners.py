@@ -273,7 +273,8 @@ def _rollout(rule_name: str, jobs: list[Job], ctx: PlanContext, cfg: RolloutConf
     end = ctx.now + cfg.horizon_s
 
     while remaining and clock <= end:
-        snapshot = [make_job(obj, ctx, position, clock) for obj in remaining]
+        gone = frozenset(pick.job.obj.object_id for pick in schedule)
+        snapshot = [make_job(obj, ctx, position, clock, gone) for obj in remaining]
         ready = [job for job in snapshot if job.feasible and job.intercept.pick_time <= job.deadline_safe]
         if not ready:
             break

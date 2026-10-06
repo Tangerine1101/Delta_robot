@@ -185,6 +185,7 @@ def run_meta(name: str, settings: Settings, started_iso: str, duration_s: float 
         "started": started_iso,
         "duration_requested_s": duration_s,
         "planner": settings.scheduling.planner,
+        "stack_aware": settings.scheduling.stack_aware,
         "speed_law": settings.speed.law,
         "setpoint_gate": settings.speed.setpoint_gate,
         "static_mm_s": settings.speed.static_mm_s,

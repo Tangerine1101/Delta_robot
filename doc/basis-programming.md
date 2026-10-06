@@ -43,7 +43,7 @@ run without threads, sockets or a camera — on the robot and in the sandbox ali
 | `modules/comm/` | bytes on the wire: `packets` (DB layouts, command IDs), `omron` (pylogix gateway + mock), `siemens` (snap7 gateway + mock), `plc_link` (worker process + `PlcLink`), `pose_stream` (UDP) | interpret scheduling data |
 | `modules/vision/` | camera capture (`camera`), board heading (`heading`), ROI geometry (`roi`), centroid tracking (`tracking`), the YOLO pipeline (`pipeline`) | — |
 | `modules/ui/` | web dashboard (`dashboard`), operator console back-end (`supervisor`, §6.1), interactive CLI (`cli`) | — |
-| `modules/tools/` | stand-alone probes: `latency_probe`, `test_rotate`, `rotate_sweep_sim`, `frame_convert`, `derive_rank_bounds`, `udp_receiver`; `flow_report` (input vs throughput across runs, §2.6) | — |
+| `modules/tools/` | stand-alone probes: `latency_probe`, `test_rotate`, `rotate_sweep_sim`, `frame_convert`, `derive_rank_bounds`, `udp_receiver`; `flow_report` (input vs throughput across runs, §2.6), `log_timeline` (one run's throughput, belt speed, density and cumulative parts over time), `log_compare` (throughput, pick rate and miss reasons per planner / awareness / speed law) | — |
 | `modules/plc_sim/` | scan-accurate PLC simulator ([`plc/simulator.md`](plc/simulator.md)); `python3 -m modules.plc_sim` serves it stand-alone | — |
 | `modules/config_io.py` | the only reader/writer of `config.yaml` (comment-preserving round trip) | — |
 | `modules/runlog.py` | per-run debug logs (§2.5) | — |
@@ -213,7 +213,7 @@ exactly once:
 | Outcome | Meaning | Reasons |
 |---|---|---|
 | `picked` | the cup came down on the part | `gripped`; `unverified` (the pose poll missed the contact band; the pick completed) |
-| `miss_grip` | a pick was dispatched, the part was not taken | `cup_off_part`: part centre − cup at contact > `runtime.grip_tolerance_mm`; `pick_motion_failed`: no contact before the trajectory failed |
+| `miss_grip` | a pick was dispatched, the part was not taken | `cup_off_part`: part centre − cup at contact > `runtime.grip_tolerance_mm`; `covered`: another part still lay on its centre (§7.7 of basis-theory); `pick_motion_failed`: no contact before the trajectory failed |
 | `miss_late` | left the workspace (`u > u_max`) never dispatched | `never_planned`, or the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing` |
 | `lost_track` | the track went stale inside the camera view | `stale_in_camera` (reopened if the id is seen again) |
 | `on_belt` | still on the belt when the run ended | `run_ended` |
@@ -581,15 +581,15 @@ Keep strings that look like numbers quoted (`device: "0"`).
 | `pose_stream` | `enabled`, `port`, `stale_s`, `omron_status_period_s` (§3.5) | `comm/plc_link` |
 | `logging` | `enabled`, `dir` (§2.5) | `main`, `runlog` |
 | `robot` | `limits.{radius_xy_mm,z_min_mm,z_max_mm}` (§4.2); `home_position`; `heights.{clearance,slope_transition,pre_pick,pickup,place}`; `corner_blend_xy`; `interpolator.{v_max,a_max,d_max,soft_start_s,scurve_shape_factor}` (the PLC time model, `basis-theory.md` §3); `packet_time.{nominal_xy_speed,nominal_z_speed,release_descent_time_s}` (fills `argument_time`: ignored by the PLC, bounds the executor's arrival timeout); `rotation.{sign,offset_deg,home_tolerance_deg,refresh_max_delta_deg}` (`basis-theory.md` §5) | `core/delta`, `core/trajectory`, `runtime` |
-| `conveyor` | `position_scale_mm` (real belt feedback → true mm and mm/s, in the PLC worker; not applied to the simulator); `velocity_ema_alpha` (position-derived velocity, used only when the PLC sends none); `accel_mm_s2` (the PLC's `Conv_Acc`; forecasts, simulator ramp); `hw_max_mm_s`; `frame.{theta_deg,robot_origin_uv}` (`basis-theory.md` §1.1); `camera_window_uv`, `workspace_window_uv` | `core`, `runtime`, `plc_sim` |
+| `conveyor` | `position_scale_mm` (real belt feedback → true mm and mm/s, in the PLC worker; not applied to the simulator); `velocity_ema_alpha` (position-derived velocity, used only when the PLC sends none); `accel_mm_s2` (the PLC's `Conv_Acc`; forecasts, simulator ramp); `hw_max_mm_s`; `frame.{theta_deg,robot_origin_uv,robot_origin_offset}` (`basis-theory.md` §1.1; the offset is added to the origin before the frame is built); `camera_window_uv`, `workspace_window_uv` | `core`, `runtime`, `plc_sim` |
 | `object_types.<type>` | `bin` (drop position, robot frame), `w`, `h`, `model_class` (YOLO class; default the type name), `marker_class`, `symmetry_deg`, `heading_offset_deg` | everywhere a class matters |
 | `vision` | `model_weights`, `imgsz`, `conf`, `conf_marker`, `iou`, `device`, `half`, `show_window`, `mjpeg_jpeg_quality`, `pixels_per_mm`, `capture.*`, `v4l2_controls.*` (manual exposure; `exposure_time_absolute` also feeds the latency backdating), `latency_offset_s` (capture latency beyond the frame's kernel stamp, subtracted from every detection stamp; from `test_camera_latency`), `roi.{enabled,polygon}`, `trigger_line.{y_px,direction,min_conf}`, `orientation.{enabled,cross_check,marker_max_dist_mm}`, `tracker.*`, `belt_estimator.*` (informational) | `vision/pipeline`, `camera_calibrate.py` |
-| `pick_gate` | `robot_movement_delay_s`, `ethernet_delay_s` (their sum is the dispatch → motion delay of the gate lead); `pick_descent_time_s`; `gate_offset_mm` (fixed distance the gate fires earlier, > 0, or later, < 0); `late_abort_mm`; `arrival_tolerance_mm`, `arrival_tolerance_max_mm`, `arrival_timeout_margin_s`; `oblique_descent_enabled`; `intercept_lead_time_s` | `core/delta`, `runtime/pick_executor` |
+| `pick_gate` | `robot_movement_delay_s`, `ethernet_delay_s` (their sum is the dispatch → motion delay of the gate lead); `pick_descent_time_s`; `gate_offset_mm` (fixed distance the gate fires earlier, > 0, or later, < 0); `late_abort_mm`; `gate_out_n` (a part is dropped, booked `miss_late` / `gate_out`, after this many consecutive `gate_late` aborts; 0 disables); `arrival_tolerance_mm`, `arrival_tolerance_max_mm`, `arrival_timeout_margin_s`; `oblique_descent_enabled`; `intercept_lead_time_s` | `core/delta`, `runtime/pick_executor` |
 | `runtime` | `poll_interval_s`, `stale_timeout_s`, `speed_timeout_s`; `grip_tolerance_mm` (part record: gripped if the part centre is this close to the cup at contact, §2.6); `flow_bin_s` (bin of `flow.csv`) | `runtime` |
 | `scheduling` | `planner`; `safety_margin_s`; `setup_time_s`; `arm_cycle.{cycle_s,occupancy_worst_s,grab_worst_s}` (what speed laws assume about a pick cycle); `planners.<name>.*` | `scheduling`, `runtime/planning` |
 | `speed` | `law`; `setpoint_gate` (null = the law's default); `static_mm_s` (the `constant` speed, the startup setpoint of every law); `control_period_s`; `band.{min_mm_s,max_mm_s}`; `commit.{deadband_mm_s,max_step_mm_s}`; `laws.<name>.*` | `runtime/speed`, `scheduling` |
 | `plc_sim` | `feed_types`, `feed_lanes` (the simulator's feeder) | `plc_sim` |
-| `feeder` | `kind`, `seed`, `max_parts`, `schedule_s`, `detection_period_s`, `detection_latency_s`, `position_noise_mm`, `kinds.<kind>.*` (the feeder's own parameters) — the `simulate_feeder` scenario (§6) | `runtime/virtual_feed` |
+| `feeder` | `kind`, `seed`, `max_parts`, `schedule_s`, `detection_period_s`, `detection_latency_s`, `position_noise_mm`, `stacking`, `kinds.<kind>.*` (the feeder's own parameters) — the `simulate_feeder` scenario (§6) | `runtime/virtual_feed` |
 | `interface` | `port`, `mjpeg_fps`; `teach_points` (name → robot-frame `[x, y, z]`; the console's *Teach points* card lists them and **writes this key** on save/delete through `config_io.write_config`, so they survive restarts; *Go* is IK-checked) | `ui/dashboard`, `ui/supervisor` |
 
 **Look-alike keys, disambiguated:** `robot.packet_time.*` (a rough ETA written into packets) ≠
@@ -620,6 +620,8 @@ python3 main.py --scheduler --scenario production --sim --duration 90 \
 python3 main.py --scheduler --scenario simulate_feeder --sim --duration 120 \
     --set feeder.seed=3 --set feeder.max_parts=30 --set speed.static_mm_s=40
 python3 -m modules.tools.flow_report log/ --scenario simulate_feeder
+python3 -m modules.tools.log_timeline log/<session>        # one figure per run
+python3 -m modules.tools.log_compare log/ --scenario simulate_feeder
 
 # 4. Offline algorithm bench: one run, a sweep, model files vs this config
 python3 -m sandbox run --set speed.law=inverse_density

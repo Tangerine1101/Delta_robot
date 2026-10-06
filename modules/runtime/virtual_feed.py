@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import csv
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from modules.core.feeders import FEEDERS, SpawnEvent, build_events
+from modules.core.footprint import Footprint, board_footprint
 from modules.core.tracking import ObjectDetection
 from modules.settings import Settings, SettingsError
 
@@ -31,9 +32,14 @@ class VirtualPart:
     t_spawn: float                  # run time it landed
     belt_at_spawn: float            # belt position when it landed at u0
     u0: float
+    covered_by: set[str] = field(default_factory=set)   # parts that landed on this one's centre
 
     def u(self, belt_position: float) -> float:
         return self.u0 + belt_position - self.belt_at_spawn
+
+    def footprint(self, belt_position: float, size: tuple[float, float]) -> Footprint:
+        return board_footprint(self.u(belt_position), self.event.v_mm, size[0], size[1],
+                               self.event.heading_deg)
 
 
 def arrival_schedule(settings: Settings, horizon_s: float) -> list[SpawnEvent]:
@@ -56,6 +62,8 @@ class VirtualFeed:
         self.position_at = position_at
         self.events = arrival_schedule(settings, duration_s if duration_s else cfg.schedule_s)
         self.camera_window_uv = settings.conveyor.camera_window_uv
+        self.stacking = cfg.stacking
+        self.sizes = {name: (spec.w, spec.h) for name, spec in settings.object_types.items()}
         self.period_s = max(cfg.detection_period_s, 1e-3)
         self.latency_s = max(cfg.detection_latency_s, 0.0)
         self.noise_mm = max(cfg.position_noise_mm, 0.0)
@@ -82,6 +90,7 @@ class VirtualFeed:
             landed = self.position_at(self.start_time + event.time_s)
             part = VirtualPart(f"vf{self._next_event:04d}", event, round(event.time_s, 3),
                                belt_now if landed is None else landed, u_min)
+            self._cover_below(part, belt_now if landed is None else landed)
             self._visible.append(part)
             self.spawned.append(part)
         if now < self._next_frame:
@@ -102,8 +111,19 @@ class VirtualFeed:
                 v += self._noise.gauss(0.0, self.noise_mm)
             out.append(ObjectDetection(object_id=part.part_id, x=u, y=v, object_type=part.event.part_type,
                                        timestamp=capture_t, confidence=1.0,
-                                       angle_deg=part.event.heading_deg))
+                                       angle_deg=part.event.heading_deg,
+                                       covered_by=tuple(sorted(part.covered_by))))
         return out
+
+    def _cover_below(self, part: VirtualPart, belt: float) -> None:
+        """A part landing now lies on top of every visible part whose centre its footprint
+        contains (the later drop is always the upper one)."""
+        if not self.stacking:
+            return
+        shape = part.footprint(belt, self.sizes[part.event.part_type])
+        for below in self._visible:
+            if shape.contains(below.u(belt), below.event.v_mm):
+                below.covered_by.add(part.part_id)
 
     def write_arrivals(self, path: Path) -> None:
         """The arrivals that landed: replayable as a sandbox `script` feeder."""

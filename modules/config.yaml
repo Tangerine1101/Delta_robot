@@ -42,7 +42,7 @@ robot:
   # rejected, never clamped. The console additionally rejects IK / -20° joint-limit failures.
   limits:
     radius_xy_mm: 180.0         # XY reach circle around the robot origin. open-issues G7 (~140 mm IK-valid at clearance)
-    z_min_mm: -305.0            # lowest allowed z: 2 mm below the pickup height
+    z_min_mm: -310.0            # lowest allowed z: 2 mm below the pickup height
     z_max_mm: -220.0            # highest allowed z: above the post-homing calibration pose (z = -230.2)
   home_position: [0.0, 0.0, -290.0]
   # Trajectory template heights, robot frame (mm). Hierarchy: basis-programming.md §4.2.
@@ -50,15 +50,15 @@ robot:
     clearance: -265.0           # travel height between picks. open-issues G7 (joint limit binds here)
     slope_transition: -275.0    # where the slanted approach turns vertical
     pre_pick: -287.0            # park height above the part before the pick phase
-    pickup: -303.0              # suction-cup contact height
+    pickup: -307.0              # suction-cup contact height
     place: -280.0               # release height over the bin
   corner_blend_xy: 25.0         # XY corner blend radius of the 7-point template (mm)
   # PLC S-curve trajectory-time model: the scheduler's estimate of every processing time.
   # open-issues C5 (never validated on the real arm — blocking).
   interpolator:
-    v_max: 300.0                # mm/s
-    a_max: 1000.0               # mm/s^2
-    d_max: 1000.0               # mm/s^2
+    v_max: 1000.0                # mm/s
+    a_max: 2250.0               # mm/s^2
+    d_max: 1750.0               # mm/s^2
     soft_start_s: 0.08          # PLC State-10 soft start (s)
     scurve_shape_factor: 1.5    # S-curve time stretch over the trapezoid
   # argument_time of every packet: ignored by the Omron firmware, but the pick executor's
@@ -72,7 +72,7 @@ robot:
     offset_deg: -62.0           # cup marker offset (deg). open-issues C4
     sign: 1                     # +1/-1 axis direction. open-issues C1
     home_tolerance_deg: 0.0     # 0 = strict "axis home at grip" check. open-issues G4
-    refresh_max_delta_deg: 15.0 # largest late heading refresh accepted before the pick (deg)
+    refresh_max_delta_deg: 5.0 # largest late heading refresh accepted before the pick (deg)
 
 # Conveyor belt and frame transforms (doc/basis-theory.md §1)
 conveyor:
@@ -88,7 +88,11 @@ conveyor:
   # calibration procedure.
   frame:
     theta_deg: 28.0             # rotation of the belt axis in the robot frame (deg)
-    robot_origin_uv: [287.0, 93.0]  # robot origin expressed in belt coordinates (mm)
+    robot_origin_uv: [287.0, 88.0]  # robot origin expressed in belt coordinates (mm)
+    # Added to robot_origin_uv before the frame is built (mm); the cup lands at -offset along
+    # (u, v) from where it would. Hand-set from the along-belt pick error (part - cup = +11 mm at
+    # gate_offset 0, 2026-10-05), not a measurement. open-issues C10
+    robot_origin_offset: [-17.0, 0.0]
   camera_window_uv: [0.0, 95.0, 0.0, 125.0]       # [u_min, u_max, v_min, v_max] seen by the camera (mm)
   workspace_window_uv: [200.0, 390.0, 0.0, 125.0]  # [u_min, u_max, v_min, v_max] the arm may pick in (mm)
 
@@ -158,15 +162,16 @@ pick_gate:
   pick_descent_time_s: 0.0      # extra gate lead for the vertical descent (s). open-issues T1
   # Fire the gate this much earlier (> 0) or later (< 0) along the belt (mm): an empirical
   # correction of late picks, not a measured latency. open-issues C10.
-  gate_offset_mm: 15.0
+  gate_offset_mm: 0.0
   late_abort_mm: 12.0           # abort (and re-queue) when the gate fires this late; <= 0 disables
+  gate_out_n: 3                 # drop a part after this many consecutive gate_late aborts; 0 disables
   # Arm-arrival tolerance, linear in belt speed from the floor (at speed.band.min_mm_s) to the
   # ceiling (at speed.band.max_mm_s). open-issues G6 (widened as a symptom treatment).
   arrival_tolerance_mm: 15.0
   arrival_tolerance_max_mm: 50.0
   arrival_timeout_margin_s: 1   # slack on the modelled flight time before a move counts as failed (s)
   oblique_descent_enabled: false  # belt-tracking slanted descent; false = vertical. open-issues C3
-  intercept_lead_time_s: 0.8    # minimum time from planning to predicted pick (s)
+  intercept_lead_time_s: 0.05    # minimum time from planning to predicted pick (s)
 
 # Realtime loop timing
 runtime:
@@ -182,6 +187,7 @@ runtime:
 # "kim" before 2026-09; kim is now Kise-Ibaraki-Mine's single-removal algorithm.
 scheduling:
   planner: drop_longest
+  stack_aware: false            # planners see which parts lie on which and pick the top one first (basis-theory.md §7.7)
   safety_margin_s: 0.1          # margin on every deadline (s)
   setup_time_s: 0.064           # per-pick executor overhead: bin arrival -> next goto send, back-to-back median of 88 cycles (2026-10-02)
   # What the speed laws assume about one pick cycle. open-issues G2, C7
@@ -192,8 +198,8 @@ scheduling:
     # The model sweep (python3 -m modules.tools.derive_rank_bounds) gives 1.909 / 3.458 at the far
     # corner u = 390, v = 0, never picked in those runs. With queue_depth_k = 1 and L = 190 mm:
     # v_max = 190 / (2.779 + 1.551) = 43.9 mm/s. open-issues C7
-    occupancy_worst_s: 2.4
-    grab_worst_s: 1.2
+    occupancy_worst_s: 2.1
+    grab_worst_s: 1.3
 
 # Which belt speed (modules/scheduling). `law` is any registered speed law (constant,
 # inverse_density, predictive_rank, ...); each law's own parameters sit under `laws`.
@@ -233,6 +239,7 @@ feeder:
   schedule_s: 3600.0            # arrivals drawn for this long when the run has no --duration (s)
   detection_latency_s: 0.011     # capture delay the virtual camera reports (s)
   position_noise_mm: 0.0        # Gaussian noise on each virtual detection (mm)
+  stacking: true                # a part landing on another covers it; a cup landing on a covered part fails
   kinds:
     periodic: {interval_s: 2.5, types: [QFP, TQFP], lanes: [20.0, 60.0, 100.0]}
     poisson: {rate_per_min: 24.0, types: [QFP, TQFP], lane_band_v: [15.0, 110.0]}

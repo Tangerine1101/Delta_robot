@@ -14,15 +14,18 @@ from modules.scheduling.types import Job, ObjectSnapshot, PlanContext, Point, Sc
 
 
 def make_job(obj: ObjectSnapshot, ctx: PlanContext, position: Point | None = None,
-             start: float | None = None) -> Job:
+             start: float | None = None, gone: frozenset[str] = frozenset()) -> Job:
     """Cost one part as if the arm left `position` (default: where it is) at `start`
     (default: now). Deadline and arrival come from the forecast at `ctx.now`, so they do not
-    depend on `start`."""
+    depend on `start`. `gone` names parts a caller walking into the future has already
+    picked, so they no longer lie on anything. A stack-aware context makes the parts still
+    lying on this one its blockers, and the job infeasible while any remain."""
     position = ctx.arm_position if position is None else position
     start = ctx.now if start is None else start
     u_min, u_max = ctx.workspace_window_uv[0], ctx.workspace_window_uv[1]
     deadline = ctx.now + ctx.forecast.time_to_travel(u_max - obj.u)
     arrival = ctx.now + ctx.forecast.time_to_travel(max(0.0, u_min - obj.u))
+    blockers = (obj.covered_by & ctx.on_belt) - gone if ctx.stack_aware else frozenset()
     intercept = ctx.predict(obj, position, start)
     processing = math.inf
     path_mm = math.inf
@@ -35,12 +38,13 @@ def make_job(obj: ObjectSnapshot, ctx: PlanContext, position: Point | None = Non
         release=obj.detected_at,
         deadline=deadline,
         processing=processing,
-        feasible=intercept is not None,
+        feasible=intercept is not None and not blockers,
         intercept=intercept,
         reachable_at=start,
         path_mm=path_mm,
         safety_margin_s=ctx.safety_margin_s,
         arrival=arrival,
+        blockers=blockers,
     )
 
 

@@ -39,6 +39,7 @@ class PlanningSnapshot:
     setpoint_mm_s: float
     arm_position: Point
     objects: tuple[ObjectSnapshot, ...]     # unclaimed parts of a known class
+    on_belt: frozenset[str] = frozenset()   # parts lying on one of `objects`, still on the belt
 
 
 class PickPlanner:
@@ -58,6 +59,8 @@ class PickPlanner:
         # Parts already attempted: vision re-emits the same id every frame while a part is
         # visible, so without this guard an attempted part would be re-created and re-picked.
         self.planned_object_ids: dict[str, float] = {}
+        # Consecutive gate_late aborts per part (pick_gate.gate_out_n).
+        self.gate_late_counts: dict[str, int] = {}
         self.metrics = SchedulerMetrics()
         self.ledger = ledger or PartLedger(time.monotonic(),
                                            grip_tolerance_mm=settings.runtime.grip_tolerance_mm)
@@ -76,7 +79,7 @@ class PickPlanner:
                 continue
             self.metrics.total_detections += 1
             self.ledger.seen(detection.object_id, detection.object_type, detection.timestamp,
-                             detection.x, detection.y)
+                             detection.x, detection.y, detection.covered_by)
             # Camera-latency compensation: anchor the part to the belt position AT the
             # frame's capture time, not at ingest; fall back to p_now without history.
             p_anchor = p_now
@@ -131,7 +134,10 @@ class PickPlanner:
                     continue
                 u_now, v_now = obj.current_uv(sample.position_mm)
                 objects.append(ObjectSnapshot(obj.object_id, obj.object_type, u_now, v_now,
-                                              bin_position, obj.last_seen_at))
+                                              bin_position, obj.last_seen_at, obj.covered_by))
+            on_belt = frozenset()
+            if self.settings.scheduling.stack_aware:
+                on_belt = self.ledger.blockers_on_belt(set().union(*(o.covered_by for o in objects)))
             return PlanningSnapshot(
                 taken_at=now,
                 belt_position_mm=sample.position_mm,
@@ -139,13 +145,15 @@ class PickPlanner:
                 setpoint_mm_s=setpoint_mm_s,
                 arm_position=self.current_position,
                 objects=tuple(objects),
+                on_belt=on_belt,
             )
 
     def context(self, snapshot: PlanningSnapshot, forecast: BeltForecast) -> PlanContext:
         scheduling = self.settings.scheduling
         return PlanContext(snapshot.taken_at, snapshot.arm_position, forecast, self.arm,
                            self.settings.conveyor.workspace_window_uv,
-                           scheduling.safety_margin_s, scheduling.setup_time_s)
+                           scheduling.safety_margin_s, scheduling.setup_time_s,
+                           scheduling.stack_aware, snapshot.on_belt)
 
     def schedule(self, snapshot: PlanningSnapshot, forecast: BeltForecast,
                  planner: BoundPlanner) -> tuple[list[ScheduledPick], int]:
@@ -204,6 +212,8 @@ class PickPlanner:
                 obj = find_tracked_object(self.tracker, object_id)
                 if obj is None:
                     continue
+                if settings.scheduling.stack_aware and self.ledger.is_covered(object_id):
+                    continue            # the part on top has not been picked (yet)
                 u_now, v_now = obj.current_uv(sample.position_mm)
                 if u_now > u_max:
                     self.metrics.skipped_outside_workspace += 1
@@ -249,7 +259,9 @@ class PickPlanner:
         if plan.debug_info.get("pick_dispatched"):
             self.ledger.pick_done(plan.object_id, time.monotonic(), success)
         else:
-            self.ledger.aborted(plan.object_id, plan.debug_info.get("abort_reason", "aborted"))
+            reason = plan.debug_info.get("abort_reason", "aborted")
+            self.ledger.aborted(plan.object_id, reason)
+            self._count_gate_late(plan.object_id, reason)
         if success or plan.debug_info.get("pick_dispatched"):
             self.planned_object_ids[plan.object_id] = time.monotonic()
             self.tracker.remove(plan.object_id)
@@ -263,6 +275,24 @@ class PickPlanner:
         else:
             goto_end = plan.trajectory_goto[-1]
             self.current_position = (goto_end.x, goto_end.y, goto_end.z)
+
+    def _count_gate_late(self, object_id: str, reason: str) -> None:
+        """A part whose gate keeps firing late is dropped after `pick_gate.gate_out_n` tries;
+        otherwise it heads the queue forever and starves every part behind it."""
+        if reason != "gate_late":
+            self.gate_late_counts.pop(object_id, None)
+            return
+        count = self.gate_late_counts.get(object_id, 0) + 1
+        self.gate_late_counts[object_id] = count
+        limit = self.settings.pick_gate.gate_out_n
+        if limit > 0 and count >= limit:
+            now = time.monotonic()
+            self.planned_object_ids[object_id] = now
+            self.tracker.remove(object_id)
+            self.ledger.gate_out(object_id, now)
+            self.gate_late_counts.pop(object_id, None)
+            print("[WARN]", json.dumps({"event": "gate_out", "object_id": object_id, "attempts": count},
+                                       ensure_ascii=True))
 
     def recent_detection_times(self) -> tuple[float, ...]:
         return tuple(self.first_seen.values())

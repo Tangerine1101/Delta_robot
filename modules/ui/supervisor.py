@@ -237,6 +237,7 @@ class Supervisor:
                 rates[kind] = params[field_name]
         return {
             "planner": s.scheduling.planner,
+            "stack_aware": s.scheduling.stack_aware,
             "speed_law": s.speed.law,
             "static_mm_s": s.speed.static_mm_s,
             "feeder_kind": s.feeder.kind,
@@ -254,6 +255,10 @@ class Supervisor:
         overrides: dict[str, Any] = {}
         if given("planner"):
             overrides["scheduling.planner"] = str(body["planner"])
+        if given("stack_aware"):
+            if not isinstance(body["stack_aware"], bool):
+                raise ValueError("stack_aware must be true or false")
+            overrides["scheduling.stack_aware"] = body["stack_aware"]
         if given("speed_law"):
             overrides["speed.law"] = str(body["speed_law"])
         if given("static_mm_s"):

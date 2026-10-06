@@ -21,7 +21,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-RUN_FIELDS = ("run", "scenario", "planner", "speed_law", "static_mm_s", "feed", "feeder_kind",
+RUN_FIELDS = ("run", "scenario", "planner", "stack_aware", "speed_law", "static_mm_s", "feed", "feeder_kind",
               "feeder_seed", "feeder_rate", "sim", "duration_s", "input", "picked", "miss_grip",
               "miss_late", "lost_track", "on_belt", "pick_rate", "input_per_min",
               "throughput_per_min", "mean_belt_mm_s", "median_error_mm", "miss_reasons")
@@ -89,7 +89,8 @@ def read_bins(directory: Path, min_bin_s: float) -> list[dict[str, Any]]:
 
 
 def label(row: dict[str, Any]) -> str:
-    return f"{row.get('planner')} / {row.get('speed_law')}"
+    aware = " (aware)" if row.get("stack_aware") else ""
+    return f"{row.get('planner')}{aware} / {row.get('speed_law')}"
 
 
 def plot(runs: list[dict[str, Any]], windows: list[dict[str, Any]], out: Path) -> Path | None:

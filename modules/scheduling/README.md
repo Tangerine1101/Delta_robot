@@ -35,7 +35,7 @@ built-in gate; see below.
 
 | Field | Meaning |
 |---|---|
-| `obj` | `ObjectSnapshot`: `object_id`, `object_type`, `u`, `v` (belt mm), `bin`, `detected_at` |
+| `obj` | `ObjectSnapshot`: `object_id`, `object_type`, `u`, `v` (belt mm), `bin`, `detected_at`, `covered_by` |
 | `release` | r_j — when the camera first saw it |
 | `arrival` | a_j — when it enters the workspace (now if already inside) |
 | `deadline` | d_j — when it leaves the workspace at the forecast belt speed |
@@ -43,7 +43,8 @@ built-in gate; see below.
 | `processing` | p_j — arm occupancy for this pick from where the arm is now (inf if unreachable) |
 | `path_mm` | arm → contact → bin path length |
 | `intercept` | where and when the cup would meet it (`pick_time`, `gate_fire_time`, ...) |
-| `feasible` | the arm can pick it at all from here |
+| `feasible` | the arm can pick it at all from here, and no part still lies on it |
+| `blockers` | ids of the parts lying on its centre that are still on the belt (empty unless `ctx.stack_aware`); a walking planner appends a job only after all of them (`jobs.extend` enforces it), and `precedence_order` pulls them forward |
 | `slack` | `deadline_safe − intercept.pick_time` |
 
 **`PlanContext`** (`ctx`) — `now`, `arm_position`, `forecast` (the belt), and three questions a

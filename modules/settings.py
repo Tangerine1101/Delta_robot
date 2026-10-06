@@ -147,6 +147,14 @@ class RobotSettings:
 class FrameSettings:
     theta_deg: float                      # rotation of the belt axis in the robot frame
     robot_origin_uv: tuple[float, float]  # robot origin in belt coordinates (mm)
+    # Empirical correction added to robot_origin_uv before the frame is built (mm): every
+    # commanded point moves by -offset in belt coordinates (open-issues C10).
+    robot_origin_offset: tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def effective_origin_uv(self) -> tuple[float, float]:
+        return (self.robot_origin_uv[0] + self.robot_origin_offset[0],
+                self.robot_origin_uv[1] + self.robot_origin_offset[1])
 
 
 @dataclass(frozen=True)
@@ -258,6 +266,9 @@ class PickGateSettings:
     # an empirical correction of the along-belt pick error (open-issues C10).
     gate_offset_mm: float = 0.0
     late_abort_mm: float = 12.0           # abort and re-queue a gate this late; <= 0 disables
+    # Drop a part from the queue (booked miss_late / gate_out) after this many consecutive
+    # gate_late aborts of its plans; 0 disables.
+    gate_out_n: int = 0
     # Arm-arrival tolerance, linear in belt speed between speed.band.min_mm_s and
     # speed.band.max_mm_s (open-issues G6). None = the floor everywhere.
     arrival_tolerance_mm: float = 5.0
@@ -294,6 +305,7 @@ class ArmCycleSettings:
 @dataclass(frozen=True)
 class SchedulingSettings:
     planner: str = "spt"                  # any registered dispatch rule or planner
+    stack_aware: bool = False             # planners see which parts lie on which (doc/basis-theory.md §7.7)
     safety_margin_s: float = 0.1          # margin on every deadline
     setup_time_s: float = 0.0             # executor overhead per pick beyond the motion model
     arm_cycle: ArmCycleSettings = ArmCycleSettings()
@@ -343,6 +355,7 @@ class FeederSettings:
     detection_period_s: float = 1.0 / 30.0  # the virtual camera's frame period
     detection_latency_s: float = 0.0      # capture-to-poll delay the virtual camera reports
     position_noise_mm: float = 0.0        # Gaussian noise on each virtual detection (u, v)
+    stacking: bool = True                 # a part landing on another covers it (the pick on the covered one fails)
     kinds: dict[str, dict[str, Any]] = field(default_factory=dict)   # feeder.kinds.<kind>
 
 

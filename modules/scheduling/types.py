@@ -32,6 +32,7 @@ class ObjectSnapshot:
     v: float
     bin: Point                      # drop position of its class
     detected_at: float              # when the camera first saw it (release time r_j)
+    covered_by: frozenset[str] = frozenset()   # parts lying on its centre (doc/basis-theory.md §7.7)
 
 
 @dataclass
@@ -52,8 +53,9 @@ class Job:
     path_mm: float = math.inf       # arm -> contact -> bin path length
     safety_margin_s: float = 0.0
     arrival: float = 0.0            # a_j — when it enters the workspace (now if already inside)
-    # Parts lying on this one's pick point. The vision has no stacking information, so this
-    # is always empty; kept so stacking-aware planners port unchanged.
+    # Parts still lying on this one's pick point: they must leave the belt first, so a
+    # nonempty set makes the job infeasible now while a planner may sequence it after them.
+    # Empty unless the context is stack-aware.
     blockers: frozenset[str] = frozenset()
 
     @property
@@ -93,6 +95,8 @@ class PlanContext:
     workspace_window_uv: tuple[float, float, float, float]
     safety_margin_s: float = 0.0
     setup_s: float = 0.0
+    stack_aware: bool = False       # jobs carry blockers (scheduling.stack_aware)
+    on_belt: frozenset[str] = frozenset()   # ids of parts still physically on the belt
 
     def predict(self, obj: ObjectSnapshot, position: Point, start: float) -> Intercept | None:
         """Intercept of `obj` if the arm leaves `position` at `start`."""

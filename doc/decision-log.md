@@ -234,6 +234,41 @@ exactly).
 
 ## 3. Repository restructuring
 
+### 2026-10-06 — stack-aware planning, `covered` misses, log plot tools
+
+The research repo's stacking treatment (`../python for scheduling`: `Job.blockers`,
+`precedence_order`, blocker-aware walks) had been ported to the planners but nothing fed
+`blockers`.
+
+* `scheduling.stack_aware` (default `false`, tick on the console's start form) makes
+  `jobs.make_job` fill `blockers = covered_by ∩ on_belt − gone`; rollouts pass `gone`, the loop's
+  `commit` skips an entry whose coverer is still on the belt. Defaults change nothing for the
+  sandbox and the existing tests.
+* `covered_by` is recorded either way; a contact on a covered part books `miss_grip / covered`
+  (new `covered_by` column in `parts.csv`, `stack_aware` in `summary.json`), so aware and blind
+  runs are comparable. `on_belt` comes from the part ledger, so a failed or gated-out part keeps
+  blocking.
+* The source is `simulate_feeder` (`feeder.stacking`, default on): the later drop covers every
+  visible part whose centre its footprint (`core/footprint.py`) contains. Virtual runs before this
+  date had overlapping parts that never interfered; they are not comparable with later ones.
+* New `log_timeline` / `log_compare` tools; `flow_report` labels aware runs.
+
+### 2026-10-05 — gate offset becomes an origin offset; `gate_out_n`
+
+Log `20261005-114134_console` run02 (`simulate_feeder`, `predictive_rank`): from t ≈ 115 s one
+part (`vf0044`) was planned 29 times and aborted `gate_late` each time, starving 29 parts behind it.
+`predictive_rank` had cut the belt to 5–10 mm/s; `pick_gate.gate_offset_mm = 17` is a fixed
+distance, so it moves the gate by 17 / v seconds (1.7 s at 10 mm/s, 3.4 s at 5), while the planner
+(`core/delta.py`, `gate_lead_s` only) never saw it: the shifted threshold was already behind the
+part when the plan was made and `late_mm` read 15–17 mm in all 56 aborts.
+
+* The offset is a constant spatial correction (582 picks, 2026-10-02/05: error + offset ≈ 10–12 mm
+  at 25–60 mm/s, slope ≈ 0.05 s). It now lives in `conveyor.frame.robot_origin_offset = [-11, 0]`,
+  added to `robot_origin_uv`, so planner, gate and workspace test share one frame;
+  `pick_gate.gate_offset_mm` is 0 (the mechanism stays available).
+* `pick_gate.gate_out_n = 3`: a part whose plans abort `gate_late` that many times in a row is
+  dropped from the tracker and booked `miss_late` / `gate_out`.
+
 ### 2026-07-11 — post-thesis cleanup
 
 * Documentation consolidated into a fixed file standard under `doc/`.
@@ -461,7 +496,8 @@ real arm.
   * The tie rule follows the sandbox **code** (an equal score at a faster speed replaces the
     current setpoint), not its docstring (which says only a strict improvement does); the
     experiment results were produced by the code.
-  * No stacking precedence: the robot's vision reports no occlusion, so `blockers` is empty.
+  * No stacking precedence at this point: the robot's vision reports no occlusion, so `blockers`
+    was empty (superseded 2026-10-06, §3 below).
   * Planning runs on a snapshot outside `state_lock`, and the chosen entry is re-validated
     under the lock, because the sandbox's instantaneous decisions take real time here.
 * First PLC-simulator check (`investigation/sim_plugin_matrix`, 90 s, one seed each, every

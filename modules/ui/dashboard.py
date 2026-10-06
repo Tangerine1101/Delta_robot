@@ -84,6 +84,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   input, select { font:inherit; background:#11141a; color:var(--text); border:1px solid #394150; border-radius:6px;
                   padding:6px 8px; min-width:0; }
   input[type=number] { width:88px; }
+  input[type=checkbox] { width:20px; height:20px; padding:0; margin:4px 0 0; }
   button.b { font:inherit; padding:7px 12px; border-radius:6px; border:1px solid #3d5170; background:#2d3a4d;
              color:#e3eeff; cursor:pointer; min-width:44px; }
   button.b:hover { background:#34465e; } button.b.pri { background:#1f6f43; border-color:#2dc653; }
@@ -214,6 +215,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="row">
         <label class="f">planner<select id="plsel" class="runopt" onchange="showDocs()"></select></label>
+        <label class="f">stack-aware<input id="stackaware" type="checkbox" class="runopt" title="planners pick the part on top of a stack first"></label>
         <label class="f">speed law<select id="lawsel" class="runopt" onchange="showDocs()"></select></label>
         <label class="f">constant speed (mm/s)<input id="staticv" type="number" step="5" min="0" class="runopt"></label>
       </div>
@@ -423,7 +425,7 @@ function fillRunForm(d){
   $("plsel").innerHTML=(pl.planners||[]).map(p=>`<option value="${esc(p.name)}">${esc(p.name)} (${esc(p.kind)})</option>`).join("");
   $("lawsel").innerHTML=(pl.speed_laws||[]).map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
   $("fdkind").innerHTML=(d.feeders||[]).map(k=>`<option>${esc(k)}</option>`).join("");
-  $("plsel").value=rd.planner; $("lawsel").value=rd.speed_law; $("staticv").value=rd.static_mm_s;
+  $("plsel").value=rd.planner; $("stackaware").checked=!!rd.stack_aware; $("lawsel").value=rd.speed_law; $("staticv").value=rd.static_mm_s;
   $("fdkind").value=rd.feeder_kind; $("fdseed").value=rd.feeder_seed; $("fdmax").value=rd.feeder_max_parts;
   $("plsel").dataset.done="1";
   feedKindChanged(); scnChanged(); showDocs();
@@ -456,6 +458,7 @@ function runSettings(){
     if(String(v)!==String(def)) out[key]=v;
   };
   put("planner", $("plsel").value, rd.planner);
+  if($("stackaware").checked !== !!rd.stack_aware) out.stack_aware = $("stackaware").checked;
   put("speed_law", $("lawsel").value, rd.speed_law);
   put("static_mm_s", $("staticv").value, rd.static_mm_s, true);
   if((sup.scenario_feeds||{})[$("scnsel").value]==="virtual"){

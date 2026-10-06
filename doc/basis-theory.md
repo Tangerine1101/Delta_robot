@@ -53,7 +53,11 @@ $$
 
 * $\theta$: angle between the belt flow axis ($+u$) and the robot axes
   (`conveyor.frame.theta_deg`).
-* $(T_X, T_Y)$: translation of the conveyor origin (`conveyor.frame.robot_origin_uv`).
+* $(T_X, T_Y)$: translation of the conveyor origin (`conveyor.frame.robot_origin_uv` plus
+  `conveyor.frame.robot_origin_offset`, an empirical correction of the along-belt pick error). With
+  the configured origin $O_\text{cfg} = O_\text{true} + \delta$ the cup lands at belt point
+  $c - \delta$ for a commanded belt point $c$; the planner, the gate and the workspace test all see the
+  shifted frame, so the correction is consistent in time at every belt speed.
 
 Implementation: `ConveyorFrame` in `modules/core/frames.py`; calibration procedure via the
 `test_vision_only` scenario (see `basis-programming.md`).
@@ -665,6 +669,29 @@ $N$ the unclaimed parts in view:
   that separates feedback from mere speed variation.
 
 ---
+
+### 7.7. Stacked parts
+
+A part dropped on the belt lands on every earlier part its footprint touches. The later drop is
+upstream of the earlier one, so its deadline is later, and belt order would try the covered part
+first — a pick that lands on a part with another across its centre fails. With
+`scheduling.stack_aware` a job's blockers are
+
+$$B_j = \text{covered\_by}(j) \cap \text{OnBelt} \setminus \text{Gone},$$
+
+the parts lying on $j$'s centre that are still on the belt (not picked; a failed or abandoned
+part stays), minus those a planner walking forward has already picked. A job with $B_j \neq
+\emptyset$ is infeasible now: dispatch rules and rollouts never choose it, `precedence_order`
+pulls each blocker forward to just before the part it covers, and the walk planners cost a job
+at infinity unless all of $B_j$ is earlier in the sequence. A blocker that is not a job (hidden
+from the camera, dropped after repeated `gate_late`) keeps the part under it blocked until it
+runs off. Without the flag $B_j = \emptyset$ and the planners are unchanged.
+
+`covered_by` is always recorded, aware or not: a cup landing on a covered part books
+`miss_grip / covered` in the part record, so the two settings are comparable on one input. It
+comes from the detection (`ObjectDetection.covered_by`): the virtual feed (`simulate_feeder`,
+`feeder.stacking`) knows the drop order and takes each board's width axis along its heading
+(`core/footprint.py`); the real camera reports none (open-issues S1).
 
 ## 8. Concurrency Model (summary)
 

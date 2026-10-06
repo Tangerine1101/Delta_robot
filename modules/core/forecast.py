@@ -3,7 +3,7 @@
 A speed law has to ask "if I commanded V, where would each object be at time t?" about
 speeds the belt is not running at, so the prediction is a value rather than a query on the
 live belt. The assumption — the setpoint then holds — is made true by the speed controller,
-which never moves the setpoint between goto dispatch and cup contact (doc/basis-theory.md §7.4,
+which never moves the setpoint between goto dispatch and cup contact (doc/basis-theory.md §7.7,
 open-issues L9).
 
 The drive ramps linearly at `accel_mm_s2` (the Omron belt servo and the PLC simulator both use a

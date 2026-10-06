@@ -6,8 +6,8 @@ outcome and a reason:
 | outcome      | meaning                                       | reasons |
 |--------------|-----------------------------------------------|---------|
 | `picked`     | the cup came down on the part                 | `gripped`; `unverified` (contact not seen by the pose poll) |
-| `miss_grip`  | a pick was dispatched but the part was not taken | `cup_off_part` (contact error > `runtime.grip_tolerance_mm`); `pick_motion_failed` (no contact) |
-| `miss_late`  | the part left the workspace never dispatched  | `never_planned`; the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing` |
+| `miss_grip`  | a pick was dispatched but the part was not taken | `cup_off_part` (contact error > `runtime.grip_tolerance_mm`); `covered` (another part still lay on its centre at contact); `pick_motion_failed` (no contact) |
+| `miss_late`  | the part left the workspace never dispatched  | `never_planned`; the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing`; `gate_out` (dropped after `pick_gate.gate_out_n` consecutive `gate_late`) |
 | `lost_track` | the track died inside the camera view         | `stale_in_camera` |
 | `on_belt`    | still on the belt when the run ended          | `run_ended` |
 
@@ -57,6 +57,7 @@ class PartRecord:
     outcome: str | None = None
     reason: str | None = None
     t_closed: float | None = None
+    covered_by: str = ""             # ids of the parts that lay on its centre, ";"-joined
 
     @property
     def error_mm(self) -> float | None:
@@ -83,6 +84,7 @@ class PartLedger:
         self.on_close = on_close
         self._lock = threading.Lock()
         self._records: dict[str, PartRecord] = {}
+        self._coverers: dict[str, frozenset[str]] = {}     # part id -> parts lying on its centre
         self._belt: list[tuple[float, float, int]] = []    # (run time, belt mm/s, density)
         self.t_end: float | None = None
 
@@ -90,14 +92,22 @@ class PartLedger:
         return round(now - self.start_time, 4)
 
     # ---- bookings ---------------------------------------------------------------------
-    def seen(self, part_id: str, part_type: str, now: float, u: float, v: float) -> None:
+    def seen(self, part_id: str, part_type: str, now: float, u: float, v: float,
+             covered_by: tuple[str, ...] = ()) -> None:
         """Any sighting; opens the record on the first. A track that went stale in camera
-        view and is seen again is reopened (the part never left)."""
+        view and is seen again is reopened (the part never left). `covered_by` names the
+        parts lying on this one's centre."""
         with self._lock:
+            if covered_by:
+                coverers = self._coverers.get(part_id, frozenset()) | frozenset(covered_by)
+                self._coverers[part_id] = coverers
             record = self._records.get(part_id)
+            if record is not None and covered_by:
+                record.covered_by = ";".join(sorted(self._coverers[part_id]))
             if record is None:
-                self._records[part_id] = PartRecord(part_id, part_type, self.source, self._t(now),
-                                                    round(u, 2), round(v, 2))
+                self._records[part_id] = PartRecord(
+                    part_id, part_type, self.source, self._t(now), round(u, 2), round(v, 2),
+                    covered_by=";".join(sorted(self._coverers.get(part_id, ()))))
             elif record.outcome == LOST_TRACK:
                 record.outcome = record.reason = record.t_closed = None
 
@@ -135,7 +145,9 @@ class PartLedger:
             record.belt_mm_s_at_contact = round(belt_mm_s, 2)
             if error_uv is not None:
                 record.error_u_mm, record.error_v_mm = round(error_uv[0], 2), round(error_uv[1], 2)
-            if observed and error_uv is not None:
+            if self._covered(part_id):
+                closed = self._close(record, now, MISS_GRIP, "covered")
+            elif observed and error_uv is not None:
                 gripped = record.error_mm <= self.grip_tolerance_mm
                 closed = self._close(record, now, PICKED if gripped else MISS_GRIP,
                                      "gripped" if gripped else "cup_off_part")
@@ -167,6 +179,15 @@ class PartLedger:
                 closed = self._close(record, now, LOST_TRACK, "stale_in_camera")
         self._notify(closed)
 
+    def gate_out(self, part_id: str, now: float) -> None:
+        """The part was dropped from the queue after repeated gate_late aborts."""
+        with self._lock:
+            record = self._records.get(part_id)
+            if record is None or record.outcome is not None or record.t_dispatch is not None:
+                return
+            closed = self._close(record, now, MISS_LATE, "gate_out")
+        self._notify(closed)
+
     def belt_sample(self, now: float, speed_mm_s: float, density: int) -> None:
         with self._lock:
             self._belt.append((self._t(now), round(speed_mm_s, 2), density))
@@ -191,6 +212,26 @@ class PartLedger:
             self.on_close(closed)
 
     # ---- views ------------------------------------------------------------------------
+    def _covered(self, part_id: str) -> bool:
+        """Is any part that lay on this one's centre still on the belt? A part is off the belt
+        once it was picked; one that failed, was dropped from the queue or was never recorded
+        (hidden from the camera) still lies there."""
+        for other in self._coverers.get(part_id, ()):
+            record = self._records.get(other)
+            if record is None or record.outcome != PICKED:
+                return True
+        return False
+
+    def is_covered(self, part_id: str) -> bool:
+        with self._lock:
+            return self._covered(part_id)
+
+    def blockers_on_belt(self, part_ids: "set[str] | frozenset[str]") -> frozenset[str]:
+        """Of `part_ids`, the parts still on the belt (not yet picked)."""
+        with self._lock:
+            return frozenset(pid for pid in part_ids
+                             if (r := self._records.get(pid)) is None or r.outcome != PICKED)
+
     def is_held(self, part_id: str) -> bool:
         with self._lock:
             record = self._records.get(part_id)

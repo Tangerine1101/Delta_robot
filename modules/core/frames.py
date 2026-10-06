@@ -97,7 +97,7 @@ class ConveyorFrame:
     @classmethod
     def from_settings(cls, conveyor) -> "ConveyorFrame":
         """Build from `Settings.conveyor`."""
-        return cls(conveyor.frame.theta_deg, conveyor.frame.robot_origin_uv)
+        return cls(conveyor.frame.theta_deg, conveyor.frame.effective_origin_uv)
 
     def vision_heading_to_robot_rad(self, vision_heading_deg: float) -> float:
         """Vision marker heading (image-pixel degrees) -> R-frame heading (radians).
