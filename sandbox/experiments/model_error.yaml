@@ -1,0 +1,12 @@
+# What a wrong dispatch-delay estimate costs: the plant's real delay differs from the model's
+# (open-issues C2). The model keeps pick_gate.robot_movement_delay_s = 0.17 s.
+description: cost of a wrong robot_movement_delay_s estimate, belt 60 and 120 mm/s
+base:
+  sim.duration_s: 600
+  scheduling.planner: kim
+  speed.law: constant
+seeds: [1, 2, 3, 4]
+grid:
+  speed.static_mm_s: [60, 120]
+  arm.plant: [{}, {pick_gate.robot_movement_delay_s: 0.12}, {pick_gate.robot_movement_delay_s: 0.22},
+              {pick_gate.robot_movement_delay_s: 0.27}]

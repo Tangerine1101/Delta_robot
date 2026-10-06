@@ -1,0 +1,24 @@
+# Every speed law with the KIM planner, bursty arrivals, the admissible band opened to
+# L / g (queue_depth_k = 0) so the laws have room to act.
+description: speed laws under bursty load, KIM planner
+base:
+  sim.duration_s: 600
+  scheduling.planner: kim
+  scheduling.arm_cycle.cycle_s: 2.0
+  speed.static_mm_s: 30
+  feeder.kind: bursty
+  feeder.bursty: {mean_rate_per_min: 24}
+  speed.laws.predictive_rank.queue_depth_k: 0
+  speed.laws.inverse_density: {headroom: 0.75, transit_min_s: 2.0}
+seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+cases:
+  - {name: constant_30, set: {speed.law: constant, speed.static_mm_s: 30}}
+  - {name: constant_60, set: {speed.law: constant, speed.static_mm_s: 60}}
+  - {name: constant_90, set: {speed.law: constant, speed.static_mm_s: 90}}
+  - {name: inverse_density, set: {speed.law: inverse_density}}
+  - {name: predictive_rank, set: {speed.law: predictive_rank}}
+  - {name: predictive_rank_hysteresis, set: {speed.law: predictive_rank_hysteresis}}
+  - {name: bound_only, set: {speed.law: bound_only, speed.laws.bound_only: {queue_depth_k: 0}}}
+  - {name: backlog_patience, set: {speed.law: backlog_patience}}
+  - {name: min_slack, set: {speed.law: min_slack}}
+  - {name: periodic_two_speed, set: {speed.law: periodic_two_speed}}
