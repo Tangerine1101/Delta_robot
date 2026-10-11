@@ -13,6 +13,7 @@ feeder has no single rate (periodic: `interval_s`, script: explicit times).
 
 from __future__ import annotations
 
+import csv
 import math
 import random
 from dataclasses import dataclass, field
@@ -56,12 +57,22 @@ def build_events(kind: str, params: dict, rng: random.Random, duration_s: float)
 @dataclass(frozen=True)
 class ScriptConfig:
     events: tuple[tuple[float, str, float], ...] = ()   # (time_s, type, v_mm)
+    arrivals_csv: str = ""          # replay the `arrivals.csv` of a run (adds the headings)
 
 
 @feeder("script", ScriptConfig)
 def script(cfg: ScriptConfig, rng: random.Random, duration_s: float) -> list[SpawnEvent]:
-    """Exactly the listed events."""
-    return [SpawnEvent(t, kind, v, 0.0, "script") for t, kind, v in cfg.events if t < duration_s]
+    """Exactly the listed events, and the rows of `arrivals_csv` (a logged run replayed)."""
+    events = [SpawnEvent(t, kind, v, 0.0, "script") for t, kind, v in cfg.events if t < duration_s]
+    if cfg.arrivals_csv:
+        with open(cfg.arrivals_csv, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                t = float(row["t_s"])
+                if t < duration_s:
+                    events.append(SpawnEvent(t, row["type"], float(row["v_mm"]),
+                                             float(row.get("heading_deg") or 0.0), row.get("regime") or "script"))
+        events.sort(key=lambda e: e.time_s)
+    return events
 
 
 @dataclass(frozen=True)

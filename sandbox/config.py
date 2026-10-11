@@ -38,6 +38,12 @@ class SimConfig:
     capture_tolerance_mm: float = 12.7   # contact within this of the part centre grips it
     lost_margin_mm: float = 30.0    # a part this far past u_max is off the belt
     stall_timeout_s: float = 10.0   # gate wait before the pick is aborted
+    stacking: bool = False          # a part landing on another covers it (feeder.stacking of the robot)
+    carry_scale: float = 1.0        # what-if: scales the plant's time from gate fire to arm free (1 = the model's)
+    goto_extra_s: float | None = None   # plant: goto flight = trajectory time + this (None: + the model's command delay)
+    pick_extra_s: float | None = None   # plant: pick dispatch -> arm free = trajectory time + this (None: same)
+    gate_cover_abort: bool = False  # what-if: abort a pick whose target was covered while the arm waited (re-plan)
+    long_wait_s: float = 3.0        # a commit whose contact is this far away counts as a long wait
 
 
 @dataclass(frozen=True)

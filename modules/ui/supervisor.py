@@ -19,6 +19,7 @@ feeder's kind, seed, rate and part count); they apply to that run only, through
 from __future__ import annotations
 
 import math
+import shutil
 import threading
 import time
 import traceback
@@ -29,13 +30,15 @@ from typing import Any, Callable
 
 from modules.comm.packets import COMMAND_ID, RobotPacket, change_speed_packet
 from modules.config_io import CONFIG_PATH, read_config, write_config
+from modules.runlog import safe_name
 from modules.core.feeders import FEEDERS, RATE_FIELDS
 from modules.core.frames import ConveyorFrame
 from modules.core.kinematics import calc_inverse_kinematics
 from modules.runtime.cell_view import arm_geometry, layout
 from modules.runtime.scenarios import SCENARIOS, run_scenario
 from modules.scheduling.registry import catalogue, validate_plugin_config
-from modules.settings import Settings, with_overrides
+from modules.settings import Settings, settings_from_dict, with_overrides
+from modules.ui import config_editor
 
 IDLE, MANUAL, RUNNING, STOPPING = "idle", "manual", "running", "stopping"
 JOG_MAX_MM = 20.0
@@ -61,6 +64,7 @@ class Supervisor:
         sim_camera: Any = None,
         record_root: Path | None = None,
         config_path: Path = CONFIG_PATH,
+        overrides: dict[str, Any] | None = None,
     ) -> None:
         self._dispatch_raw = dispatch
         self._status_raw = request_status
@@ -73,30 +77,21 @@ class Supervisor:
         self.sim = sim
         self.sim_camera = sim_camera
         self.record_root = record_root
-        self.frame = ConveyorFrame.from_settings(settings.conveyor)
         self.plugins = catalogue()
         self.run_count = 0
         self.run_settings: dict[str, Any] = {}
 
-        self.workspace = settings.robot.limits
-        self.limits = {
-            "z_min": self.workspace.z_min_mm,
-            "z_max": self.workspace.z_max_mm,
-            "r_max": self.workspace.radius_xy_mm,
-            "belt_max": settings.conveyor.hw_max_mm_s,
-            "jog_max": JOG_MAX_MM,
-        }
-        clearance = settings.robot.heights.clearance
-        self.presets: dict[str, tuple[float, float, float]] = {"home": settings.robot.home_position}
-        for name, spec in settings.object_types.items():
-            self.presets[f"bin {name}"] = (spec.bin[0], spec.bin[1], clearance)
         # Teach points live in config.yaml (interface.teach_points) so they survive restarts.
         self.config_path = Path(config_path)
-        self.teach_points: dict[str, tuple[float, float, float]] = dict(settings.interface.teach_points)
-        self._teach_lock = threading.Lock()
+        self._teach_lock = threading.Lock()        # every write of the config file
+        # `--set` overrides of the console's command line stay on top of every reload.
+        self.overrides = dict(overrides or {})
+        self.boot_settings = settings
+        self._adopt(settings)
 
         self.mode = IDLE
         self.scenario: str | None = None
+        self.run_name = ""
         self.run_started: float | None = None
         self.run_plans = 0
         self._run_thread: threading.Thread | None = None
@@ -208,6 +203,7 @@ class Supervisor:
         return {
             "mode": self.mode,
             "scenario": self.scenario,
+            "run_name": self.run_name,
             "elapsed_s": round(time.monotonic() - self.run_started, 1) if self.run_started else None,
             "plans": self.run_plans,
             "sim": self.sim is not None,
@@ -225,6 +221,7 @@ class Supervisor:
             "feeders": sorted(FEEDERS),
             "run_defaults": self.run_defaults(),
             "run_settings": self.run_settings,
+            "config_stale": config_editor.is_stale(self.config_path, self.loaded_mtime),
         }
 
     def run_defaults(self) -> dict[str, Any]:
@@ -282,6 +279,33 @@ class Supervisor:
             overrides[f"feeder.kinds.{kind}.{field_name}"] = rate
         return overrides
 
+    def _adopt(self, settings: Settings) -> None:
+        """Make `settings` the running configuration: what the console derives from it (frame,
+        limits, presets, teach points) and the base of every later run. The PLC link was built
+        from the first settings and keeps them (config_editor.RESTART_PREFIXES)."""
+        self.settings = settings
+        self.frame = ConveyorFrame.from_settings(settings.conveyor)
+        self.workspace = settings.robot.limits
+        self.limits = {
+            "z_min": self.workspace.z_min_mm,
+            "z_max": self.workspace.z_max_mm,
+            "r_max": self.workspace.radius_xy_mm,
+            "belt_max": settings.conveyor.hw_max_mm_s,
+            "jog_max": JOG_MAX_MM,
+        }
+        clearance = settings.robot.heights.clearance
+        self.presets: dict[str, tuple[float, float, float]] = {"home": settings.robot.home_position}
+        for name, spec in settings.object_types.items():
+            self.presets[f"bin {name}"] = (spec.bin[0], spec.bin[1], clearance)
+        self.teach_points: dict[str, tuple[float, float, float]] = dict(settings.interface.teach_points)
+        self.loaded_mtime = self._config_mtime()
+
+    def _config_mtime(self) -> float | None:
+        try:
+            return self.config_path.stat().st_mtime
+        except OSError:
+            return None
+
     def _log(self, level: str, text: str) -> None:
         entry = {"t": time.time(), "level": level, "text": text}
         self.log.append(entry)
@@ -293,6 +317,9 @@ class Supervisor:
         routes: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
             ("GET", "/api/state"): lambda b: self.state(),
             ("GET", "/api/log"): lambda b: {"log": list(self.log)},
+            ("GET", "/api/config"): self._api_config,
+            ("POST", "/api/config/save"): self._api_config_save,
+            ("POST", "/api/config/reload"): self._api_config_reload,
             ("POST", "/api/manual/goto"): self._api_goto,
             ("POST", "/api/manual/jog"): self._api_jog,
             ("POST", "/api/manual/preset"): self._api_preset,
@@ -319,6 +346,61 @@ class Supervisor:
         except Exception as exc:
             self._log("error", f"{path} failed: {exc}")
             return 500, {"ok": False, "error": str(exc)}
+
+    # -- configuration
+    def _api_config(self, body: dict[str, Any]) -> dict[str, Any]:
+        return config_editor.snapshot(self.config_path, self.settings, self.overrides,
+                                      self.loaded_mtime, self.boot_settings)
+
+    def _reload(self) -> dict[str, Any]:
+        """Read the file and make it the running configuration. The caller holds `_lock` and has
+        checked the console is idle; a file that does not load leaves everything as it was."""
+        fresh = settings_from_dict(read_config(self.config_path))
+        settings = with_overrides(fresh, self.overrides) if self.overrides else fresh
+        validate_plugin_config(settings)
+        before = config_editor.flatten(self.settings)
+        self._adopt(settings)
+        changed = config_editor.differing(before, config_editor.flatten(settings))
+        self.emit("layout", {**layout(self.settings, self.frame), "run": None})
+        self.emit("sup", self.state())
+        restart = [k for k in config_editor.differing(config_editor.flatten(self.boot_settings),
+                                                      config_editor.flatten(settings))
+                   if config_editor.needs_restart(k)]
+        masked = sorted(k for k in changed if k in self.overrides)
+        return {"changed": changed, "restart_needed": restart, "masked": masked}
+
+    def _api_config_reload(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self.mode != IDLE:
+                raise Busy(f"console is {self.mode}: a run keeps the settings it started with; "
+                           "stop it, then reload")
+            result = self._reload()
+        self._log("info", f"config reloaded from {self.config_path.name}: "
+                  + (f"{len(result['changed'])} setting(s) changed" if result["changed"] else "no change"))
+        return result
+
+    def _api_config_save(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Write the edits ({dotted key: value}) to config.yaml — checked with the strict loader
+        first, comments kept, the previous file kept as `<name>.bak` — and, with `apply`, make
+        them the running configuration."""
+        changes = body.get("changes")
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("nothing to save")
+        apply = bool(body.get("apply", True))
+        with self._lock:
+            if apply and self.mode != IDLE:
+                raise Busy(f"console is {self.mode}: save without applying, or stop the run first")
+            with self._teach_lock:
+                candidate = config_editor.apply_changes(read_config(self.config_path), changes)
+                checked = settings_from_dict(candidate)       # SettingsError (a ValueError) names the key
+                validate_plugin_config(with_overrides(checked, self.overrides) if self.overrides else checked)
+                shutil.copy2(self.config_path, self.config_path.with_name(self.config_path.name + ".bak"))
+                write_config(candidate, self.config_path)
+            result = self._reload() if apply else {"changed": [], "restart_needed": [], "masked": []}
+        described = ", ".join(f"{k}={v}" for k, v in changes.items())
+        self._log("info", f"config saved{' and applied' if apply else ''}: {described}")
+        self.emit("sup", self.state())
+        return {"saved": sorted(changes), "applied": apply, **result}
 
     # -- manual
     def _manual(self, label: str, action: Callable[[], dict[str, Any]], *, need_idle_arm: bool = True
@@ -428,10 +510,13 @@ class Supervisor:
         return {}
 
     def _write_teach_points(self, points: dict[str, tuple[float, float, float]]) -> None:
+        was_stale = config_editor.is_stale(self.config_path, self.loaded_mtime)
         raw = read_config(self.config_path)
         raw.setdefault("interface", {})["teach_points"] = {k: list(v) for k, v in points.items()}
         write_config(raw, self.config_path)
         self.teach_points = points
+        if not was_stale:        # our own write is not "the file changed on disk"
+            self.loaded_mtime = self._config_mtime()
 
     def _api_pump(self, body: dict[str, Any]) -> dict[str, Any]:
         on = 1 if bool(body.get("on")) else 0
@@ -494,6 +579,9 @@ class Supervisor:
             raise ValueError(f"unknown scenario '{name}'")
         duration = body.get("duration")
         duration_s = float(duration) if duration not in (None, "", 0, "0") else None
+        run_name = safe_name(body.get("run_name"))
+        if str(body.get("run_name") or "").strip() and not run_name:
+            raise ValueError("run name needs at least one letter or digit")
         overrides = self.run_overrides(body.get("settings") or {})
         run_settings = with_overrides(self.settings, overrides) if overrides else self.settings
         validate_plugin_config(run_settings)
@@ -508,23 +596,25 @@ class Supervisor:
                 raise Busy(f"arm not ready: {why}")
             self.mode = RUNNING
             self.scenario = name
+            self.run_name = run_name
             self.run_started = time.monotonic()
             self.run_plans = 0
             self.run_count += 1
             self.run_settings = overrides
             self._stop_event = threading.Event()
             self._run_thread = threading.Thread(
-                target=self._run, args=(name, duration_s, self._stop_event, run_settings, overrides),
+                target=self._run, args=(name, duration_s, self._stop_event, run_settings, overrides, run_name),
                 name=f"scenario-{name}", daemon=True)
             self._run_thread.start()
         described = ", ".join(f"{k}={v}" for k, v in overrides.items())
-        self._log("info", f"scenario '{name}' started" + (f" for {duration_s:.0f}s" if duration_s else "")
+        self._log("info", f"scenario '{name}'" + (f" ('{run_name}')" if run_name else "") + " started"
+                  + (f" for {duration_s:.0f}s" if duration_s else "")
                   + (f" ({described})" if described else ""))
         self.emit("sup", self.state())
         return {"scenario": name}
 
     def _run(self, name: str, duration_s: float | None, stop_event: threading.Event,
-             settings: Settings, overrides: dict[str, Any]) -> None:
+             settings: Settings, overrides: dict[str, Any], run_name: str = "") -> None:
         virtual = SCENARIOS[name].feed == "virtual"
         paused_feeder = None
         if virtual and self.sim is not None:
@@ -534,7 +624,8 @@ class Supervisor:
         record_dir = None
         if self.record_root is not None:
             stamp = datetime.now().strftime("%H%M%S")
-            record_dir = self.record_root / f"run{self.run_count:02d}_{stamp}_{name}"
+            label = f"{run_name}_" if run_name else ""
+            record_dir = self.record_root / f"run{self.run_count:02d}_{stamp}_{label}{name}"
         try:
             def sink(kind: str, payload: dict[str, Any]) -> None:
                 if kind == "plan":
@@ -546,7 +637,8 @@ class Supervisor:
                 duration_s=duration_s, event_sink=sink, frame_register=self.attach_camera,
                 disable_native_window=True, image_source=None if virtual else self.sim_camera,
                 stop_event=stop_event, record_dir=record_dir,
-                record_meta={"sim": self.sim is not None, "overrides": overrides, "console_run": self.run_count},
+                record_meta={"sim": self.sim is not None, "overrides": overrides, "console_run": self.run_count,
+                             "run_name": run_name or None},
             )
             self._log("info", f"scenario '{name}' ended ({self.run_plans} plans)"
                       + (f"; record in {record_dir}" if record_dir is not None else ""))
@@ -567,6 +659,7 @@ class Supervisor:
             with self._lock:
                 self.mode = IDLE
                 self.scenario = None
+                self.run_name = ""
                 self.run_started = None
             self.emit("sup", self.state())
 

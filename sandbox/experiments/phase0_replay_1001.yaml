@@ -1,0 +1,23 @@
+# Phase 0, second set — out-of-sample replay. Four cell runs of the 2026-10-10 session
+# `log/20261010-163210_exp_PR_DP_1010_console` (seed 1001, 1000 parts, 24 parts/min, stacking,
+# stack-aware, dp planner): predictive_rank at W = 15, 25 and 50 s and `constant` at 20 mm/s.
+# The plant's leg offsets (sandbox/config.yaml) were identified from this same session's
+# command and pose logs, so this is a check of the identification on the whole-run outcome (picks,
+# belt, per-part agreement), not of unseen data: phase0_replay (seed 110, other days) is the
+# unseen-data check. Runs of the session with fewer than 100 picks (run03, run04: aborted
+# starts) are left out. `_uncal` adds the model's command delay to every leg, as the sandbox did
+# before the identification. The session ran with the pick gate's `covered` abort, so every run
+# sets `sim.gate_cover_abort`.
+kind: replay
+description: Replay the cell's seed-1001 runs (W = 15, 25, 50 s and constant 20 mm/s) and compare the part records
+gates: {picks_rel: 0.05, belt_rel: 0.10, agree: 0.85}
+runs:
+  - {name: w15_uncal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: w15_cal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true}, gated: true}
+  - {name: w25_uncal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: w25_cal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true}, gated: true}
+  - {name: w50_uncal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: w50_cal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true}, gated: true}
+  - {name: c20_uncal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: c20_cal, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true}, gated: true}
+quick: {duration_s: 900}

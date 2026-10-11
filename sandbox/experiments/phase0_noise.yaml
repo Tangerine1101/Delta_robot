@@ -1,0 +1,47 @@
+# Noise floor of the replay. A replay is deterministic, so one sandbox number per cell run says
+# nothing about how much of a gap to the cell is the closed loop's scatter. Each cell run is
+# replayed seven times with the plant unchanged and only the clock of the simulation shifted by a
+# few milliseconds (`sim.dt_s` 4-6 ms, `sim.replan_period_s` 45-55 ms): jitter of the size the
+# robot's own poll and the PLC link have. Compare the cell's value with the spread of the seven
+# (README, phase 0). W = 50 s (seed 1001) and W = 45 s (seed 110) are the two long-horizon runs
+# whose belt gate failed in phase0_replay*.
+kind: replay
+description: Seven clock-shifted replays of each cell run, to find the closed loop's scatter
+gates: {picks_rel: 0.05, belt_rel: 0.10, agree: 0.85}
+runs:
+  - {name: w15_dt5_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.05}}
+  - {name: w15_dt4_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.05}}
+  - {name: w15_dt6_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.05}}
+  - {name: w15_dt5_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.045}}
+  - {name: w15_dt5_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.055}}
+  - {name: w15_dt4_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.055}}
+  - {name: w15_dt6_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run01_163349_W15-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.045}}
+  - {name: w25_dt5_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.05}}
+  - {name: w25_dt4_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.05}}
+  - {name: w25_dt6_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.05}}
+  - {name: w25_dt5_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.045}}
+  - {name: w25_dt5_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.055}}
+  - {name: w25_dt4_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.055}}
+  - {name: w25_dt6_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run02_171740_W25-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.045}}
+  - {name: w50_dt5_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.05}}
+  - {name: w50_dt4_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.05}}
+  - {name: w50_dt6_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.05}}
+  - {name: w50_dt5_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.045}}
+  - {name: w50_dt5_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.055}}
+  - {name: w50_dt4_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.055}}
+  - {name: w50_dt6_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run05_182023_W50-dp-simufeeder-1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.045}}
+  - {name: c20_dt5_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.05}}
+  - {name: c20_dt4_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.05}}
+  - {name: c20_dt6_rp50, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.05}}
+  - {name: c20_dt5_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.045}}
+  - {name: c20_dt5_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.005, sim.replan_period_s: 0.055}}
+  - {name: c20_dt4_rp55, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.004, sim.replan_period_s: 0.055}}
+  - {name: c20_dt6_rp45, cell_run: log/20261010-163210_exp_PR_DP_1010_console/run06_190509_dp-const-20-seed1001_simulate_feeder, set: {sim.gate_cover_abort: true, sim.dt_s: 0.006, sim.replan_period_s: 0.045}}
+  - {name: k45_dt5_rp50, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.005, sim.replan_period_s: 0.05}}
+  - {name: k45_dt4_rp50, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.004, sim.replan_period_s: 0.05}}
+  - {name: k45_dt6_rp50, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.006, sim.replan_period_s: 0.05}}
+  - {name: k45_dt5_rp45, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.005, sim.replan_period_s: 0.045}}
+  - {name: k45_dt5_rp55, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.005, sim.replan_period_s: 0.055}}
+  - {name: k45_dt4_rp55, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.004, sim.replan_period_s: 0.055}}
+  - {name: k45_dt6_rp45, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.dt_s: 0.006, sim.replan_period_s: 0.045}}
+quick: {duration_s: 900}

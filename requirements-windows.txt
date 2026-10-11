@@ -1,0 +1,70 @@
+# Dependencies for Windows. requirements.txt is a Linux freeze: its triton, nvidia-* and cuda-* pins
+# have no Windows wheels, and one unsatisfiable pin makes `pip install -r` install nothing. They are
+# left out here (the Windows PyTorch wheels carry their own CUDA runtime).
+#
+#   .venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+#
+# PyPI's Windows torch / torchvision are CPU-only. For a GPU, install them first from the PyTorch
+# index that matches your driver (the selector at https://pytorch.org/get-started/locally), e.g.
+#   .venv\Scripts\python.exe -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/<cuXXX>
+# then run the command above; pip keeps the installed builds because the versions already match.
+#
+# Not covered: the camera. modules/vision opens a V4L2 device (/dev/videoN), so the real camera
+# pipeline does not run on Windows; the console, the PLC links, simulate_feeder, the PLC simulator,
+# the sandbox and the tests do not need it.
+albucore==0.0.24
+albumentations==2.0.8
+annotated-doc==0.0.4
+annotated-types==0.8.0
+av==19.0.1
+certifi==2026.5.20
+charset-normalizer==3.4.7
+click==8.3.3
+contourpy==1.3.3
+cycler==0.12.1
+filelock==3.29.3
+fonttools==4.63.0
+fsspec==2026.4.0
+idna==3.18
+Jinja2==3.1.6
+kiwisolver==1.5.0
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+matplotlib==3.10.9
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.4.6
+opencv-python==4.13.0.92
+packaging==26.2
+pillow==12.2.0
+polars==1.41.2
+polars-runtime-32==1.41.2
+psutil==7.2.2
+pycomm3==1.2.16
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.20.0
+pylogix==1.1.5
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+python-snap7==3.0.0
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+ruamel.yaml==0.19.1
+scipy==1.17.1
+setuptools==81.0.0
+shellingham==1.5.4
+simsimd==6.5.16
+six==1.17.0
+stringzilla==5.2.0
+sympy==1.14.0
+torch==2.12.0
+torchvision==0.27.0
+typer==0.25.1
+typing_extensions==4.15.0
+typing-inspection==0.4.4
+ultralytics==8.4.66
+ultralytics-thop==2.0.20
+urllib3==2.7.0

@@ -1,0 +1,21 @@
+# Phase 0 — does the sandbox reproduce the cell? Three one-hour cell runs of the same input
+# (seed 110, 24 parts/min, stacking, stack-aware) replayed under their own settings.
+#   W = 15 s: dp (log/20261008-163559 run02) and KIM (log/20261008-175607 run05, belt floor 50)
+#   W = 45 s: KIM (log/20261007-190332 run01)
+# Each is replayed with the plant as identified from the cell (`_cal`: goto and pick legs at the
+# trajectory model's time plus the measured +0.005 / -0.019 s, sandbox/config.yaml) and with the
+# older plant that adds the model's command delay (0.228 s) to every leg (`_uncal`): the cell
+# picks every 2.21 s, the uncalibrated model every 2.49 s. The `_cal` entries are the gate; the
+# set was fitted on nothing here, the offsets come from the 2026-10-10 session (phase0_replay_1001
+# is the out-of-sample check on that session's own runs). Open-issues S3.
+kind: replay
+description: Replay the cell's seed-110 hour at W = 15 s and W = 45 s and compare the part records
+gates: {picks_rel: 0.05, belt_rel: 0.10, agree: 0.85}
+runs:
+  - {name: dp_w15_uncal, cell_run: log/20261008-163559_console/run02_164527_simulate_feeder, set: {sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: dp_w15_cal, cell_run: log/20261008-163559_console/run02_164527_simulate_feeder, gated: true}
+  - {name: kim_w15_uncal, cell_run: log/20261008-175607_console/run05_180409_simulate_feeder, set: {sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: kim_w15_cal, cell_run: log/20261008-175607_console/run05_180409_simulate_feeder, gated: true}
+  - {name: kim_w45_uncal, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, set: {sim.goto_extra_s: null, sim.pick_extra_s: null}}
+  - {name: kim_w45_cal, cell_run: log/20261007-190332_console/run01_190343_simulate_feeder, gated: true}
+quick: {duration_s: 900}

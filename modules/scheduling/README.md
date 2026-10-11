@@ -83,6 +83,12 @@ A rule picks one part from the feasible jobs. The registry turns it into a full 
 applying it again to the remaining jobs, so the loop can fall back to the next part when the
 first no longer validates. It also exists as a rollout planner, `<rule>_rollout`.
 
+The rule sees only the **released** jobs (`jobs.released`): those the arm would not wait longer
+for than for the earliest one (`Job.wait_s`, within `RELEASE_SLACK_S`). A rule that ranks by
+path or processing alone would otherwise choose a part still far upstream — the path to the
+pick point does not depend on how far away the part is — and park the arm for tens of seconds
+while parts already in reach leave. When every job is upstream, the earliest arrivals stay.
+
 ```python
 # modules/scheduling/rules.py
 @dispatch_rule("nearest_deadline_first")

@@ -46,7 +46,7 @@ if exist "%VENV_DIR%\Scripts\python.exe" (
 echo Upgrading pip...
 "%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade pip
 
-if exist "%REPO_ROOT%\requirements.txt" (
+if exist "%REPO_ROOT%\requirements-windows.txt" (
     echo Installing dependencies from requirements.txt...
     "%VENV_DIR%\Scripts\python.exe" -m pip install -r "%REPO_ROOT%\requirements.txt"
     if errorlevel 1 (

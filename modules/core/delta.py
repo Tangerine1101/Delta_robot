@@ -36,6 +36,10 @@ _EARLIEST_ITERATIONS = 6
 _EARLIEST_TOL_S = 0.01
 _PARK_ITERATIONS = 4
 _PARK_TOL_S = 1e-3
+# Edge tolerance of the intercept's window test (mm). A part upstream of the workspace is picked
+# at the instant it reaches u_min, so u_pick equals u_min up to ~1e-12 mm of float rounding that
+# varies with the absolute clock; without it about half of those parts read as unreachable.
+_WINDOW_EDGE_TOL_MM = 1e-6
 
 
 def gate_sampling_latency_s(gate_poll_s: float = GATE_POLL_S) -> float:
@@ -166,7 +170,7 @@ class DeltaArm:
         soft_start_s = self.robot.interpolator.soft_start_s
         for _ in range(_EARLIEST_ITERATIONS):
             u_pick = u_start + belt.travel_in(max(0.0, guess - start_time))
-            if u_pick > u_max:
+            if u_pick > u_max + _WINDOW_EDGE_TOL_MM:
                 return None
             new_guess = start_time + command_delay_s + goto_time(self.pick_point(u_pick, v)) + soft_start_s
             new_guess = max(new_guess, t_enter)
@@ -175,7 +179,7 @@ class DeltaArm:
             if converged:
                 break
         u_pick = u_start + belt.travel_in(max(0.0, guess - start_time))
-        if not ConveyorFrame.is_in_window_uv(u_pick, v, window):
+        if not ConveyorFrame.is_in_window_uv(u_pick, v, window, _WINDOW_EDGE_TOL_MM):
             return None
 
         # Stage (b): the arm must be parked a full gate lead before contact.
@@ -193,7 +197,7 @@ class DeltaArm:
                 u_pick = u_max
                 final = start_time + max(0.0, to_edge)
                 clamped = True
-            if not ConveyorFrame.is_in_window_uv(u_pick, v, window):
+            if not ConveyorFrame.is_in_window_uv(u_pick, v, window, _WINDOW_EDGE_TOL_MM):
                 return None
             position = self.pick_point(u_pick, v)
             goto_s = goto_time(position)

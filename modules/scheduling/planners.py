@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from modules.scheduling.jobs import extend, make_job, precedence_order, release_estimate
+from modules.scheduling.jobs import extend, make_job, precedence_order, release_estimate, released
 from modules.scheduling.registry import PLANNERS, planner
 from modules.scheduling.types import Job, PlanContext, Point, ScheduledPick
 
@@ -278,7 +278,7 @@ def _rollout(rule_name: str, jobs: list[Job], ctx: PlanContext, cfg: RolloutConf
         ready = [job for job in snapshot if job.feasible and job.intercept.pick_time <= job.deadline_safe]
         if not ready:
             break
-        chosen = rule(ready, ctx)
+        chosen = rule(released(ready), ctx)
         if chosen is None:
             break
         schedule.append(ScheduledPick(chosen, clock, chosen.intercept.pick_time,

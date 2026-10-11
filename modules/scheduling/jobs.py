@@ -73,6 +73,24 @@ def extend(job: Job, position: Point, free_at: float, taken: frozenset[str],
     return finish, ctx.next_position(job.obj), pick
 
 
+# A job counts as released while its wait is within this of the shortest wait among the jobs
+# (the arm's flight to a part overlaps the last of that wait).
+RELEASE_SLACK_S = 0.5
+
+
+def released(jobs: list[Job]) -> list[Job]:
+    """The jobs a dispatch rule may choose from: those the arm would not have to wait longer
+    for than for the earliest one (non-delay dispatching, as for 1 | r_j | sum U_j). A rule
+    that ranks by path or processing alone would otherwise park the arm for a part still
+    upstream of the workspace — idling for tens of seconds at low belt speed — while parts
+    already in reach left unpicked. When every job is still upstream, the earliest are kept."""
+    waits = [job.wait_s for job in jobs]
+    floor = min(waits, default=math.inf)
+    if not math.isfinite(floor):
+        return jobs
+    return [job for job, wait in zip(jobs, waits) if wait <= floor + RELEASE_SLACK_S]
+
+
 def precedence_order(jobs: list[Job]) -> list[Job]:
     """Pull every blocker forward to just before the job it covers (no-op without stacking)."""
     by_id = {job.obj.object_id: job for job in jobs}

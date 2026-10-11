@@ -1,0 +1,60 @@
+{
+  "scenario": "simulate_feeder",
+  "started": "2026-10-07T20:09:33",
+  "duration_requested_s": null,
+  "planner": "spt_rollout",
+  "stack_aware": true,
+  "speed_law": "predictive_rank",
+  "setpoint_gate": null,
+  "static_mm_s": 20.0,
+  "band_mm_s": [
+    5.0,
+    100.0
+  ],
+  "feed": "virtual",
+  "feeder": {
+    "kind": "poisson",
+    "seed": 110,
+    "max_parts": 2000,
+    "params": {
+      "rate_per_min": 24.0,
+      "types": [
+        "QFP",
+        "TQFP"
+      ],
+      "lane_band_v": [
+        15.0,
+        110.0
+      ]
+    },
+    "scheduled": 1391,
+    "landed": 245
+  },
+  "sim": false,
+  "overrides": {
+    "scheduling.planner": "spt_rollout",
+    "scheduling.stack_aware": true,
+    "speed.law": "predictive_rank",
+    "speed.static_mm_s": 20.0,
+    "feeder.seed": 110,
+    "feeder.max_parts": 2000
+  },
+  "console_run": 3,
+  "duration_s": 698.8,
+  "input": 245,
+  "picked": 122,
+  "miss_grip": 8,
+  "miss_late": 91,
+  "lost_track": 0,
+  "on_belt": 24,
+  "miss_reasons": {
+    "miss_grip/covered": 8,
+    "miss_late/never_planned": 91
+  },
+  "pick_rate": 0.552,
+  "input_per_min": 21.04,
+  "throughput_per_min": 10.48,
+  "mean_belt_mm_s": 32.77,
+  "median_error_mm": 1.02,
+  "grip_tolerance_mm": 12.7
+}

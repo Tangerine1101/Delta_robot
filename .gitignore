@@ -33,3 +33,7 @@ log/
 *.run.xml
 # Sandbox sweep output (each run folder carries its own manifest)
 sandbox/results/
+python for scheduling/
+python-for-scheduling
+# Previous config.yaml kept by the console's configuration editor
+modules/config.yaml.bak

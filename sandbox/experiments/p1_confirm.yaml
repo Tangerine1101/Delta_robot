@@ -1,0 +1,85 @@
+# Phase 1 confirmation: three planners, stationary load
+# The same 20 settings for dp, KIM and SPT on the confirmation seeds 3001-3010 (not used to choose
+# anything), 60 cases x 10 seeds. Paired by seed: every case sees the same arrivals.
+# See doc/experiment_notes.md.
+kind: sweep
+description: "Phase 1 confirmation: three planners, stationary load"
+cell_config: modules/config.yaml
+base:
+  feeder.kind: poisson
+  feeder.poisson.rate_per_min: 24
+  sim.duration_s: 2800          # 1000 parts arrive by ~2500 s, the rest is the tail
+  sim.stacking: true
+  scheduling.stack_aware: true
+  feeder.max_parts: 1000
+  speed.laws.predictive_rank.planner: drop_longest
+  scheduling.planners.dp.max_jobs: 16
+seeds: [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010]
+quick: {base: {sim.duration_s: 700, feeder.max_parts: 250}, seeds: [3001, 3002, 3003], cases: [{name: "dp|W=15", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}, {name: "dp|W=inf", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}, {name: "dp|c=20", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 20}}, {name: "dp|c=60", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 60}}, {name: "kim|W=15", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}, {name: "kim|W=inf", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}, {name: "kim|c=20", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 20}}, {name: "kim|c=60", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 60}}, {name: "spt|W=15", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}, {name: "spt|W=inf", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}, {name: "spt|c=20", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 20}}, {name: "spt|c=60", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 60}}]}
+cases:
+  - {name: "dp|W=5", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 5}}
+  - {name: "dp|W=15", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}
+  - {name: "dp|W=20", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 20}}
+  - {name: "dp|W=25", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 25}}
+  - {name: "dp|W=30", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 30}}
+  - {name: "dp|W=40", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 40}}
+  - {name: "dp|W=50", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 50}}
+  - {name: "dp|W=60", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 60}}
+  - {name: "dp|W=90", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 90}}
+  - {name: "dp|W=inf", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}
+  - {name: "dp|c=10", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 10}}
+  - {name: "dp|c=20", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: "dp|c=30", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 30}}
+  - {name: "dp|c=40", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 40}}
+  - {name: "dp|c=50", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 50}}
+  - {name: "dp|c=60", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 60}}
+  - {name: "dp|c=70", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 70}}
+  - {name: "dp|c=80", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 80}}
+  - {name: "dp|c=90", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 90}}
+  - {name: "dp|c=100", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 100}}
+  - {name: "kim|W=5", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 5}}
+  - {name: "kim|W=15", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}
+  - {name: "kim|W=20", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 20}}
+  - {name: "kim|W=25", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 25}}
+  - {name: "kim|W=30", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 30}}
+  - {name: "kim|W=40", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 40}}
+  - {name: "kim|W=50", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 50}}
+  - {name: "kim|W=60", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 60}}
+  - {name: "kim|W=90", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 90}}
+  - {name: "kim|W=inf", set: {scheduling.planner: kim, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}
+  - {name: "kim|c=10", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 10}}
+  - {name: "kim|c=20", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: "kim|c=30", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 30}}
+  - {name: "kim|c=40", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 40}}
+  - {name: "kim|c=50", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 50}}
+  - {name: "kim|c=60", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 60}}
+  - {name: "kim|c=70", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 70}}
+  - {name: "kim|c=80", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 80}}
+  - {name: "kim|c=90", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 90}}
+  - {name: "kim|c=100", set: {scheduling.planner: kim, speed.law: constant, speed.static_mm_s: 100}}
+  - {name: "spt|W=5", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 5}}
+  - {name: "spt|W=15", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}
+  - {name: "spt|W=20", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 20}}
+  - {name: "spt|W=25", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 25}}
+  - {name: "spt|W=30", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 30}}
+  - {name: "spt|W=40", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 40}}
+  - {name: "spt|W=50", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 50}}
+  - {name: "spt|W=60", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 60}}
+  - {name: "spt|W=90", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 90}}
+  - {name: "spt|W=inf", set: {scheduling.planner: spt, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}
+  - {name: "spt|c=10", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 10}}
+  - {name: "spt|c=20", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: "spt|c=30", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 30}}
+  - {name: "spt|c=40", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 40}}
+  - {name: "spt|c=50", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 50}}
+  - {name: "spt|c=60", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 60}}
+  - {name: "spt|c=70", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 70}}
+  - {name: "spt|c=80", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 80}}
+  - {name: "spt|c=90", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 90}}
+  - {name: "spt|c=100", set: {scheduling.planner: spt, speed.law: constant, speed.static_mm_s: 100}}
+report:
+  title: Phase 1 confirmation (dp, KIM, SPT; 24 parts/min)
+  metrics: [pick_share, picks_per_min, covered_share, lost_share, mean_belt_mm_s, dip_s]
+  group: [planner, law, horizon_s, static_mm_s]
+  labels: {horizon_s: {1000: inf}}
+  charts: []

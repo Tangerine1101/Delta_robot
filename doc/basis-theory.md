@@ -244,7 +244,10 @@ Iterate to the earliest goto-feasible pick:
 
 This solver is `DeltaArm.predict` (`modules/core/delta.py`); it costs every job a planner sees
 (§7). The `spt` rule picks the job with the shortest start → pick → bin path: path length
-stands in for processing time, since on this arm a shorter path is a shorter pick cycle.
+stands in for processing time, since on this arm a shorter path is a shorter pick cycle. It
+chooses only among the released jobs (`jobs.released`): those whose wait for the part, `Job.wait_s`,
+is within 0.5 s of the shortest, because the path to a part still upstream does not grow with its
+distance while the arm would sit parked for it.
 
 ### 4.4. Positional pick gate
 
@@ -692,7 +695,19 @@ runs off. Without the flag $B_j = \emptyset$ and the planners are unchanged.
 `miss_grip / covered` in the part record, so the two settings are comparable on one input. It
 comes from the detection (`ObjectDetection.covered_by`): the virtual feed (`simulate_feeder`,
 `feeder.stacking`) knows the drop order and takes each board's width axis along its heading
-(`core/footprint.py`); the real camera reports none (open-issues S1).
+(`core/footprint.py`). The real camera derives it from overlapping detection boxes when
+`vision.stacking.enabled` (`vision/stacking.py`): two boxes that overlap by at least
+`min_overlap_frac` of the smaller one for `confirm_frames` frames in a row are a stack, and the
+track that appeared later is on top, as in the virtual feed; tracks that appeared within
+`min_birth_gap_frames` of each other have no known order and assert nothing. The result is
+recorded while the board is in the camera view and kept by the belt tracker after it leaves, so
+the planner and the pick gate read it without a camera.
+
+A part can still be covered *after* its pick was committed: the commit cannot be pre-empted
+and the arm may wait seconds at the park point for a part that has not reached the workspace.
+With `scheduling.stack_aware` the pick gate therefore re-reads the part record just before the
+descent and, if a part has landed on the target meanwhile, aborts the pick (`covered`); the
+target stays queued and the part on top is picked first.
 
 ## 8. Concurrency Model (summary)
 

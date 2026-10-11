@@ -1,0 +1,48 @@
+# Phase 1 selection: dp, stationary load
+# Choose the best horizon W and the best constant belt speed on selection seeds. 20 cases (10 W incl.
+# W = inf, the paper's setting; 10 speeds) x 20 seeds (2001-2020), 1000 parts at 24 parts/min,
+# stacking, stack-aware, dp. Seeds 1001-1010 are kept for the cell; 3001-3010 confirm
+# (p1_confirm.yaml). Read with: python3 -m sandbox confirm --select p1_select --confirm p1_confirm.
+# See doc/experiment_notes.md.
+kind: sweep
+description: "Phase 1 selection: dp, stationary load"
+cell_config: modules/config.yaml
+base:
+  feeder.kind: poisson
+  feeder.poisson.rate_per_min: 24
+  scheduling.planner: dp
+  sim.duration_s: 2800          # 1000 parts arrive by ~2500 s, the rest is the tail
+  sim.stacking: true
+  scheduling.stack_aware: true
+  feeder.max_parts: 1000
+  speed.laws.predictive_rank.planner: drop_longest
+  scheduling.planners.dp.max_jobs: 16
+seeds: [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020]
+quick: {base: {sim.duration_s: 700, feeder.max_parts: 250}, seeds: [2001, 2002, 2003], cases: [{name: "dp|W=15", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}, {name: "dp|W=inf", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}, {name: "dp|c=20", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 20}}, {name: "dp|c=60", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 60}}]}
+cases:
+  - {name: "dp|W=5", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 5}}
+  - {name: "dp|W=15", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 15}}
+  - {name: "dp|W=20", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 20}}
+  - {name: "dp|W=25", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 25}}
+  - {name: "dp|W=30", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 30}}
+  - {name: "dp|W=40", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 40}}
+  - {name: "dp|W=50", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 50}}
+  - {name: "dp|W=60", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 60}}
+  - {name: "dp|W=90", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 90}}
+  - {name: "dp|W=inf", set: {scheduling.planner: dp, speed.law: predictive_rank, speed.laws.predictive_rank.horizon_s: 1000}}
+  - {name: "dp|c=10", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 10}}
+  - {name: "dp|c=20", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: "dp|c=30", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 30}}
+  - {name: "dp|c=40", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 40}}
+  - {name: "dp|c=50", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 50}}
+  - {name: "dp|c=60", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 60}}
+  - {name: "dp|c=70", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 70}}
+  - {name: "dp|c=80", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 80}}
+  - {name: "dp|c=90", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 90}}
+  - {name: "dp|c=100", set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 100}}
+report:
+  title: Phase 1 selection (dp, 24 parts/min)
+  metrics: [pick_share, picks_per_min, covered_share, lost_share, mean_belt_mm_s, dip_s]
+  group: [law, horizon_s, static_mm_s]
+  labels: {horizon_s: {1000: inf}}
+  charts: []

@@ -646,7 +646,171 @@ now declares its rate parameter (`rate_field`). Verified on the PLC simulator:
 - a forced delay mismatch gives `miss_grip/cup_off_part`;
 - 89 tests.
 
+### 2026-10-07 — Intercept window edge tolerance; `dp.max_jobs` in the config
+
+Run `run03_164219_simulate_feeder` (dp, predictive_rank, stack-aware) starved twice: the arm
+committed to a part ~170 mm upstream and idled 32–34 s at 5 mm/s. Cause: `DeltaArm.predict`
+tested `u_pick ∈ window` with no tolerance, and a part upstream of the workspace is picked at
+exactly `u_min`, so float rounding (~1e-12 mm, varying with the absolute clock) made ~47 % of
+upstream parts read as unreachable at any instant. Stack chains turned the flicker into a
+schedule change: a flickering blocker removed every part under it, leaving a "lucky" far
+blocker as the first pick, and the commit cannot be pre-empted (open-issues L2 / T4).
+`predict` now widens the window test by `_WINDOW_EDGE_TOL_MM = 1e-6` (`core/delta.py`,
+`ConveyorFrame.is_in_window_uv(..., tolerance_mm)`); `tests/test_intercept_edge.py` pins it.
+`dp`'s `max_jobs` (default 8) is now listed in `scheduling.planners.dp`. The sandbox's model
+cells and `scheduling` section were synchronised with `modules/config.yaml`.
+
+### 2026-10-08 — "Stop at 1391", SPT parking for upstream parts, starvation bench
+
+Three reports (`issues/`):
+
+* **The run stops at 1391 parts.** Not a counter: with no `--duration` the arrivals are drawn
+  over `feeder.schedule_s = 3600` and seed 110 at 24/min yields exactly 1391 (last arrival
+  3593.8 s); the run ends when they are all dealt with (≈ 3631 s). `feeder.max_parts` only
+  truncated, so `max_parts: 2000` still gave 1391 (run03_200933). `arrival_schedule` now doubles
+  the horizon until `max_parts` parts exist (every feeder draws sequentially, so the first 1391
+  are unchanged; a fixed `--duration` is never extended).
+* **SPT skips parts in reach for one that has just landed.** `spt` ranks by `path_mm`
+  (start → pick point → bin); for a part upstream of the workspace the pick point is at `u_min`
+  in its lane, so the path does not grow with the distance, while the arm then waits 19–38 s
+  (vf0080 u = 164 passed over for vf0082 u = 4; vf0134 for vf0136). The landing zone is where
+  later drops cover it, hence `miss_grip/covered` after the wait. The wait is inside
+  `processing` but no rule looked at it. Rules now choose among `jobs.released(...)` (non-delay
+  dispatching: jobs whose `wait_s` is within 0.5 s of the shortest) in both the rule-to-planner
+  expansion and `<rule>_rollout`. Sandbox, seed 110, 600 s, stacking: 98 → 179 picks, 44 → 0
+  bypassed parts. `ToyArm` in the tests reports its processing as flight, not wait.
+* **dp passes over feasible parts.** After the edge-tolerance fix (2026-10-07) the sandbox
+  shows no such commit for `dp` (1 bypass in an hour; 3 with the tolerance removed — the
+  flicker itself needs the robot's absolute clock, see open-issues S3). The dips that remain
+  are stack inversions and a slow belt (open-issues S2).
+
+The sandbox now reproduces these: `sim.stacking`, `scheduling.stack_aware` with blockers,
+covered-contact misses, bypass / long-wait / dip metrics, `python3 -m sandbox dips`, the
+`arrivals_csv` replay, `experiments/starvation.yaml`.
+
+### 2026-10-10 — Experiment bench for the pre-cell simulations (phase 0 and 1)
+
+After the cell showed that W = 15 s beats W = 45 s, the sandbox got a way to run named
+experiments and write their tables and charts (`python3 -m sandbox exp <name>`,
+`bash sandbox/run_experiments.sh`, docs in `sandbox/experiments/README.md` and `README.vi.md`):
+
+* `sandbox/exp.py` dispatches by the spec's `kind` — `sweep` (cases x seeds, `report:` block ->
+  `report.md`, `summary.csv`, charts; `sandbox/sweep.py`, `sandbox/report.py`) and `replay`
+  (`sandbox/replay.py`, `sandbox/cellrun.py`). `cell_config:` starts a spec from the cell's own
+  scheduling / speed / feeder sections, `quick:` is the coarse version, `--dry-run` estimates the
+  time. The factors of a sweep are columns of `runs.csv`.
+* The four overlapping `horizon*.yaml` specs were replaced by `w_map.yaml` / `w_map_dp.yaml`.
+* Phase 0 replays three one-hour cell runs (seed 110) on their own `arrivals.csv` and settings.
+  The sandbox's arm was 12 % slower than the cell's (a pick every 2.49 s against 2.21 s), which
+  made the belt slower and the picks fewer at W = 15; `sim.carry_scale: 0.8` (the plant's time
+  from gate fire to arm free) brings picks (1315 vs 1316) and belt (42.4 vs 43.3 mm/s) into
+  agreement. It is an empirical factor, not yet traced to a cause (open-issues S3). At W = 45 the
+  replay still fails.
+* Phase 1 (`w_map`, KIM, 5 seeds, 400 hour-long runs) maps W against load and stack awareness:
+  open-issues S2.
+
+### 2026-10-10 — Configuration editor in the operator console
+
+The console could change a run's settings (planner, law, feeder) but not the configuration:
+anything else meant editing `config.yaml` and restarting. The *Config* tab (`ui/config_editor.py`,
+`Supervisor._api_config*`) shows every key with its comment, saves checked edits with
+`write_config`, and reloads the file into a running console between runs. The PLC link, the
+pose stream, the run log and the simulator are built once, so their keys are flagged "restart"
+rather than hot-swapped. A scenario already running keeps its settings. `--set` overrides win
+over the file on every reload, so an edit to an overridden key is flagged, not silently lost.
+Runs started without a duration use `runtime.duration_s` (0 = no limit); `feeder.max_parts`
+stretches a virtual feed past it.
+
+### 2026-10-10 — Covered picks: abort at the gate, stacks from the camera
+
+All 25 `miss_grip / covered` of the 1391-part cell run (dp, W = 15 s) had one shape: the part
+landed at u ≈ 0 and was planned within 0.25 s; a second part landed on it 0.1-0.8 s later, while
+the arm, already committed, waited ~3.3 s at the park point for the first to reach the
+workspace; the cup then came down on the covered part, and the part on top was picked next. The
+commit re-check of `is_covered` happens only when the pick is chosen. The pick gate now re-reads
+the part record before the descent (`pick_executor._wait_for_object_arrival`, abort reason
+`covered`, only with `stack_aware`); the part is re-queued and the part on top goes first. In
+the sandbox (`sim.gate_cover_abort`, KIM, 24/min, W = 15, 5 seeds x 1 h) covered misses went
+19.6 -> 0 and picks 1337 -> 1353; at W = 30, 13.2 -> 0 and no significant pick gain.
+To make this usable on the real camera (open-issues S1), `vision/stacking.py` derives
+`covered_by` from overlapping detection boxes (the later track is on top), recorded while the
+board is in the camera view and kept by the belt tracker afterwards; it is off by default
+(`vision.stacking.enabled`) until checked on the cell. A just-in-time commit (hold the goto
+until the arm must leave) would also remove the cause and the bypass of open-issues S2, and is
+not done.
+
+### 2026-10-10 — Named run logs, logs archived
+
+Finding the W = 15 and W = 45 runs took a search by date. `main.py --log-name NAME` now puts the
+label in the log folder (`<time>_<NAME>_<mode>`), and the console's Scenario card has a *run
+name* field (`run<NN>_<time>_<name>_<scenario>`, also `run_name` in `summary.json`). The label
+sits before the mode / scenario so patterns ending in them still match. All earlier logs
+(12 sessions plus the old `log/archived/`, 610 files) were packed into `log/archived.zip` and
+removed; `sandbox/cellrun.py` unpacks a run from it on demand, so `phase0_replay` still works.
+
 ---
+
+### 2026-10-10 — Plant identification: the sandbox arm's 0.28 s per pick traced, `carry_scale` replaced
+
+A console session of four runs (`log/20261010-163210_exp_PR_DP_1010_console`: dp, seed 1001,
+1000 parts, 24 parts/min, `predictive_rank` at W = 15 / 25 / 50 s and `constant` 20 mm/s; two
+aborted starts of 4 and 0 picks left out) gave 3654 picks with the pose stream, every command
+and the belt status. `modules/tools/identify_plant` measures from them what the sandbox plant
+assumes:
+
+* **Arm legs.** Send -> arrival at the last waypoint is the trajectory model's time to within
+  +0.005 s (goto, 3660 legs) and -0.019 s (pick, 3547 legs), for path lengths of 120-400 mm
+  (ratio 0.97-1.01, fit residual 0.010-0.015 s). The motion starts 0.107 s after the send (the
+  command write is 0.065 s) and the model's soft start covers that. Short gotos (< 120 mm, 4 %)
+  take 0.16 s longer than modelled (open-issues C5).
+* **Where the 0.28 s went.** The plant added the model's command delay (`robot_movement_delay_s +
+  ethernet_delay_s` = 0.228 s) to the goto leg and to the pick leg. That delay is the *scheduler's
+  lead* for the gate (it keeps the cup landing on the part); the arm does not spend it on the
+  flight, which the table above already contains. The cell's back-to-back cycle is 2.18 s:
+  goto 0.945 + wait 0.19 + pick 0.972 + gap 0.07 (median); the sandbox's was 2.49 s.
+* **Replacement.** `sim.goto_extra_s = 0.005` and `sim.pick_extra_s = -0.019`
+  (`sandbox/config.yaml`) replace the empirical `carry_scale: 0.8` (kept as a what-if,
+  default 1). `phase0_replay` and `w_map*` no longer set it. Replays with the identified plant
+  and `carry_scale` 1: seed 110 W = 15 dp / KIM picks 1315 / 1315 against 1316 / 1312, belt 43.2 /
+  43.2 against 43.3 / 43.2, W = 45 KIM picks 1219 against 1227, belt 24.2 against 30.2 (all but
+  the last belt gate pass). Seed 1001 (with `sim.gate_cover_abort`, which that session ran)
+  W = 15 / 25 / 50 and constant 20: picks 946 / 954 / 874 / 906 against 943 / 958 / 846 / 907,
+  belt 44.0 / 40.0 / 31.3 / 20.0 against 42.9 / 37.5 / 27.1 / 20.0, parts with a different
+  outcome 4.5 / 2.8 / 9.6 / 0.5 %; the belt gate fails at W = 50 (+16 %). With the old plant the
+  same W = 50 run picked 715 and held the belt at 9.6 mm/s.
+* **Belt servo.** Settled `speed_current` equals the setpoint (ratio 1.000, 0.001 over 5-60
+  mm/s). A step reaches 10 / 50 / 90 % at 0.023 / 0.080 / 0.126 s after the send, whatever its
+  size (4-22 mm/s): a ~0.04 s delay and a ~0.1 s transition, not a 500 mm/s2 ramp (which would
+  take 0.04 s for 20 mm/s). The sandbox keeps its ramp; the difference is under 0.1 s.
+* **Descent and gate.** The cup reaches its lowest z 0.221 s after the pick send (sd 0.004 s)
+  at z = -298.10 mm (sd 0.03 mm) over 3654 picks (open-issues T3). Virtual parts are picked
+  with `error_u_mm` = 0.0199 s x belt speed + 0.41 mm: the gate and arm timing explain at most
+  1.6 mm at 60 mm/s.
+
+Cell W points on this seed: 0.943 (W = 15), 0.958 (25), 0.846 (50) of the parts picked
+(open-issues S2).
+
+Noise floor (`experiments/phase0_noise.yaml`, 35 replays): the belt FAIL at W = 50 (seed 1001) is
+inside the sandbox's own spread, the W = 15 / 25 belts carry a 3-8 % upward bias, and W = 45 (seed 110,
+KIM, an older cell run) is below the cell in all seven replicas. No plant refinement was made: the
+goto legs under 120 mm cost 0.3 % of the cycle on average and the model's cell sections already equal
+the session's. `sandbox/replay.py` now also reports belt-speed RMSE, throughput RMSE and the KS
+distance of the pick-interval distribution. Report: `doc/plant-identification.md`.
+
+### 2026-10-11 — The dp study: design and what the sandbox said
+
+The experiment plan was narrowed to the contribution, the speed law: `dp` is the main planner
+(three levels of W and of the constant speed around the sandbox optimum, plus W = ∞), KIM and
+SPT are compared at the optimum only. Seeds are split by role: 1001–1010 are kept for the cell,
+2001–2020 select a level, 3001–3010 confirm it (choosing the best of ten on the seeds that then
+measure it reports the luck of the choice). Stack-blind runs left the plan. `sandbox/confirm.py`
+(`python3 -m sandbox confirm`) does the select-then-confirm, the paired differences and the
+number of cell seeds; `feeder.max_parts` and the decision-time metrics (`law_ms_*`, `plan_ms_*`,
+`plan_jobs_*`) were added to the sandbox; `solve_time.yaml` measures dp and `predictive_rank` against
+`max_jobs` and the candidate step. Results are in `doc/experiment_notes.md` §4: best W = 20 s and best
+constant 20 mm/s on both a stationary and a `regime` load, `predictive_rank` ahead of the best constant by
+5.4 and 8.0 points, dp indistinguishable from KIM and 5–8 points ahead of SPT, W ≥ 60 s the same run
+as W = ∞. KIM at W\* is therefore not planned on the cell. No config value was changed.
 
 ## 4. Parked ideas
 

@@ -2,6 +2,10 @@
 
     python3 -m sandbox run [--set key=value ...] [--profile]   # one run, summary printed
     python3 -m sandbox sweep sandbox/experiments/<spec>.yaml [--workers N]
+    python3 -m sandbox exp <name> [--quick] [--dry-run]       # a named experiment: run it, write tables + charts
+    python3 -m sandbox exp --list                             # the experiments of sandbox/experiments/
+    python3 -m sandbox report <results dir>                   # redraw the tables and charts of a finished sweep
+    python3 -m sandbox dips <run dir | parts.csv>              # where the output left the input
     python3 -m sandbox check                                   # model files vs modules/config.yaml
     python3 -m sandbox list                                    # plugins, feeders, arm models
 """
@@ -72,15 +76,33 @@ def list_all() -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "confirm":      # its own options: sandbox/confirm.py
+        from sandbox.confirm import main as confirm_main
+
+        return confirm_main(sys.argv[2:])
     parser = argparse.ArgumentParser(prog="python3 -m sandbox", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="one simulated run")
     run.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--profile", action="store_true", help="print the 15 most expensive calls")
+    run.add_argument("--out", metavar="DIR", help="write parts.csv, flow.csv and waits.json of the run")
+    dp = sub.add_parser("dips", help="stretches where the throughput leaves the input")
+    dp.add_argument("run", help="a run directory (parts.csv) or a parts.csv")
+    dp.add_argument("--threshold", type=float, default=8.0, help="input - output, parts/min")
+    dp.add_argument("--min-len", type=float, default=15.0, help="shortest stretch, s")
     sw = sub.add_parser("sweep", help="an experiment spec, in parallel")
     sw.add_argument("spec")
     sw.add_argument("--workers", type=int, default=None)
+    ex = sub.add_parser("exp", help="a named experiment of sandbox/experiments/")
+    ex.add_argument("name", nargs="?")
+    ex.add_argument("--list", action="store_true", help="list the experiments")
+    ex.add_argument("--quick", action="store_true", help="the spec's shorter `quick:` version")
+    ex.add_argument("--dry-run", action="store_true", help="only print the run count and the estimated time")
+    ex.add_argument("--workers", type=int, default=None)
+    rp = sub.add_parser("report", help="tables and charts of a finished sweep directory")
+    rp.add_argument("run_dir")
+    sub.add_parser("confirm", help="select levels on some seeds, confirm them on others (see sandbox/confirm.py)")
     sub.add_parser("check", help="compare the model files' cell with modules/config.yaml")
     sub.add_parser("list", help="list plugins, feeders and arm models")
     args = parser.parse_args()
@@ -89,6 +111,24 @@ def main() -> int:
         return check()
     if args.command == "list":
         list_all()
+        return 0
+    if args.command == "dips":
+        from sandbox.flow import read_parts, report
+
+        print(report(read_parts(args.run), threshold_per_min=args.threshold, min_len_s=args.min_len))
+        return 0
+    if args.command == "exp":
+        from sandbox.exp import describe, run_experiment
+
+        if args.list or not args.name:
+            print(describe())
+            return 0
+        run_experiment(args.name, workers=args.workers, quick=args.quick, dry_run=args.dry_run)
+        return 0
+    if args.command == "report":
+        from sandbox.report import build_report
+
+        build_report(args.run_dir)
         return 0
     if args.command == "sweep":
         from sandbox.sweep import sweep
@@ -99,6 +139,12 @@ def main() -> int:
     from sandbox.sweep import run_one
 
     overrides = _overrides(args.set)
+    if args.out:
+        from sandbox.sweep import run_recorded
+
+        result = run_recorded(overrides, args.out)
+        print(json.dumps(result, indent=2))
+        return 0
     if args.profile:
         import cProfile
         import pstats

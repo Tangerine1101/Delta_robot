@@ -96,7 +96,7 @@ class ConsoleAgainstSimulator(unittest.TestCase):
     def test_2_rejects_unsafe_targets(self):
         code, r = self.api("/api/manual/goto", {"x": 0.0, "y": 0.0, "z": -210.0})
         self.assertEqual(code, 400)                          # z above robot_limits.z_max_mm
-        code, r = self.api("/api/manual/goto", {"x": 0.0, "y": 0.0, "z": -310.0})
+        code, r = self.api("/api/manual/goto", {"x": 0.0, "y": 0.0, "z": -315.0})
         self.assertEqual(code, 400)                          # z below robot_limits.z_min_mm
         code, r = self.api("/api/manual/goto", {"x": 150.0, "y": -150.0, "z": -290.0})
         self.assertEqual(code, 400)                          # outside robot_limits.radius_xy_mm
@@ -157,7 +157,8 @@ class ConsoleAgainstSimulator(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.sup.record_root = Path(tmp)
             try:
-                code, r = self.api("/api/scenario/start", {"name": "simulate_feeder", "duration": 60, "settings": {
+                code, r = self.api("/api/scenario/start", {"name": "simulate_feeder", "duration": 60,
+                                                           "run_name": "W15 dp/seed 2", "settings": {
                     "planner": "kim", "speed_law": "constant", "static_mm_s": 40,
                     "feeder_kind": "poisson", "feeder_seed": 2, "feeder_rate": 60, "feeder_max_parts": 3}})
                 self.assertEqual(code, 200, r)
@@ -165,7 +166,9 @@ class ConsoleAgainstSimulator(unittest.TestCase):
             finally:
                 self.sup.record_root = None
             [run_dir] = list(Path(tmp).iterdir())
+            self.assertTrue(run_dir.name.endswith("_W15-dp-seed-2_simulate_feeder"), run_dir.name)
             summary = json.loads((run_dir / "summary.json").read_text())
+            self.assertEqual(summary["run_name"], "W15-dp-seed-2")
             for name in ("parts.csv", "flow.csv", "arrivals.csv"):
                 self.assertTrue((run_dir / name).exists(), name)
         self.assertEqual(summary["planner"], "kim")
@@ -178,6 +181,11 @@ class ConsoleAgainstSimulator(unittest.TestCase):
         self.assertTrue({"layout", "flow", "run_summary"} <= kinds, kinds)
         # The simulator's own boards were paused for the virtual run and are back.
         self.assertIsNotNone(self.sim.feeder)
+
+    def test_7b_rejects_a_run_name_with_nothing_usable(self):
+        code, r = self.api("/api/scenario/start", {"name": "simulate_feeder", "run_name": "///"})
+        self.assertEqual(code, 400, r)
+        self.assertEqual(self.sup.mode, "idle")
 
     def test_7_rejects_a_rate_for_a_feeder_without_one(self):
         code, r = self.api("/api/scenario/start", {"name": "simulate_feeder", "settings": {

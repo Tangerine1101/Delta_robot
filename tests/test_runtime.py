@@ -299,5 +299,60 @@ class RampLeadResidual(unittest.TestCase):
         self.assertLess(abs(residual), 1.5)
 
 
+class _Ledger:
+    def __init__(self, covered: bool) -> None:
+        self.covered = covered
+
+    def is_covered(self, part_id: str) -> bool:
+        return self.covered
+
+
+class CoveredTarget(unittest.TestCase):
+    """A part that lands on the target while the arm waits for it aborts the pick before the
+    cup comes down (open-issues S1 follow-up): the part stays queued."""
+
+    def _gate(self, stack_aware: bool, covered: bool) -> tuple[bool, dict]:
+        now = time.monotonic()
+        cfg, frame, arm, tracker, plan = _fixture(now)
+        cfg = load(**{"scheduling.stack_aware": stack_aware})
+        executor = RealtimePickExecutor(lambda p: None, lambda: None, cfg, arm)
+        executor.ledger = _Ledger(covered)
+        state = RealtimeState(tracker=tracker, frame=frame, ipc_lock=executor.ipc_lock)
+        state.belt_position_mm = 0.0
+        ok = executor._wait_for_object_arrival(plan, state)
+        return ok, plan.debug_info
+
+    def test_covered_target_aborts_before_the_descent(self):
+        ok, info = self._gate(stack_aware=True, covered=True)
+        self.assertFalse(ok)
+        self.assertEqual(info["abort_reason"], "covered")
+
+    def test_not_stack_aware_does_not_look(self):
+        _, info = self._gate(stack_aware=False, covered=True)
+        self.assertNotEqual(info.get("abort_reason"), "covered")
+
+
+class ConfiguredDuration(unittest.TestCase):
+    def test_default_is_until_stopped(self):
+        from modules.runtime.scenarios import effective_duration
+
+        self.assertIsNone(effective_duration(load(), None))
+
+    def test_configured_duration_applies_only_without_an_explicit_one(self):
+        from modules.runtime.scenarios import effective_duration
+
+        cfg = load(**{"runtime.duration_s": 120.0})
+        self.assertEqual(effective_duration(cfg, None), 120.0)
+        self.assertEqual(effective_duration(cfg, 30.0), 30.0)
+
+    def test_max_parts_stretches_a_virtual_feed_past_the_configured_duration(self):
+        from modules.runtime.scenarios import effective_duration
+
+        cfg = load(**{"runtime.duration_s": 120.0, "feeder.max_parts": 500})
+        self.assertIsNone(effective_duration(cfg, None, virtual_feed=True))
+        self.assertEqual(effective_duration(cfg, None), 120.0)               # not a virtual feed
+        self.assertEqual(effective_duration(cfg, 30.0, virtual_feed=True), 30.0)   # a given one still caps
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

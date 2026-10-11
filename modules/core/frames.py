@@ -123,9 +123,12 @@ class ConveyorFrame:
         return self.u_hat[0] * s_u, self.u_hat[1] * s_u
 
     @staticmethod
-    def is_in_window_uv(u: float, v: float, window: UVWindow) -> bool:
+    def is_in_window_uv(u: float, v: float, window: UVWindow, tolerance_mm: float = 0.0) -> bool:
+        """Is (u, v) inside the window, widened by `tolerance_mm` on every side? A solver that
+        lands exactly on an edge needs a tolerance: float rounding puts it either side."""
         u_min, u_max, v_min, v_max = window
-        return u_min <= u <= u_max and v_min <= v <= v_max
+        return (u_min - tolerance_mm <= u <= u_max + tolerance_mm
+                and v_min - tolerance_mm <= v <= v_max + tolerance_mm)
 
 
 def vision_mm_to_uv(x_mm: float, y_mm: float) -> tuple[float, float]:

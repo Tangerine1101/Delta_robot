@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from modules.settings import SettingsError, build_section
 
+from modules.scheduling.jobs import released
 from modules.scheduling.types import Job, PlanContext, ScheduledPick, SpeedDecision, SpeedView
 
 
@@ -151,7 +152,7 @@ class BoundPlanner:
         remaining = [job for job in jobs if job.feasible]
         order: list[ScheduledPick] = []
         while remaining:
-            chosen = self.spec.fn(remaining, *args)
+            chosen = self.spec.fn(released(remaining), *args)
             if chosen is None:
                 break
             order.append(_as_scheduled(chosen, ctx))

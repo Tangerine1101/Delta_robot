@@ -1,0 +1,29 @@
+# Phase 1b — the W map for the cell's other planner (dp), at the loads where it matters.
+description: predictive_rank horizon W x stack awareness at the cell's load, dp
+cell_config: modules/config.yaml
+base:
+  sim.duration_s: 3600
+  sim.stacking: true
+  speed.law: predictive_rank
+  speed.laws.predictive_rank.planner: drop_longest
+  scheduling.planner: dp
+  feeder.poisson.rate_per_min: 24
+seeds: [110, 111, 112]
+grid:
+  scheduling.stack_aware: [false, true]
+  speed.laws.predictive_rank.horizon_s: [10, 15, 30, 45, 1000]
+quick:
+  base: {sim.duration_s: 600}
+  seeds: [110]
+  grid:
+    scheduling.stack_aware: [true]
+    speed.laws.predictive_rank.horizon_s: [15, 45]
+report:
+  title: Horizon W with dp at 24 parts/min
+  metrics: [pick_share, picks_per_min, covered_share, lost_share, mean_belt_mm_s, dip_s]
+  labels: {horizon_s: {1000: inf}}
+  charts:
+    - {kind: line, x: horizon_s, y: pick_share, series: stack_aware}
+    - {kind: line, x: horizon_s, y: mean_belt_mm_s, series: stack_aware}
+  best:
+    - {over: horizon_s, metric: pick_share, group: [stack_aware], tolerance: 0.005}

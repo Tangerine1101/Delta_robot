@@ -50,6 +50,8 @@ Consequences for anyone working here:
 | [`decision-log.md`](decision-log.md) | History only: superseded designs and why they were rejected, applied calibrations, repo restructuring, parked ideas | append-only |
 | [`dev-note.md`](dev-note.md) | Human developer's working notes and hardware quirks | **human only — AI must not edit** |
 | [`plc/`](plc/README.md) | PLC programs (deployed Omron `Matching_Code_10`, target `delta_paper_0_2`), PC↔PLC data contract, defect review with proposed ST patches, config review against the PLC, PLC simulator | anyone |
+| [`experiment_notes.md`](experiment_notes.md) | The study's experiment list: seed groups, simulation experiments S1–S4, cell experiments C1–C5, decision rules, results of the simulation phase | anyone |
+| [`plant-identification.md`](plant-identification.md) / [`.vi.md`](plant-identification.vi.md) | Plant identification report (2026-10-10 session): method, tables and figures for arm legs, pick cycle, belt servo, pick error, and the sandbox replay validation | anyone |
 | [`pick-accuracy-findings.md`](pick-accuracy-findings.md) | Pick-gate timing defect register (T1–T9): why picks land off-centre and worsen above ~120 mm/s, evidence, fix roadmap | anyone |
 | [`../modules/scheduling/README.md`](../modules/scheduling/README.md) | How to write a dispatch rule, planner or speed law: the contracts, with worked examples | anyone |
 | [`../sandbox/README.md`](../sandbox/README.md) | The offline algorithm bench: configuration, model/plant, sweeps, what is modelled | anyone |
@@ -89,7 +91,7 @@ Delta_robot/
 │   ├── vision/                # PyAV capture, YOLO-OBB pipeline, board heading, ROI, centroid tracker
 │   ├── ui/                    # Web dashboard, operator console back-end, interactive CLI
 │   ├── tools/                 # Probes: latency, rotation, angle sweep, frame converter, rank bounds, UDP;
-│   │                          #   flow_report (input vs throughput across runs), log_timeline / log_compare (throughput plots of one run / across set-ups), pick_timing (gate latency, belt scale)
+│   │                          #   flow_report (input vs throughput across runs), identify_plant (system identification of the arm legs, pick cycle, belt servo and pick error from a console session), log_timeline / log_compare (throughput plots of one run / across set-ups), pick_timing (gate latency, belt scale)
 │   └── plc_sim/               # PLC simulator (Omron Matching_Code_10 port + belt, Siemens, boards, camera)
 │
 ├── sandbox/                   # Offline algorithm bench: config, arm models, feeders, sweeps (README.md)

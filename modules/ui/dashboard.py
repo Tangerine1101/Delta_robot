@@ -101,6 +101,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   canvas { width:100%; height:240px; display:block; background:#111419; border-radius:6px; }
   #cam { width:100%; border-radius:6px; background:#000; display:block; object-fit:contain; }
   #planlog, #teachjson { font-size:11px; max-height:220px; overflow:auto; white-space:pre-wrap; color:#b8c0cc; line-height:1.5; }
+  .cfg-edited { background:#2a2f1c; }
+  .cfg table { table-layout:fixed; }
+  .cfg td:nth-child(1) { width:32%; } .cfg td:nth-child(2) { width:24%; }
+  .cfgk { font-family:ui-monospace,monospace; word-break:break-all; vertical-align:top; }
+  .cfg td { vertical-align:top; }
+  .cfg td.note { vertical-align:top; }
+  details.cfg > summary { cursor:pointer; padding:7px 0; color:#cfd6e2; font-weight:600; border-bottom:1px solid #262b33; }
+  .tag { font-size:10px; padding:0 5px; margin-left:6px; border-radius:8px; background:#2a2f38; color:#9aa4b2; }
+  .tag.warn { background:#3a3016; color:#ffd166; } .tag.restart { background:#3a2020; color:#ff8a8a; }
   .lvl-info { color:#b8c0cc; } .lvl-warn { color:var(--warn); } .lvl-error { color:var(--bad); }
   #toast { position:fixed; right:14px; bottom:14px; max-width:420px; padding:10px 14px; border-radius:8px;
            background:#23324a; border:1px solid #3d5170; display:none; z-index:10; }
@@ -144,6 +153,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <button id="tabbtn-live" onclick="showTab('live')">Live</button>
   <button id="tabbtn-charts" onclick="showTab('charts')">Charts (30s)</button>
   <button id="tabbtn-log" onclick="showTab('log')">Log</button>
+  <button id="tabbtn-config" onclick="showTab('config')">Config</button>
 </nav>
 
 <div id="tab-operate" class="tabpage active">
@@ -212,6 +222,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="row">
         <label class="f">scenario<select id="scnsel" onchange="scnChanged()"></select></label>
         <label class="f">duration (s, blank = until stopped)<input id="scndur" type="number" min="0" step="10" placeholder="∞"></label>
+        <label class="f">run name (optional)<input id="runname" type="text" maxlength="60" placeholder="e.g. W15-dp-seed110" class="runopt" style="width:210px"></label>
       </div>
       <div class="row">
         <label class="f">planner<select id="plsel" class="runopt" onchange="showDocs()"></select></label>
@@ -235,6 +246,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="kv mono" style="margin-top:8px">
         <b>running</b><span id="r_name">—</span>
+        <b>run name</b><span id="r_label">—</span>
         <b>elapsed</b><span id="r_elapsed">—</span>
         <b>plans</b><span id="r_plans">—</span>
       </div>
@@ -361,6 +373,25 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="tab-config" class="tabpage">
+<div class="wrap one">
+  <div class="card">
+    <h2>Configuration <span class="mono" id="cfgpath" style="text-transform:none"></span></h2>
+    <div class="row">
+      <input id="cfgfilter" placeholder="filter by key or comment…" oninput="cfgRender()" style="flex:1; min-width:220px">
+      <button class="b own" onclick="cfgSave(true)" title="check, write config.yaml (the old file is kept as config.yaml.bak) and use it from the next run">Save &amp; apply</button>
+      <button class="b" onclick="cfgSave(false)" title="write config.yaml only; Reload applies it later">Save to file</button>
+      <button class="b own" onclick="cfgReload()" title="read config.yaml again (edited by hand?) and use it from the next run">Reload from file</button>
+      <button class="b" onclick="cfgDiscard()">Discard edits</button>
+    </div>
+    <div class="note" id="cfgnote"></div>
+    <div id="cfgbody" class="cfg" style="margin-top:8px"></div>
+    <div class="note" style="margin-top:8px">A running scenario keeps the settings it started with; applied settings reach the next run.
+      Teach points have their own card. A key not in the file shows its default. Edits are checked before anything is written and the file's comments are kept.</div>
+  </div>
+</div>
+</div>
+
 <div id="toast"></div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -373,10 +404,11 @@ let pose = null;
 
 // ---------------------------------------------------------------- tabs, toast
 function showTab(name){
-  for(const t of ["operate","cell","flow","live","charts","log"]){
+  for(const t of ["operate","cell","flow","live","charts","log","config"]){
     $("tab-"+t).classList.toggle("active", t===name);
     $("tabbtn-"+t).classList.toggle("active", t===name);
   }
+  if(name==="config") cfgLoad();
 }
 let toastTimer = null;
 function toast(text, err){
@@ -412,23 +444,25 @@ async function rotate(){ const j = await api("/api/rotate", {deg:+$("rotdeg").va
 async function startScenario(){
   const name=$("scnsel").value, dur=$("scndur").value, settings=runSettings();
   const described = Object.keys(settings).map(k=>k+"="+settings[k]).join(", ");
-  if(!confirm("Start scenario '"+name+"'"+(dur?(" for "+dur+" s"):" until stopped")
+  if(!confirm("Start scenario '"+name+"'"+($("runname").value.trim()?(" as '"+$("runname").value.trim()+"'"):"")+(dur?(" for "+dur+" s"):" until stopped")
               +(described?("\\nwith "+described):"")+"?")) return;
-  const j = await api("/api/scenario/start", {name, duration: dur===""?null:+dur, settings}); if(j) toast("started "+name);
+  const runName=$("runname").value.trim();
+  const j = await api("/api/scenario/start", {name, duration: dur===""?null:+dur, settings, run_name: runName}); if(j) toast("started "+name+(runName?(" ("+runName+")"):""));
 }
 
 // ---------------------------------------------------------------- run settings form
 const esc = (t) => String(t??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function fillRunForm(d){
-  if($("plsel").dataset.done) return;
+  const sig = JSON.stringify(d.run_defaults||{});
+  if($("plsel").dataset.done===sig) return;     // refilled when a reload changes the defaults
   const rd=d.run_defaults||{}, pl=d.plugins||{};
   $("plsel").innerHTML=(pl.planners||[]).map(p=>`<option value="${esc(p.name)}">${esc(p.name)} (${esc(p.kind)})</option>`).join("");
   $("lawsel").innerHTML=(pl.speed_laws||[]).map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
   $("fdkind").innerHTML=(d.feeders||[]).map(k=>`<option>${esc(k)}</option>`).join("");
   $("plsel").value=rd.planner; $("stackaware").checked=!!rd.stack_aware; $("lawsel").value=rd.speed_law; $("staticv").value=rd.static_mm_s;
   $("fdkind").value=rd.feeder_kind; $("fdseed").value=rd.feeder_seed; $("fdmax").value=rd.feeder_max_parts;
-  $("plsel").dataset.done="1";
-  feedKindChanged(); scnChanged(); showDocs();
+  $("plsel").dataset.done=sig;
+  lastKind=null; feedKindChanged(); scnChanged(); showDocs();
 }
 function showDocs(){
   if(!sup) return;
@@ -472,6 +506,93 @@ function runSettings(){
 }
 async function stopScenario(){ const j = await api("/api/scenario/stop", {}); if(j) toast(j.stopping?"stopping…":"nothing running"); }
 $("stopbtn").onclick = async () => { const j = await api("/api/stop", {}); if(j) toast("STOP sent: belt stopped, run ending"); };
+
+
+// ---------------------------------------------------------------- configuration editor (config.yaml, via the console)
+let cfg = null, cfgKeys = [];
+const cfgEdits = {}, cfgBad = new Set(), cfgOpen = new Set();
+async function cfgLoad(){
+  try{
+    const r = await fetch("/api/config"); const j = await r.json().catch(()=>({ok:false, error:"bad response"}));
+    if(!j.ok){ toast(j.error || ("HTTP "+r.status), true); return; }
+    cfg = j; cfgRender();
+  }catch(e){ toast("request failed: "+e, true); }
+}
+const cfgKind = (v) => typeof v==="boolean" ? "bool" : typeof v==="number" ? "num" : typeof v==="string" ? "str" : "json";
+function cfgRender(){
+  if(!cfg) return;
+  $("cfgpath").textContent = cfg.path;
+  const filt = $("cfgfilter").value.trim().toLowerCase();
+  const pend = new Set(cfg.pending), masked = new Set(cfg.masked), inFile = new Set(cfg.in_file);
+  cfgKeys = Object.keys(cfg.values).filter(k => !filt || k.toLowerCase().includes(filt) || (cfg.comments[k]||"").toLowerCase().includes(filt));
+  const groups = {};
+  cfgKeys.forEach((k,i)=>{ const g=k.split(".")[0]; (groups[g]=groups[g]||[]).push(i); });
+  let html = "";
+  for(const g of Object.keys(groups)){
+    const rows = groups[g].map(i=>{
+      const k=cfgKeys[i], orig=cfg.values[k], edited=(k in cfgEdits), v=edited?cfgEdits[k]:orig, kind=cfgKind(orig);
+      let input;
+      if(kind==="bool") input = `<input type="checkbox" ${v?"checked":""} onchange="cfgEdit(${i}, this)">`;
+      else if(kind==="num") input = `<input type="number" step="any" value="${esc(v)}" oninput="cfgEdit(${i}, this)" style="width:120px">`;
+      else input = `<input type="text" value="${esc(kind==="str"?v:JSON.stringify(v))}" oninput="cfgEdit(${i}, this)" style="width:100%">`;
+      const tags = (pend.has(k)?'<span class="tag warn" title="the file differs from what is running; Reload from file applies it">not applied</span>':"")
+        + (masked.has(k)?'<span class="tag warn" title="set with --set on the command line; it wins over the file">--set</span>':"")
+        + (!inFile.has(k)?'<span class="tag" title="not in config.yaml: the default applies; saving writes it">default</span>':"")
+        + (cfg.restart_prefixes.some(p=>k.startsWith(p))?'<span class="tag restart" title="read once at start-up: restart the console to use a new value">restart</span>':"");
+      const name = k.slice(g.length+1) || k;
+      return `<tr class="${edited?"cfg-edited":""}"><td class="cfgk">${esc(name)}${tags}</td><td>${input}</td><td class="note">${esc(cfg.comments[k]||"")}</td></tr>`;
+    }).join("");
+    const open = filt!=="" || cfgOpen.has(g) || groups[g].some(i=>cfgKeys[i] in cfgEdits);
+    html += `<details class="cfg" ${open?"open":""} ontoggle="cfgToggle('${esc(g)}', this.open)"><summary>${esc(g)} <span class="note">(${groups[g].length})</span></summary>`
+          + `<table><tbody>${rows}</tbody></table></details>`;
+  }
+  $("cfgbody").innerHTML = html || '<div class="note">no key matches</div>';
+  cfgSummary();
+}
+function cfgToggle(g, open){ if(open) cfgOpen.add(g); else cfgOpen.delete(g); }
+function cfgSummary(){
+  if(!cfg) return;
+  const n = Object.keys(cfgEdits).length, parts = [];
+  if(cfg.file_error) parts.push("The file does not load: "+cfg.file_error+" (showing what is running).");
+  parts.push(n ? (n+" unsaved edit(s)"+(cfgBad.size?", "+cfgBad.size+" invalid":"")+".") : "No unsaved edits.");
+  if(cfg.stale) parts.push("config.yaml changed on disk since it was loaded — Reload from file to use it.");
+  if(cfg.pending.length) parts.push("Not applied yet: "+cfg.pending.join(", ")+".");
+  if(cfg.masked.length) parts.push("Overridden by --set: "+cfg.masked.join(", ")+".");
+  if(cfg.restart_needed.length) parts.push("Restart needed for: "+cfg.restart_needed.join(", ")+".");
+  $("cfgnote").textContent = parts.join(" ");
+}
+function cfgEdit(i, el){
+  const k=cfgKeys[i], orig=cfg.values[k], kind=cfgKind(orig); let v, bad=false;
+  if(kind==="bool") v = el.checked;
+  else if(kind==="num"){ if(el.value==="" || isNaN(+el.value)) bad=true; else v=+el.value; }
+  else if(kind==="str") v = el.value;
+  else { try{ v = JSON.parse(el.value); }catch(_){ bad=true; } }
+  el.style.borderColor = bad ? "var(--bad)" : "";
+  if(bad){ cfgBad.add(k); delete cfgEdits[k]; }
+  else { cfgBad.delete(k); if(JSON.stringify(v)===JSON.stringify(orig)) delete cfgEdits[k]; else cfgEdits[k]=v; }
+  el.closest("tr").classList.toggle("cfg-edited", k in cfgEdits);
+  cfgSummary();
+}
+function cfgClear(){ for(const k of Object.keys(cfgEdits)) delete cfgEdits[k]; cfgBad.clear(); }
+function cfgDiscard(){ cfgClear(); cfgRender(); }
+async function cfgSave(apply){
+  const keys = Object.keys(cfgEdits);
+  if(cfgBad.size){ toast("fix the invalid fields first", true); return; }
+  if(!keys.length){ toast("no edits to save"); return; }
+  const lines = keys.map(k=>k+":  "+JSON.stringify(cfg.values[k])+"  ->  "+JSON.stringify(cfgEdits[k])).join("\\n");
+  if(!confirm((apply?"Save and apply":"Save to config.yaml")+" these changes?\\n\\n"+lines)) return;
+  const j = await api("/api/config/save", {changes: Object.assign({}, cfgEdits), apply});
+  if(!j) return;
+  cfgClear(); await cfgLoad();
+  toast("saved "+j.saved.length+" setting(s)"+(j.applied?", applied to the next run":""));
+  if((j.restart_needed||[]).length) setTimeout(()=>toast("restart the console to use: "+j.restart_needed.join(", "), true), 2600);
+}
+async function cfgReload(){
+  if(Object.keys(cfgEdits).length && !confirm("Reload from file and drop your unsaved edits?")) return;
+  const j = await api("/api/config/reload", {}); if(!j) return;
+  cfgClear(); await cfgLoad();
+  toast("reloaded: "+(j.changed.length ? j.changed.length+" setting(s) changed" : "no change"));
+}
 
 // ---------------------------------------------------------------- teach points (config.yaml, via the console)
 let teachPoints = {}, teachKeys = [], teachShown = null;
@@ -578,6 +699,7 @@ function apply(type, d){
     $("s_arm").textContent = d.arm_idle ? "still" : d.arm_note;
     $("s_pump").textContent = d.pump_cmd===null ? "— (scenario)" : (d.pump_cmd ? "ON" : "off");
     $("r_name").textContent = d.scenario || "—";
+    $("r_label").textContent = d.run_name || "—";
     $("r_elapsed").textContent = d.elapsed_s!==null && d.elapsed_s!==undefined ? d.elapsed_s+" s" : "—";
     $("r_plans").textContent = d.scenario ? d.plans : "—";
     $("scn").textContent = d.scenario || "console";
@@ -589,11 +711,13 @@ function apply(type, d){
     const firstTeach = teachShown===null;
     teachRender(d.teach_points);
     if(firstTeach) teachMigrate();
-    if(!$("presets").dataset.done){
+    const presetSig = JSON.stringify(d.presets);
+    if($("presets").dataset.done!==presetSig){
       $("presets").innerHTML = Object.keys(d.presets).map(k=>`<button class="b man" onclick="preset('${k}')">${k}</button>`).join("");
-      $("presets").dataset.done="1";
+      $("presets").dataset.done=presetSig;
       $("beltslider").max = d.limits.belt_max;
     }
+    $("tabbtn-config").textContent = d.config_stale ? "Config •" : "Config";
     applyEnable();
   } else if(type==="sim"){
     const w=d.world||{};

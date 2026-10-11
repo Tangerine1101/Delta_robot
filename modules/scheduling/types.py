@@ -63,6 +63,16 @@ class Job:
         return self.deadline - self.safety_margin_s
 
     @property
+    def wait_s(self) -> float:
+        """How long the arm would sit parked for this part: the pick-phase dispatch minus the
+        earliest the goto could end (the command delay stays in it, so compare jobs, do not
+        read it as zero for a part already in reach). A part still upstream of the workspace
+        has a large wait; inf if unreachable."""
+        if self.intercept is None:
+            return math.inf
+        return max(0.0, self.intercept.gate_fire_time - self.reachable_at - self.intercept.goto_s)
+
+    @property
     def slack(self) -> float:
         """Time to spare if the part were picked first: deadline minus predicted contact."""
         if self.intercept is None:

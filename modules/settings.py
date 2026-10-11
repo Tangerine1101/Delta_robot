@@ -220,6 +220,17 @@ class VisionTrackerSettings:
 
 
 @dataclass(frozen=True)
+class VisionStackingSettings:
+    """Which board lies on which, read from overlapping detection boxes (vision/stacking.py,
+    open-issues S1). Off: the real camera then reports no stacking."""
+
+    enabled: bool = False
+    min_overlap_frac: float = 0.15        # shared area / area of the smaller box that counts as lying on
+    confirm_frames: int = 3               # frames in a row the boxes must overlap
+    min_birth_gap_frames: int = 2         # tracks born closer than this have no known order
+
+
+@dataclass(frozen=True)
 class BeltEstimatorSettings:
     """Belt speed from track motion — informational; the scheduler uses the PLC encoder."""
 
@@ -250,6 +261,7 @@ class VisionSettings:
     trigger_line: TriggerLineSettings = TriggerLineSettings()
     orientation: OrientationSettings = OrientationSettings()
     tracker: VisionTrackerSettings = VisionTrackerSettings()
+    stacking: VisionStackingSettings = VisionStackingSettings()
     belt_estimator: BeltEstimatorSettings = BeltEstimatorSettings()
 
 
@@ -291,6 +303,7 @@ class RuntimeSettings:
     # tracked centre is this close to the cup at contact (open-issues L17).
     grip_tolerance_mm: float = 12.7
     flow_bin_s: float = 10.0              # time bin of flow.csv (input / throughput per bin)
+    duration_s: float = 0.0               # run length of a scenario started without a duration; 0 = none (simulate_feeder then ends with feeder.schedule_s); ignored by simulate_feeder when feeder.max_parts > 0
 
 
 @dataclass(frozen=True)
@@ -350,7 +363,7 @@ class FeederSettings:
 
     kind: str = "poisson"                 # any registered feeder
     seed: int = 1
-    max_parts: int = 0                    # stop feeding after this many parts; 0 = no limit
+    max_parts: int = 0                    # feed exactly this many parts (extends schedule_s); 0 = schedule_s decides
     schedule_s: float = 3600.0            # arrivals drawn for this long when the run has no duration
     detection_period_s: float = 1.0 / 30.0  # the virtual camera's frame period
     detection_latency_s: float = 0.0      # capture-to-poll delay the virtual camera reports

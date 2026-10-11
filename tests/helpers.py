@@ -29,7 +29,7 @@ class ToyArm:
     def predict(self, u, v, start, start_time, forecast, anchor_time):
         object_id = self._by_u[round(u, 6)]
         t = start_time + self.processing[object_id]
-        return Intercept(t, t, (0.0, 0.0, -300.0), u, 0.0)
+        return Intercept(t, t, (0.0, 0.0, -300.0), u, self.processing[object_id])   # all flight, no waiting
 
     def costs(self, start, start_time, intercept, bin_position, belt_speed_at_pick, setup_s):
         p = intercept.pick_time - start_time

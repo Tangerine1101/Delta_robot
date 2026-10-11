@@ -50,7 +50,7 @@ robot:
     clearance: -265.0           # travel height between picks. open-issues G7 (joint limit binds here)
     slope_transition: -275.0    # where the slanted approach turns vertical
     pre_pick: -287.0            # park height above the part before the pick phase
-    pickup: -307.0              # suction-cup contact height
+    pickup: -300.0              # suction-cup contact height
     place: -280.0               # release height over the bin
   corner_blend_xy: 25.0         # XY corner blend radius of the 7-point template (mm)
   # PLC S-curve trajectory-time model: the scheduler's estimate of every processing time.
@@ -145,6 +145,13 @@ vision:
   tracker:
     max_match_dist_px: 250      # centroid tracker association radius (px)
     max_missing_frames: 15      # frames a track survives without a detection
+  # Which board lies on which, from overlapping detection boxes (the later track is on top);
+  # the planner uses it only with scheduling.stack_aware. open-issues S1.
+  stacking:
+    enabled: false
+    min_overlap_frac: 0.15      # shared area / area of the smaller box that counts as lying on
+    confirm_frames: 3           # frames in a row the boxes must overlap
+    min_birth_gap_frames: 2     # tracks born closer than this have no known order
   # Informational belt-speed estimate from track motion; the scheduler uses the PLC encoder.
   belt_estimator:
     enabled: true
@@ -180,15 +187,20 @@ runtime:
   speed_timeout_s: 1.0          # a belt speed sample older than this blocks planning (s)
   grip_tolerance_mm: 12.7       # outcome record: gripped if the part centre is this close to the cup at contact (open-issues L17)
   flow_bin_s: 10.0              # time bin of the run's flow.csv (s)
+  duration_s: 0.0               # run length when started without a duration (--duration / the console's field), s; 0 = no limit from here (camera scenarios run until stopped; simulate_feeder ends when its feeder.schedule_s of arrivals is dealt with). > 0 also fixes simulate_feeder's arrival horizon to this length, unless feeder.max_parts > 0 (then the run lasts as long as that many parts take)
 
 # Which object next (modules/scheduling, doc/basis-theory.md §7). `planner` is any registered
 # dispatch rule (spt, fifo, edd, least_slack) or sequence planner (kim, kim_release, dp, ...):
 # `python3 -m modules.scheduling` lists them. drop_longest is the planner this cell ran as
 # "kim" before 2026-09; kim is now Kise-Ibaraki-Mine's single-removal algorithm.
 scheduling:
-  planner: drop_longest
-  stack_aware: false            # planners see which parts lie on which and pick the top one first (basis-theory.md §7.7)
+  planner: dp
+  stack_aware: true            # planners see which parts lie on which and pick the top one first (basis-theory.md §7.7)
   safety_margin_s: 0.1          # margin on every deadline (s)
+  # Parameters of one planner (scheduling.planners.<name>, modules/scheduling/README.md §3).
+  planners:
+    dp:
+      max_jobs: 16               # dp searches this many most urgent parts (plus whatever lies on them); cost is 2^n
   setup_time_s: 0.064           # per-pick executor overhead: bin arrival -> next goto send, back-to-back median of 88 cycles (2026-10-02)
   # What the speed laws assume about one pick cycle. open-issues G2, C7
   arm_cycle:
@@ -221,7 +233,7 @@ speed:
       density_length_mm: 0.0    # density measurement length; 0 = u_max. open-issues G3
     predictive_rank:
       planner: drop_longest     # planner that scores candidate speeds; null = scheduling.planner
-      horizon_s: 45.0           # scoring horizon W (s)
+      horizon_s: 50             # scoring horizon W (s)
       queue_depth_k: 1          # picks the band must absorb: v_max = L / (k * p + g)
       candidate_step_mm_s: 5.0  # candidate speed grid step (mm/s)
 
@@ -234,9 +246,9 @@ plc_sim:
 # seed (modules/core/feeders.py, the same feeders as the sandbox) riding the real belt encoder.
 feeder:
   kind: poisson                 # script | periodic | poisson | regime | bursty
-  seed: 1
-  max_parts: 0                  # stop after this many parts; 0 = no limit
-  schedule_s: 3600.0            # arrivals drawn for this long when the run has no --duration (s)
+  seed: 1001
+  max_parts: 0                  # feed this many parts (the horizon grows to fit); 0 = the arrivals of schedule_s
+  schedule_s: 3600.0            # arrivals drawn for this long when the run has no --duration (s); the run ends when they are all dealt with
   detection_latency_s: 0.011     # capture delay the virtual camera reports (s)
   position_noise_mm: 0.0        # Gaussian noise on each virtual detection (mm)
   stacking: true                # a part landing on another covers it; a cup landing on a covered part fails

@@ -1,0 +1,42 @@
+# Phase 1 — the map of the scoring horizon W against load and stack awareness.
+# Question: which W is good, and does it depend on the load? On the cell (24 parts/min, seed 110)
+# W = 15 s ran 1316/1391 picks and W = 45 s 1227; in the earlier sandbox sweeps the difference
+# appeared only near the arm's capacity and only with stacking.
+# Everything not listed comes from modules/config.yaml (`cell_config`); the sandbox models of the
+# arm are as identified from the cell (sandbox/config.yaml sim.goto_extra_s / pick_extra_s) and checked by phase0_replay. W = 1000 s stands for "infinity" (the
+# paper's setting). One hour per run, KIM; w_map_dp is the same map for the cell's planner.
+description: predictive_rank horizon W x arrival rate x stack awareness, stacking on, KIM
+cell_config: modules/config.yaml
+base:
+  sim.duration_s: 3600
+  sim.stacking: true
+  speed.law: predictive_rank
+  speed.laws.predictive_rank.planner: drop_longest
+  scheduling.planner: kim
+seeds: [110, 111, 112, 113, 114]
+grid:
+  feeder.poisson.rate_per_min: [10, 16, 20, 24, 28]
+  scheduling.stack_aware: [false, true]
+  speed.laws.predictive_rank.horizon_s: [5, 10, 15, 20, 30, 45, 90, 1000]
+quick:
+  base: {sim.duration_s: 600}
+  seeds: [110, 111]
+  grid:
+    feeder.poisson.rate_per_min: [16, 24]
+    scheduling.stack_aware: [false, true]
+    speed.laws.predictive_rank.horizon_s: [15, 45, 1000]
+report:
+  title: Horizon W against load and stack awareness
+  metrics: [pick_share, picks_per_min, covered_share, lost_share, mean_belt_mm_s, dip_s, bypassed_lost]
+  group: [rate_per_min, stack_aware, horizon_s]
+  labels: {horizon_s: {1000: inf}}
+  notes:
+    - "Reading the charts: a W that keeps `pick_share` on the plateau at every load is safe; a W whose line drops at the high loads is the cliff. `covered_share` is what stacking costs, `mean_belt_mm_s` shows whether the law slowed the belt (a belt pinned at the floor with a falling `pick_share` is the starvation of open-issues S2)."
+  charts:
+    - {kind: line, x: horizon_s, y: pick_share, series: stack_aware, facet: rate_per_min}
+    - {kind: line, x: horizon_s, y: mean_belt_mm_s, series: stack_aware, facet: rate_per_min}
+    - {kind: line, x: horizon_s, y: covered_share, series: stack_aware, facet: rate_per_min}
+    - {kind: heatmap, x: horizon_s, y: rate_per_min, value: pick_share, facet: stack_aware}
+    - {kind: line, x: horizon_s, y: dip_s, series: stack_aware, facet: rate_per_min}
+  best:
+    - {over: horizon_s, metric: pick_share, group: [rate_per_min, stack_aware], tolerance: 0.005}

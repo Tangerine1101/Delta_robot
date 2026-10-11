@@ -33,6 +33,7 @@ from modules.vision.heading import (
     resolve_heading_360,
 )
 from modules.vision.roi import RoiFrame, TriggerLine
+from modules.vision.stacking import StackDetector
 from modules.vision.tracking import BeltVelocityEstimator, CentroidTracker
 
 # OpenCV's bundled Qt has no Wayland plugin; force xcb (X11/XWayland) so the live window
@@ -148,6 +149,10 @@ class VisionImageProcessing:
             max_match_dist=vision.tracker.max_match_dist_px,
             max_missing=vision.tracker.max_missing_frames,
         )
+        st = vision.stacking
+        self._stacking = StackDetector(
+            cv2, np, min_overlap_frac=st.min_overlap_frac, confirm_frames=st.confirm_frames,
+            min_birth_gap_frames=st.min_birth_gap_frames) if st.enabled else None
         be = vision.belt_estimator
         self._belt_estimator_enabled = be.enabled
         self._belt_estimator = BeltVelocityEstimator(
@@ -406,6 +411,21 @@ class VisionImageProcessing:
             return angle, type_name, marker
         return normalize_angle_deg(board[4]), self._names[cls_id], None
 
+    def _covered_by(self, active, pcb_dets) -> dict[int, frozenset[int]]:
+        """{track id: ids of the tracks lying on it}, from the overlap of this frame's boxes
+        (vision/stacking.py). Empty when `vision.stacking.enabled` is off."""
+        if self._stacking is None or not pcb_dets:
+            return {}
+        boards = {}
+        for trk in active.values():
+            board = min(pcb_dets, key=lambda d: (d[0] - trk.cx) ** 2 + (d[1] - trk.cy) ** 2)
+            if board[6] >= self._tl_min_conf:
+                boards[trk.id] = board
+        covered = self._stacking.update(boards)
+        for top, bottom in self._stacking.new_covers:
+            print(f"[VISION] STACK yolo-{top:06d} lies on yolo-{bottom:06d}", flush=True)
+        return covered
+
     def _emit_detections(self, active, pcb_dets, marker_dets, capture_ts=None) -> None:
         """Emit an ObjectDetection for every tracked board, every frame it is seen.
 
@@ -431,6 +451,7 @@ class VisionImageProcessing:
             detect_ts = capture_ts + self._half_exposure_s - self._latency_offset_s
         else:
             detect_ts = capture_ts - self._half_exposure_s - self._latency_offset_s
+        covered = self._covered_by(active, pcb_dets)
         for trk in active.values():
             if not pcb_dets:
                 continue
@@ -464,6 +485,7 @@ class VisionImageProcessing:
                 x=u, y=v, object_type=mapped,
                 timestamp=detect_ts,
                 confidence=float(conf), angle_deg=float(angle),
+                covered_by=tuple(f"yolo-{t:06d}" for t in sorted(covered.get(trk.id, ()))),
             )
             with self._lock:
                 self._deque.append(det)

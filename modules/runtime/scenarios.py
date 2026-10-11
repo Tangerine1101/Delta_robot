@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -77,6 +77,17 @@ def get_scenario(name: str) -> Scenario:
         raise ValueError(f"Unknown scenario '{name}'. Available: {', '.join(sorted(SCENARIOS))}") from None
 
 
+def effective_duration(settings: Settings, duration_s: float | None, *, virtual_feed: bool = False) -> float | None:
+    """The run length: the given duration, else `runtime.duration_s` when it is above 0, else
+    None (until stopped). A virtual feed with `feeder.max_parts` set runs as long as it takes to
+    feed that many parts, so the configured duration does not cap it; a given one still does."""
+    if duration_s is None and settings.runtime.duration_s > 0.0:
+        if virtual_feed and settings.feeder.max_parts > 0:
+            return None
+        return settings.runtime.duration_s
+    return duration_s
+
+
 def run_scenario(
     name: str,
     settings: Settings,
@@ -103,6 +114,7 @@ def run_scenario(
     summary.json."""
     scenario = get_scenario(name)
     validate_plugin_config(settings)
+    duration_s = effective_duration(settings, duration_s, virtual_feed=scenario.feed == "virtual")
     if scenario.moves_arm and (dispatch is None or request_status is None):
         raise RuntimeError(f"Scenario '{name}' moves the arm and needs a live PLC link.")
     if scenario.drives_belt and (dispatch is None or request_status is None):
@@ -191,6 +203,10 @@ def run_meta(name: str, settings: Settings, started_iso: str, duration_s: float 
         "static_mm_s": settings.speed.static_mm_s,
         "band_mm_s": [settings.speed.band.min_mm_s, settings.speed_ceiling_mm_s()],
         "feed": feed,
+        # The settings the run really had (the console edits config.yaml between runs, so the
+        # file at session start is not enough to replay it): `sandbox/cellrun.py` reads these.
+        "settings": {"scheduling": asdict(settings.scheduling), "speed": asdict(settings.speed),
+                     "feeder": asdict(settings.feeder)},
     }
     if feed == "virtual":
         cfg = settings.feeder

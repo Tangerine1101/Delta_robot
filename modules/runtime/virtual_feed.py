@@ -42,12 +42,31 @@ class VirtualPart:
                                self.event.heading_deg)
 
 
-def arrival_schedule(settings: Settings, horizon_s: float) -> list[SpawnEvent]:
-    """The run's arrivals, deterministic in `feeder.seed`."""
+_MAX_HORIZON_DOUBLINGS = 12
+
+
+def arrival_schedule(settings: Settings, horizon_s: float, *, fixed_horizon: bool = False) -> list[SpawnEvent]:
+    """The run's arrivals, deterministic in `feeder.seed`.
+
+    The arrivals are drawn over `horizon_s`. With `max_parts > 0` and no fixed horizon (the run
+    has no `--duration`) the horizon is doubled until `max_parts` parts exist, so `max_parts`
+    is a count, not a cap on what `schedule_s` happens to yield (seed 110 yields 1391 parts per
+    3600 s). Every feeder draws sequentially, so a longer horizon only appends: the arrivals of
+    the shorter one are unchanged."""
     cfg = settings.feeder
     if cfg.kind not in FEEDERS:
         raise SettingsError(f"feeder.kind: unknown feeder '{cfg.kind}'. Known: {', '.join(sorted(FEEDERS))}")
-    events = build_events(cfg.kind, dict(cfg.kinds.get(cfg.kind) or {}), random.Random(cfg.seed), horizon_s)
+    params = dict(cfg.kinds.get(cfg.kind) or {})
+    events = build_events(cfg.kind, params, random.Random(cfg.seed), horizon_s)
+    if cfg.max_parts > 0 and not fixed_horizon:
+        for _ in range(_MAX_HORIZON_DOUBLINGS):
+            if len(events) >= cfg.max_parts:
+                break
+            horizon_s *= 2.0
+            longer = build_events(cfg.kind, params, random.Random(cfg.seed), horizon_s)
+            if len(longer) == len(events):
+                break               # a feeder with a finite script: nothing more to draw
+            events = longer
     unknown = sorted({e.part_type for e in events} - set(settings.object_types))
     if unknown:
         raise SettingsError(f"feeder.kinds.{cfg.kind}.types: {', '.join(unknown)} not in object_types")
@@ -60,7 +79,8 @@ class VirtualFeed:
         cfg = settings.feeder
         self.start_time = start_time
         self.position_at = position_at
-        self.events = arrival_schedule(settings, duration_s if duration_s else cfg.schedule_s)
+        self.events = arrival_schedule(settings, duration_s if duration_s else cfg.schedule_s,
+                                       fixed_horizon=bool(duration_s))
         self.camera_window_uv = settings.conveyor.camera_window_uv
         self.stacking = cfg.stacking
         self.sizes = {name: (spec.w, spec.h) for name, spec in settings.object_types.items()}

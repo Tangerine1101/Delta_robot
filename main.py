@@ -15,6 +15,7 @@ import argparse
 import time
 from typing import Any
 
+from modules.runlog import safe_name
 from modules.settings import Settings, SettingsError, load_settings, with_overrides
 
 
@@ -105,7 +106,8 @@ def _run_scheduler(args: argparse.Namespace, settings: Settings) -> None:
             duration_s=args.duration,
             image_source=image_source,
             record_dir=args.runlog.dir if args.runlog is not None else None,
-            record_meta={"sim": bool(args.sim), "overrides": list(args.set)},
+            record_meta={"sim": bool(args.sim), "overrides": list(args.set),
+                         "run_name": safe_name(args.log_name) or None},
             **iface,
         )
     finally:
@@ -118,7 +120,7 @@ def _run_scheduler(args: argparse.Namespace, settings: Settings) -> None:
             sim.shutdown()
 
 
-def _run_console(args: argparse.Namespace, settings: Settings) -> None:
+def _run_console(args: argparse.Namespace, settings: Settings, overrides: dict[str, Any] | None = None) -> None:
     """Operator console: web UI with manual control and scenario switching.
 
     Starts idle — no scenario runs until the operator starts one from the page.
@@ -139,7 +141,8 @@ def _run_console(args: argparse.Namespace, settings: Settings) -> None:
     sim_camera = sim.camera() if sim is not None else None
     supervisor = Supervisor(link.dispatch, link.request_status, settings, emit=server.emit,
                             attach_camera=server.attach_camera, sim=sim, sim_camera=sim_camera,
-                            record_root=args.runlog.dir if args.runlog is not None else None)
+                            record_root=args.runlog.dir if args.runlog is not None else None,
+                            overrides=overrides)
     server.set_api_handler(supervisor.handle_api)
     server.start()
     if sim_camera is not None:
@@ -194,7 +197,7 @@ def _open_runlog(args: argparse.Namespace, settings: Settings, console: bool) ->
     if args.sim or args.dummy:
         mode += "-sim"
     return RunLog.open(settings.logging.dir, mode, {"plc_ip": args.ip, "pose_stream": asdict(settings.pose_stream),
-                                                    "overrides": args.set})
+                                                    "overrides": args.set}, name=args.log_name)
 
 
 def main() -> None:
@@ -234,6 +237,8 @@ def main() -> None:
                         help="Override one config value for this run, e.g. --set speed.law=predictive_rank")
     parser.add_argument("--no-log", action="store_true",
                         help="Do not write a run log under logging.dir.")
+    parser.add_argument("--log-name", default=None, metavar="NAME",
+                        help="Label the run log: log/<time>_<NAME>_<mode>/ (letters, digits, - _ . only).")
     args = parser.parse_args()
 
     console = args.interface and not args.cli and not args.scheduler
@@ -246,19 +251,23 @@ def main() -> None:
     if args.no_plc and (not args.scheduler or args.sim or SCENARIOS[args.scenario].moves_arm):
         parser.error("--no-plc applies to --scheduler scenarios that do not move the arm, without --sim.")
 
+    overrides: dict[str, Any] = {}
     try:
         settings = load_settings()
         if args.set:
-            settings = with_overrides(settings, _parse_overrides(args.set))
+            overrides = _parse_overrides(args.set)
+            settings = with_overrides(settings, overrides)
     except SettingsError as exc:
         parser.error(str(exc))
     args.ip = args.ip or settings.plc.omron.ip
     args.port = args.port or settings.plc.omron.port
 
+    if args.log_name is not None and not safe_name(args.log_name):
+        parser.error("--log-name needs at least one letter or digit.")
     args.runlog = _open_runlog(args, settings, console)
     try:
         if console:
-            _run_console(args, settings)
+            _run_console(args, settings, overrides)
         elif args.cli:
             _run_cli(args, settings)
         else:

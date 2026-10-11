@@ -72,6 +72,40 @@ def read_config(path: Path | str = CONFIG_PATH) -> dict[str, Any]:
     return _to_plain(data)
 
 
+def _comment_line(token: Any) -> str:
+    """The first line of a round-trip comment token, without its `#`."""
+    value = getattr(token, "value", None)
+    if not isinstance(value, str):
+        return ""
+    first = value.strip().split("\n", 1)[0].strip()
+    return first[1:].strip() if first.startswith("#") else ""
+
+
+def read_comments(path: Path | str = CONFIG_PATH) -> dict[str, str]:
+    """{dotted key: the comment at the end of its line} for every key that has one (the editor's
+    help text). A comment on a section header or a block comment between keys is not a key's."""
+    comments: dict[str, str] = {}
+
+    def walk(node: Any, prefix: str) -> None:
+        for key, value in node.items():
+            dotted = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, CommentedMap):
+                walk(value, dotted)
+                continue
+            token = node.ca.items.get(key)
+            text = _comment_line(token[2]) if token and len(token) > 2 else ""
+            if not text and isinstance(value, CommentedSeq) and value.ca.comment:
+                text = _comment_line((value.ca.comment[0] or [None])[0] if isinstance(value.ca.comment[0], list)
+                                     else value.ca.comment[0])
+            if text:
+                comments[dotted] = text
+
+    document = _load_document(Path(path))
+    if isinstance(document, CommentedMap):
+        walk(document, "")
+    return comments
+
+
 def _new_node(value: Any, like: Any = None) -> Any:
     """A round-trip node for `value`, copying the flow style of the node it replaces."""
     if isinstance(value, dict):

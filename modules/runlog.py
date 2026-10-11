@@ -1,4 +1,4 @@
-"""Per-run debug logs under `log/<YYYYmmdd-HHMMSS>_<mode>/`.
+"""Per-run debug logs under `log/<YYYYmmdd-HHMMSS>_[<name>_]<mode>/`.
 
 Every record carries both clocks so commands, status and motion can be lined up:
 
@@ -25,11 +25,13 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -114,6 +116,15 @@ def _trim_packet(package: dict[str, Any]) -> dict[str, Any]:
     return trimmed
 
 
+def safe_name(text: Any, limit: int = 60) -> str:
+    """A user-given run name as a directory-name part: letters, digits, `-`, `_` and `.` only
+    (accents are dropped, anything else, spaces included, becomes `-`); empty when nothing is left."""
+    plain = unicodedata.normalize("NFKD", str(text or "").replace("đ", "d").replace("Đ", "D"))
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", plain.strip()).strip("-.")
+    return cleaned[:limit].rstrip("-.")
+
+
 class RunLog:
     """Thread-safe writers for one run directory. Create with `RunLog.open`."""
 
@@ -131,11 +142,14 @@ class RunLog:
         self._closed = False
 
     @classmethod
-    def open(cls, root: str | Path, mode: str, meta: dict[str, Any]) -> "RunLog":
+    def open(cls, root: str | Path, mode: str, meta: dict[str, Any], name: str | None = None) -> "RunLog":
+        """`<root>/<YYYYmmdd-HHMMSS>_[<name>_]<mode>/`; `name` is the operator's label
+        (`main.py --log-name`), cleaned by `safe_name`."""
         root = Path(root)
         if not root.is_absolute():
             root = REPO_ROOT / root
-        name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{mode}"
+        label = safe_name(name)
+        name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{label + '_' if label else ''}{mode}"
         directory = root / name
         suffix = 1
         while directory.exists():
@@ -151,6 +165,7 @@ class RunLog:
             "start_iso": datetime.now().isoformat(timespec="milliseconds"),
             "git": _git_revision(),
             "pid": os.getpid(),
+            "log_name": label or None,
             **meta,
         }
         (directory / "meta.json").write_text(json.dumps(info, indent=2, ensure_ascii=False))

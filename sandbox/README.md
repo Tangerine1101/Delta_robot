@@ -20,7 +20,17 @@ python3 -m sandbox run --set scheduling.planner=dp --set speed.law=predictive_ra
 python3 -m sandbox run --profile                      # where the time goes
 python3 -m sandbox sweep sandbox/experiments/speed_laws.yaml [--workers N]
 python3 -m sandbox check                              # model files vs modules/config.yaml
+python3 -m sandbox run --out DIR --set sim.stacking=true ...   # also write parts.csv, flow.csv, waits.json
+python3 -m sandbox dips DIR|parts.csv                 # where the output left the input (robot logs too)
+python3 -m sandbox exp --list                         # named experiments, each with a report of tables + charts
+bash sandbox/run_experiments.sh phase0|phase1 [--quick]   # the pre-cell experiments, one command
 ```
+
+Experiments (how to run, read and write one): [experiments/README.md](experiments/README.md),
+Vietnamese [experiments/README.vi.md](experiments/README.vi.md). `exp` runs `sweep` specs and
+`replay` specs (a logged cell run replayed on its own arrivals and compared with the cell,
+`replay.py`); `report DIR` redraws the tables and charts of a finished sweep (`report.py`).
+Always use `.venv/bin/python` (the system Python lacks `ruamel`).
 
 A sweep writes `sandbox/results/<spec>-<timestamp>/runs.csv` (one row per run) and
 `manifest.json` (git revision, spec, resolved config of every case). `results/` is not tracked.
@@ -46,8 +56,40 @@ validates is committed. The **plant** then flies the goto, the gate fires at
 delay: the part is gripped if it is within `sim.capture_tolerance_mm` along the belt. The
 setpoint is frozen from goto dispatch to contact (open-issues L9).
 
-Not modelled: the camera's latency and noise, stacking, the PLC's own motion defects
-(`plc_sim` has those), and the real motion finishing earlier than the time model (G8).
+`sim.stacking: true` models stacking like the robot's `simulate_feeder`: a part landing on
+parts in the camera view covers those it overlaps (footprints from the feeder's headings and
+the part sizes); with `scheduling.stack_aware` jobs carry blockers, and a cup that comes down
+on a part still covered is booked a miss (`covered_misses`). As on the robot only a *picked*
+part frees what lies under it.
+
+`feeder.max_parts` (default 0 = none) keeps the first parts of the feeder, as the robot's key does; set
+`sim.duration_s` long enough for the tail. Every run also records the wall time of each speed-law
+decision and commit planning (`law_ms_*`, `plan_ms_*`, queue length `plan_jobs_*`).
+`python3 -m sandbox confirm` selects levels on some seeds and confirms them on others
+(`confirm.py`; experiments `p1_*.yaml`, `doc/experiment_notes.md`).
+
+The plant's leg times are the trajectory model's plus a fixed overhead, identified from the cell's
+pose stream (`python3 -m modules.tools.identify_plant log/<session>`): `sim.goto_extra_s`
+(+0.005 s) and `sim.pick_extra_s` (-0.019 s), set in `config.yaml`. `null` adds the model's
+command delay (0.228 s, the scheduler's lead for the gate) to each leg instead, which makes
+the arm 0.28 s per pick slower than the cell. `sim.carry_scale` (default 1) scales the time from
+gate fire to arm free: a what-if. `experiments/phase0_replay*.yaml` check the result against
+logged cell runs.
+
+Starvation is measured, not eyeballed. A commit whose contact is more than `sim.long_wait_s`
+away is a **long wait**; every other part the arm could have picked sooner from where it stood
+is **bypassed** (`bypassed`), and one that then left the workspace unpicked is `bypassed_lost`.
+`dips` / `dip_s` count the stretches where the trailing-60 s throughput left the input
+(`sandbox/flow.py`, the same finder reads the `parts.csv` of a robot run: the dips of the
+dashboard's *Input and throughput* chart). `waits.json` lists each long wait with the parts
+passed over. To replay a logged run exactly: `feeder.kind: script` with
+`feeder.script.arrivals_csv: <run>/arrivals.csv`. `experiments/starvation.yaml` is the
+one-hour seed-110 case of the 2026-10 issues.
+
+Not modelled: the camera's latency and noise, the PLC's own motion defects (`plc_sim` has
+those), the real motion finishing earlier than the time model (G8), and the robot's absolute
+clock (the float-edge flicker of the intercept window depended on it; `tests/test_intercept_edge.py`
+pins that one).
 
 ## Model and plant
 

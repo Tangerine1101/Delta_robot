@@ -185,8 +185,10 @@ with worked examples, are in [`modules/scheduling/README.md`](../modules/schedul
 ### 2.5. Run log
 
 Every `main.py` run (CLI, scheduler, console, with or without `--sim`) writes
-`log/<YYYYmmdd-HHMMSS>_<mode>/` (`logging.enabled`, `logging.dir`; `--no-log` skips one run;
-`log/` is git-ignored). Every record carries `t_mono` (`time.monotonic()`, the clock of `[PLAN]`
+`log/<YYYYmmdd-HHMMSS>_[<name>_]<mode>/` (`logging.enabled`, `logging.dir`; `--no-log` skips one
+run; `--log-name NAME` labels it — letters, digits, `-`, `_`, `.`; anything else becomes `-`,
+accents are dropped; `log/` is git-ignored). Old runs can be kept in `log/archived.zip`;
+the sandbox's replay (`sandbox/cellrun.py`) reads a run from there when its folder is gone. Every record carries `t_mono` (`time.monotonic()`, the clock of `[PLAN]`
 times, gate times and pose samples; the worker process shares it) and `t_wall` (`time.time()`).
 
 | File | Content |
@@ -203,7 +205,8 @@ To line a command up with the motion it caused, take its `t_mono_send` from
 `commands.jsonl` and read `pose.csv` from that time on.
 
 A scheduler run also writes its part record there (§2.6); a console run writes one
-`run<NN>_<HHMMSS>_<scenario>/` sub-folder per scenario started.
+`run<NN>_<HHMMSS>_[<run name>_]<scenario>/` sub-folder per scenario started; the run name is the
+Scenario card's *run name* field (same cleaning as `--log-name`) and is also in `summary.json` as `run_name`.
 
 ### 2.6. Part record: input, throughput, misses (`runtime/outcomes.py`)
 
@@ -214,7 +217,7 @@ exactly once:
 |---|---|---|
 | `picked` | the cup came down on the part | `gripped`; `unverified` (the pose poll missed the contact band; the pick completed) |
 | `miss_grip` | a pick was dispatched, the part was not taken | `cup_off_part`: part centre − cup at contact > `runtime.grip_tolerance_mm`; `covered`: another part still lay on it (§7.7 of basis-theory); `pick_motion_failed`: no contact before the trajectory failed |
-| `miss_late` | left the workspace (`u > u_max`) never dispatched | `never_planned`, or the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing` |
+| `miss_late` | left the workspace (`u > u_max`) never dispatched | `never_planned`, or the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing`, `covered` |
 | `lost_track` | the track went stale inside the camera view | `stale_in_camera` (reopened if the id is seen again) |
 | `on_belt` | still on the belt when the run ended | `run_ended` |
 
@@ -228,7 +231,7 @@ counted at the first sighting, **throughput** at contact.
 |---|---|
 | `parts.csv` | one row per part: type, source, first sighting (t, u, v), plans, last abort, dispatch and contact times, contact error (u, v, norm), belt speed at contact, outcome, reason |
 | `flow.csv` | per `runtime.flow_bin_s` bin: parts seen, outcomes booked, input and throughput per minute, mean belt speed and density |
-| `summary.json` | the run's set-up (scenario, planner, speed law, speeds, feeder kind/seed/parameters, `--set` or console overrides) and totals: outcome counts, miss reasons, pick rate, input and throughput per minute, median contact error |
+| `summary.json` | the run's set-up (scenario, planner, speed law, speeds, feeder kind/seed/parameters, `--set` or console overrides, and `settings`: the `scheduling` / `speed` / `feeder` sections the run really had, which `python3 -m sandbox exp phase0_replay` replays) and totals: outcome counts, miss reasons, pick rate, input and throughput per minute, median contact error |
 | `arrivals.csv` | `simulate_feeder` only: the arrivals that landed (time, type, lane, heading), replayable as a sandbox `script` feeder |
 
 The dashboard receives the same record live (`flow` at 1 Hz, `outcome` per closed part,
@@ -468,8 +471,13 @@ the feeder `feeder.kind` (`modules/core/feeders.py`, the sandbox's feeders) with
 `feeder.kinds.<kind>`. A part lands at the camera origin at its arrival time and rides the belt
 encoder, so on the cell the real belt carries it and the real arm picks at it with nothing on
 the belt. The same seed gives the same arrivals, so runs of different planners or speed laws
-see the same input. The run ends by itself once every part has landed and left the tracker
-(`feeder.max_parts > 0`, or the end of the schedule). Under `--sim` the simulator's own boards
+see the same input. The run ends by itself once every part has landed and left the tracker.
+A run started without a duration (no `--duration`, the console's field blank) lasts
+`runtime.duration_s` when that is above 0 (default 0 = no limit); an explicit duration wins.
+A duration, given or configured, fixes the arrival horizon at that length — except that with `feeder.max_parts > 0` the configured one is ignored and the run lasts as long as that many parts take; an explicit duration still caps it. Without one the
+arrivals are drawn over `feeder.schedule_s` (3600 s: seed 110 gives 1391
+parts); `feeder.max_parts > 0` makes the horizon grow until that many parts exist, so it is a
+count, not a cap on the schedule. Under `--sim` the simulator's own boards
 are switched off for it. Virtual parts are not checked for overlap (open-issues L17).
 
 `production` needs a PLC link. Offline it runs against the PLC simulator with `--sim`: the loop,
@@ -528,9 +536,27 @@ Omron motion already sent: the PLC has no stop command (P10).
 | `POST /api/belt`, `POST /api/rotate` | Belt speed and cup angle |
 | `POST /api/scenario/{start,stop}` | Scenario runs; `start` takes `{name, duration, settings}` with optional `planner`, `speed_law`, `static_mm_s`, `feeder_kind`, `feeder_seed`, `feeder_rate` (parts/min, the feeder's rate field), `feeder_max_parts` |
 | `POST /api/stop` | The STOP button |
+| `GET /api/config` | `config.yaml` as dotted keys with their comments, what is not applied yet, what a `--set` masks, what needs a restart |
+| `POST /api/config/save` | `{changes: {dotted key: value}, apply}`: check, write, optionally apply (below) |
+| `POST /api/config/reload` | Read the file again and use it from the next run |
 
 Refusals return 409 (busy) or 400 (invalid target). There is **no authentication** (open
-issue L12). Teach points are stored in the viewer's browser only.
+issue L12).
+
+**Configuration editor.** The *Config* tab lists every key of `Settings` (a key missing from
+the file shows its default) with the file's end-of-line comment as help, grouped by section,
+with a filter. *Save & apply* checks the edits with the strict loader (and the plugin names),
+writes `config.yaml` through `config_io.write_config` (comments kept; the previous file is
+kept as `config.yaml.bak`) and makes the result the console's configuration; *Save to file*
+only writes; *Reload from file* applies a file edited by hand. Applying and reloading need the
+console idle: a running scenario keeps the settings it started with, applied settings reach the
+next run, and the scenario form's defaults are refilled. A file that does not load is refused
+and the old settings keep running. `--set` overrides of the console's command line stay on top
+of every reload and are flagged. Keys read once at start-up — `plc.*`, `pose_stream.*`,
+`logging.*`, `plc_sim.*`, `interface.port`, `interface.mjpeg_fps`, `conveyor.position_scale_mm`
+— are written but only take effect after a restart; the tab marks them. `config_stale` in the
+console state (a dot on the tab) means the file changed on disk since it was loaded. Teach
+points are edited on their own card; the logic is `modules/ui/config_editor.py`.
 
 **Run settings.** The scenario card chooses the planner, the speed law and the constant speed,
 and for a virtual feed the feeder, seed, rate and part count. They apply to that run only
@@ -583,9 +609,9 @@ Keep strings that look like numbers quoted (`device: "0"`).
 | `robot` | `limits.{radius_xy_mm,z_min_mm,z_max_mm}` (§4.2); `home_position`; `heights.{clearance,slope_transition,pre_pick,pickup,place}`; `corner_blend_xy`; `interpolator.{v_max,a_max,d_max,soft_start_s,scurve_shape_factor}` (the PLC time model, `basis-theory.md` §3); `packet_time.{nominal_xy_speed,nominal_z_speed,release_descent_time_s}` (fills `argument_time`: ignored by the PLC, bounds the executor's arrival timeout); `rotation.{sign,offset_deg,home_tolerance_deg,refresh_max_delta_deg}` (`basis-theory.md` §5) | `core/delta`, `core/trajectory`, `runtime` |
 | `conveyor` | `position_scale_mm` (real belt feedback → true mm and mm/s, in the PLC worker; not applied to the simulator); `velocity_ema_alpha` (position-derived velocity, used only when the PLC sends none); `accel_mm_s2` (the PLC's `Conv_Acc`; forecasts, simulator ramp); `hw_max_mm_s`; `frame.{theta_deg,robot_origin_uv,robot_origin_offset}` (`basis-theory.md` §1.1; the offset is added to the origin before the frame is built); `camera_window_uv`, `workspace_window_uv` | `core`, `runtime`, `plc_sim` |
 | `object_types.<type>` | `bin` (drop position, robot frame), `w`, `h`, `model_class` (YOLO class; default the type name), `marker_class`, `symmetry_deg`, `heading_offset_deg` | everywhere a class matters |
-| `vision` | `model_weights`, `imgsz`, `conf`, `conf_marker`, `iou`, `device`, `half`, `show_window`, `mjpeg_jpeg_quality`, `pixels_per_mm`, `capture.*`, `v4l2_controls.*` (manual exposure; `exposure_time_absolute` also feeds the latency backdating), `latency_offset_s` (capture latency beyond the frame's kernel stamp, subtracted from every detection stamp; from `test_camera_latency`), `roi.{enabled,polygon}`, `trigger_line.{y_px,direction,min_conf}`, `orientation.{enabled,cross_check,marker_max_dist_mm}`, `tracker.*`, `belt_estimator.*` (informational) | `vision/pipeline`, `camera_calibrate.py` |
+| `vision` | `model_weights`, `imgsz`, `conf`, `conf_marker`, `iou`, `device`, `half`, `show_window`, `mjpeg_jpeg_quality`, `pixels_per_mm`, `capture.*`, `v4l2_controls.*` (manual exposure; `exposure_time_absolute` also feeds the latency backdating), `latency_offset_s` (capture latency beyond the frame's kernel stamp, subtracted from every detection stamp; from `test_camera_latency`), `roi.{enabled,polygon}`, `trigger_line.{y_px,direction,min_conf}`, `orientation.{enabled,cross_check,marker_max_dist_mm}`, `tracker.*`, `stacking.{enabled,min_overlap_frac,confirm_frames,min_birth_gap_frames}` (which board lies on which, from overlapping detection boxes; off by default, S1), `belt_estimator.*` (informational) | `vision/pipeline`, `camera_calibrate.py` |
 | `pick_gate` | `robot_movement_delay_s`, `ethernet_delay_s` (their sum is the dispatch → motion delay of the gate lead); `pick_descent_time_s`; `gate_offset_mm` (fixed distance the gate fires earlier, > 0, or later, < 0); `late_abort_mm`; `gate_out_n` (a part is dropped, booked `miss_late` / `gate_out`, after this many consecutive `gate_late` aborts; 0 disables); `arrival_tolerance_mm`, `arrival_tolerance_max_mm`, `arrival_timeout_margin_s`; `oblique_descent_enabled`; `intercept_lead_time_s` | `core/delta`, `runtime/pick_executor` |
-| `runtime` | `poll_interval_s`, `stale_timeout_s`, `speed_timeout_s`; `grip_tolerance_mm` (part record: gripped if the part centre is this close to the cup at contact, §2.6); `flow_bin_s` (bin of `flow.csv`) | `runtime` |
+| `runtime` | `poll_interval_s`, `stale_timeout_s`, `speed_timeout_s`; `grip_tolerance_mm` (part record: gripped if the part centre is this close to the cup at contact, §2.6); `flow_bin_s` (bin of `flow.csv`); `duration_s` (run length of a scenario started without a duration; 0 = no limit, so camera scenarios run until stopped and `simulate_feeder` ends with its `feeder.schedule_s` of arrivals) | `runtime` |
 | `scheduling` | `planner`; `safety_margin_s`; `setup_time_s`; `arm_cycle.{cycle_s,occupancy_worst_s,grab_worst_s}` (what speed laws assume about a pick cycle); `planners.<name>.*` | `scheduling`, `runtime/planning` |
 | `speed` | `law`; `setpoint_gate` (null = the law's default); `static_mm_s` (the `constant` speed, the startup setpoint of every law); `control_period_s`; `band.{min_mm_s,max_mm_s}`; `commit.{deadband_mm_s,max_step_mm_s}`; `laws.<name>.*` | `runtime/speed`, `scheduling` |
 | `plc_sim` | `feed_types`, `feed_lanes` (the simulator's feeder) | `plc_sim` |
@@ -658,6 +684,13 @@ python3 -m modules.tools.latency_probe --target omron
 # (vision.pixels_per_mm vs the belt feedback, C8). The [GATE] dispatch_to_contact_s is quantised
 # by the executor's 50 ms poll; this is not.
 python3 -m modules.tools.pick_timing log/<run folder>
+
+# System identification of a console session (pose stream, commands, belt status, part records),
+# without the camera terms: per-leg send -> arrival against core/motion.trajectory_time, the pick
+# cycle split into flight / wait / flight / gap, descent depth, the belt servo's step response and
+# the pick error against belt speed. Writes identification.md, legs.csv, identification.png into
+# sandbox/results/identify_<session>. The leg gaps are sandbox sim.goto_extra_s / pick_extra_s.
+python3 -m modules.tools.identify_plant log/<session folder> [--min-picked 100]
 
 # Capture latency the detection stamps leave out -> vision.latency_offset_s. Put 3-5 boards at
 # the upstream edge of the camera window, arm idle. The belt waits for the vision model and a

@@ -94,6 +94,7 @@ class RealtimePickExecutor:
         self.on_speed_event: Callable[[str], None] | None = None
         # The run's part record (runtime/outcomes.py); set by the decision loop.
         self.ledger: PartLedger | None = None
+        self.stack_aware = settings.scheduling.stack_aware
 
     def _arrival_tolerance_mm(self, belt_speed_mm_s: float | None) -> float:
         """Arm-arrival tolerance for the current belt speed: linear between the
@@ -523,6 +524,15 @@ class RealtimePickExecutor:
                     ),
                 )
                 plan.debug_info["abort_reason"] = "object_missing"
+                return False
+            if self.stack_aware and self.ledger is not None and self.ledger.is_covered(plan.object_id):
+                # A part landed on the target while the arm waited for it (the commit cannot
+                # be pre-empted): the cup would come down on the wrong board. The target is
+                # still un-dispatched, so the main loop re-queues it and, stack-aware, picks
+                # the part on top first.
+                print("[WARN]", json.dumps({"plan_id": plan.plan_id, "event": "pick_target_covered",
+                                            "object_id": plan.object_id}, ensure_ascii=True))
+                plan.debug_info["abort_reason"] = "covered"
                 return False
             if gate["reached"]:
                 late_mm = gate["object_u"] - gate["threshold_u"]

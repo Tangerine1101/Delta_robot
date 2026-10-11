@@ -1,0 +1,25 @@
+# The stack-aware run of 2026-10 (issues/stack-aware, issues/SPT-no-release) in the sandbox:
+# seed 110 at 24 parts/min for an hour, virtual parts landing on each other (sim.stacking),
+# predictive_rank with the robot's band. Columns to read: `bypassed` / `bypassed_lost` (a
+# commit that made the arm wait while a part could have been picked sooner), `covered_misses`,
+# `dips` / `dip_s` (output left the input), `mean_belt_mm_s`.
+# Replay the logged input exactly with `feeder.kind: script` and
+# `feeder.script.arrivals_csv: issues/stack-aware/run03_164219_simulate_feeder/arrivals.csv`.
+description: planner x belt speed under stacking, seed 110, one hour
+base:
+  sim.duration_s: 3600
+  sim.stacking: true
+  scheduling.stack_aware: true
+  speed.band.min_mm_s: 5
+  speed.static_mm_s: 20
+  speed.laws.predictive_rank.planner: drop_longest
+  feeder.poisson.lane_band_v: [15.0, 110.0]
+seeds: [110]
+cases:
+  - {name: dp+rank, set: {scheduling.planner: dp, speed.law: predictive_rank}}
+  - {name: spt_rollout+rank, set: {scheduling.planner: spt_rollout, speed.law: predictive_rank}}
+  - {name: drop_longest+rank, set: {scheduling.planner: drop_longest, speed.law: predictive_rank}}
+  - {name: dp+20, set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: dp+40, set: {scheduling.planner: dp, speed.law: constant, speed.static_mm_s: 40}}
+  - {name: spt_rollout+20, set: {scheduling.planner: spt_rollout, speed.law: constant, speed.static_mm_s: 20}}
+  - {name: spt_rollout+40, set: {scheduling.planner: spt_rollout, speed.law: constant, speed.static_mm_s: 40}}

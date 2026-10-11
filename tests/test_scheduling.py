@@ -50,6 +50,10 @@ class Forecast(unittest.TestCase):
         self.assertEqual(live_forecast(30.0, 50.0, 22.31, 5.0).target, 50.0)
 
 
+# The frozen reference gets the same window-edge tolerance as DeltaArm.predict (core/delta.py).
+_EDGE_TOL_MM = 1e-6
+
+
 def legacy_realtime_intercept(arm: DeltaArm, u: float, v: float, start, now: float, speed: float):
     """The realtime predictor the loop used before the job pipeline (frozen reference): the
     earliest reachable intercept with no lead, then pushed downstream until the arm is parked
@@ -73,7 +77,7 @@ def legacy_realtime_intercept(arm: DeltaArm, u: float, v: float, start, now: flo
         return None
     for _ in range(6):
         u_pick = u + speed * max(0.0, guess - now)
-        if u_pick > u_max:
+        if u_pick > u_max + _EDGE_TOL_MM:
             return None
         new_guess = max(now + command_delay_s + goto_total(arm.pick_point(u_pick, v)) + soft_start_s, t_enter)
         if abs(new_guess - guess) < 0.01:
@@ -81,7 +85,7 @@ def legacy_realtime_intercept(arm: DeltaArm, u: float, v: float, start, now: flo
             break
         guess = new_guess
     u_pick = u + speed * max(0.0, guess - now)
-    if not ConveyorFrame.is_in_window_uv(u_pick, v, window):
+    if not ConveyorFrame.is_in_window_uv(u_pick, v, window, _EDGE_TOL_MM):
         return None
 
     # Stage (b): the caller's lead and the park-before-gate condition.
@@ -97,7 +101,7 @@ def legacy_realtime_intercept(arm: DeltaArm, u: float, v: float, start, now: flo
             u_pick = u_max
             final = now + max(0.0, (u_pick - u) / speed)
             clamped = True
-        if not ConveyorFrame.is_in_window_uv(u_pick, v, window):
+        if not ConveyorFrame.is_in_window_uv(u_pick, v, window, _EDGE_TOL_MM):
             return None
         pick = arm.pick_point(u_pick, v)
         required = now + command_delay_s + goto_total(pick) + arm.gate_lead_s

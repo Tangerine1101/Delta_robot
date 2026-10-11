@@ -7,7 +7,7 @@ outcome and a reason:
 |--------------|-----------------------------------------------|---------|
 | `picked`     | the cup came down on the part                 | `gripped`; `unverified` (contact not seen by the pose poll) |
 | `miss_grip`  | a pick was dispatched but the part was not taken | `cup_off_part` (contact error > `runtime.grip_tolerance_mm`); `covered` (another part still lay on it at contact); `pick_motion_failed` (no contact) |
-| `miss_late`  | the part left the workspace never dispatched  | `never_planned`; the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing`; `gate_out` (dropped after `pick_gate.gate_out_n` consecutive `gate_late`) |
+| `miss_late`  | the part left the workspace never dispatched  | `never_planned`; the last pre-grip abort: `goto_failed`, `gate_late`, `object_stalled`, `object_missing`, `covered`; `gate_out` (dropped after `pick_gate.gate_out_n` consecutive `gate_late`) |
 | `lost_track` | the track died inside the camera view         | `stale_in_camera` |
 | `on_belt`    | still on the belt when the run ended          | `run_ended` |
 
